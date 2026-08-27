@@ -41,6 +41,7 @@ type SimpleProxyRouteConfig = {
   routePath: string;
   internalPath: SessionInternalPath;
   runtimeMethod?: string;
+  forwardJsonBody?: boolean;
   forwardSearch?: boolean;
   notFoundMessage?: string;
 };
@@ -64,10 +65,23 @@ function simpleProxyRoute(config: SimpleProxyRouteConfig): Route {
         const sessionId = getSessionId(match);
         if (sessionId instanceof Response) return sessionId;
 
+        let runtimeInit: RequestInit | undefined = config.runtimeMethod
+          ? { method: config.runtimeMethod }
+          : undefined;
+        if (config.forwardJsonBody) {
+          const body = await parseJsonBody<unknown>(request);
+          if (body instanceof Response) return body;
+          runtimeInit = {
+            ...runtimeInit,
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(body),
+          };
+        }
+
         const response = await ctx.sessionRuntime.fetch(
           sessionId,
           config.internalPath,
-          config.runtimeMethod ? { method: config.runtimeMethod } : undefined,
+          runtimeInit,
           config.forwardSearch ? new URL(request.url).search : undefined
         );
 
@@ -360,6 +374,7 @@ export const sessionRuntimeProxyRoutes: Route[] = [
     routePath: "/sessions/:id/scm-credentials",
     internalPath: SessionInternalPaths.scmCredentials,
     runtimeMethod: "POST",
+    forwardJsonBody: true,
   }),
   simpleProxyRoute({
     policy: SCM_AGNOSTIC_SANDBOX_FALLBACK_ROUTE,

@@ -16,6 +16,7 @@ import {
 } from "../../openai-token-refresh-service";
 import type { XaiTokenRefreshResult } from "../../xai-token-refresh-service";
 import type { ScmCredentialsResult } from "../../scm-credentials-service";
+import type { RepositoryTokenTarget } from "../../../source-control";
 import type { SessionMessenger } from "../../messenger";
 import type { MessageRepository } from "../../message-repository";
 import type { ArtifactRepository } from "../../artifact-repository";
@@ -27,6 +28,11 @@ import type { SessionSandboxEventProcessor } from "../../sandbox-events";
 import type { SandboxRow, SessionRow } from "../../types";
 import { assertArtifactType } from "../../artifacts";
 import { parseTunnelUrls } from "../../tunnel-urls";
+import {
+  mapRepositoryTargetError,
+  resolveSessionRepositoryTarget,
+  type SessionRepositoryEntry,
+} from "../../repository-target";
 import { z } from "zod";
 
 const addParticipantRequestSchema = z.object({
@@ -38,6 +44,11 @@ const addParticipantRequestSchema = z.object({
 });
 
 type AddParticipantRequest = z.infer<typeof addParticipantRequestSchema>;
+
+const scmCredentialsRequestSchema = z.strictObject({
+  repoOwner: z.string().trim().min(1).optional(),
+  repoName: z.string().trim().min(1).optional(),
+});
 
 /**
  * HTTP boundary for the sandbox-facing endpoints: event ingestion, media
@@ -61,7 +72,10 @@ export class SandboxHandler {
       session: SessionRow,
       log: Logger
     ) => Promise<XaiTokenRefreshResult>,
-    private readonly getScmCredentials: (log: Logger) => Promise<ScmCredentialsResult>,
+    private readonly getScmCredentials: (
+      repository: RepositoryTokenTarget,
+      log: Logger
+    ) => Promise<ScmCredentialsResult>,
     private readonly isValidSandboxToken: (
       token: string | null,
       sandbox: SandboxRow | null
@@ -332,7 +346,18 @@ export class SandboxHandler {
     );
   }
 
-  async scmCredentials(log: Logger): Promise<Response> {
+  async scmCredentials(request: Request, log: Logger): Promise<Response> {
+    let raw: unknown;
+    try {
+      raw = await request.json();
+    } catch {
+      return Response.json({ error: "Invalid request body" }, { status: 400 });
+    }
+    const parsed = scmCredentialsRequestSchema.safeParse(raw);
+    if (!parsed.success) {
+      return Response.json({ error: "Invalid request body" }, { status: 400 });
+    }
+
     const session = this.sessionCoreRepository.getSession();
     if (!session) {
       return Response.json({ error: "No session" }, { status: 404 });
@@ -344,7 +369,26 @@ export class SandboxHandler {
       );
     }
 
-    const result = await this.getScmCredentials(log);
+    let target: SessionRepositoryEntry;
+    try {
+      target = resolveSessionRepositoryTarget(
+        parsed.data,
+        this.sessionCoreRepository.getSessionRepositories()
+      );
+    } catch (error) {
+      const mapped = mapRepositoryTargetError(error);
+      if (!mapped) throw error;
+      return Response.json({ error: mapped.error }, { status: mapped.status });
+    }
+
+    const result = await this.getScmCredentials(
+      {
+        owner: target.repoOwner,
+        name: target.repoName,
+        providerRepoId: target.row?.repo_id,
+      },
+      log
+    );
     if (!result.ok) {
       return Response.json({ error: result.error }, { status: result.status });
     }

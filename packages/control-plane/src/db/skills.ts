@@ -20,7 +20,7 @@ import { isUniqueConstraintError } from "./errors";
 import { MAX_D1_QUERY_PARAMETERS } from "./query-limits";
 import type { SqlDatabase, SqlStatement } from "./sql-database";
 
-const RESERVED_SKILL_NAMES = new Set([
+export const RESERVED_SKILL_NAMES = new Set([
   "agent-browser",
   "record-video",
   "upload-screenshot",
@@ -33,9 +33,13 @@ interface SkillRow {
   name: string;
   current_revision_id: string;
   enabled: number;
+  required: number;
   deleted_at: number | null;
   created_by: string;
   updated_by: string;
+  source_kind: "app" | "git";
+  source_path: string | null;
+  source_commit_sha: string | null;
   created_at: number;
   updated_at: number;
   revision_number: number;
@@ -97,6 +101,7 @@ interface ApplicableSkill {
   id: string;
   name: string;
   description: string;
+  required: boolean;
   currentRevisionId: string;
   revisionNumber: number;
   revisionSha256: string;
@@ -195,10 +200,10 @@ export class SkillStore {
         this.db
           .prepare(
             `INSERT INTO skills
-             (id, name, current_revision_id, enabled, deleted_at, created_by, updated_by, created_at, updated_at)
-             VALUES (?, ?, NULL, 1, NULL, ?, ?, ?, ?)`
+             (id, name, current_revision_id, enabled, required, deleted_at, created_by, updated_by, created_at, updated_at)
+             VALUES (?, ?, NULL, 1, ?, NULL, ?, ?, ?, ?)`
           )
-          .bind(id, input.name, actorUserId, actorUserId, now, now),
+          .bind(id, input.name, input.required ? 1 : 0, actorUserId, actorUserId, now, now),
         this.revisionInsert(revisionId, id, 1, input.content, revision, actorUserId, now),
         ...this.fileInserts(revisionId, revision.files),
         this.db
@@ -257,6 +262,7 @@ export class SkillStore {
     }
     await this.validateAssignments(input.assignments);
     const revision = await buildValidatedSkillRevision(current.name, input.content);
+    const required = input.required ?? current.required;
     const now = Date.now();
     const statements: SqlStatement[] = [];
     let updateResultIndex: number;
@@ -267,10 +273,10 @@ export class SkillStore {
       statements.push(
         this.db
           .prepare(
-            `UPDATE skills SET updated_by = ?, updated_at = ?
+            `UPDATE skills SET required = ?, updated_by = ?, updated_at = ?
              WHERE id = ? AND current_revision_id = ? AND deleted_at IS NULL`
           )
-          .bind(actorUserId, now, id, expectedRevisionId)
+          .bind(required ? 1 : 0, actorUserId, now, id, expectedRevisionId)
       );
     } else {
       const revisionId = `skillrev_${generateId()}`;
@@ -292,10 +298,10 @@ export class SkillStore {
       statements.push(
         this.db
           .prepare(
-            `UPDATE skills SET current_revision_id = ?, updated_by = ?, updated_at = ?
+            `UPDATE skills SET current_revision_id = ?, required = ?, updated_by = ?, updated_at = ?
              WHERE id = ? AND current_revision_id = ? AND deleted_at IS NULL`
           )
-          .bind(revisionId, actorUserId, now, id, expectedRevisionId)
+          .bind(revisionId, required ? 1 : 0, actorUserId, now, id, expectedRevisionId)
       );
     }
     statements.push(
@@ -492,6 +498,7 @@ export class SkillStore {
         id: row.id,
         name: row.name,
         description: row.description,
+        required: row.required === 1,
         currentRevisionId: row.current_revision_id,
         revisionNumber: row.revision_number,
         revisionSha256: row.revision_sha256,
@@ -585,6 +592,7 @@ export class SkillStore {
       name: row.name,
       description: row.description,
       enabled: row.enabled === 1,
+      required: row.required === 1,
       currentRevisionId: row.current_revision_id,
       revisionNumber: row.revision_number,
       revisionSha256: row.revision_sha256,
@@ -596,6 +604,9 @@ export class SkillStore {
       source,
       createdBy: row.created_by,
       updatedBy: row.updated_by,
+      sourceKind: row.source_kind ?? "app",
+      ...(row.source_path ? { sourcePath: row.source_path } : {}),
+      ...(row.source_commit_sha ? { sourceCommitSha: row.source_commit_sha } : {}),
       createdAt: row.created_at,
       updatedAt: row.updated_at,
     };

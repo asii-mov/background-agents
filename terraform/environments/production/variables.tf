@@ -679,3 +679,89 @@ variable "unsafe_allow_all_users" {
   type        = bool
   default     = false
 }
+
+variable "platform_admin_users" {
+  description = "Comma-separated bootstrap administrators, matched case-insensitively by user ID, verified email, or provider-scoped SCM login such as github:octocat. Configure at least one before enabling central catalogue governance."
+  type        = string
+  default     = ""
+}
+
+variable "platform_editor_users" {
+  description = "Comma-separated bootstrap catalogue editors, matched case-insensitively by user ID, verified email, or provider-scoped SCM login such as github:octocat. Administrators can assign persisted roles in the UI after deployment."
+  type        = string
+  default     = ""
+}
+
+# =============================================================================
+# Git-backed Skills and MCP governance (optional)
+# =============================================================================
+
+variable "governance_repo_owner" {
+  description = "Owner of the central Git repository containing the Open-Inspect Skills and MCP catalog. Set with governance_repo_name to enable Git governance."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = (trimspace(var.governance_repo_owner) == "") == (trimspace(var.governance_repo_name) == "")
+    error_message = "governance_repo_owner and governance_repo_name must be set together or both left empty."
+  }
+}
+
+variable "governance_repo_name" {
+  description = "Repository name for the central Skills and MCP catalog."
+  type        = string
+  default     = ""
+}
+
+variable "governance_repo_ref" {
+  description = "Branch, tag, or commit ref reconciled from the governance repository."
+  type        = string
+  default     = "main"
+}
+
+variable "governance_repo_path" {
+  description = "Relative repository path containing catalog.yaml."
+  type        = string
+  default     = ".openinspect"
+
+  validation {
+    condition     = !startswith(var.governance_repo_path, "/") && !strcontains(var.governance_repo_path, "\\") && !contains(split("/", var.governance_repo_path), "..")
+    error_message = "governance_repo_path must be a safe relative POSIX path."
+  }
+}
+
+variable "governance_npm_registry_url" {
+  description = "HTTPS npm registry used to resolve automatic MCP package updates."
+  type        = string
+  default     = "https://registry.npmjs.org"
+
+  validation {
+    condition     = startswith(var.governance_npm_registry_url, "https://")
+    error_message = "governance_npm_registry_url must use HTTPS."
+  }
+}
+
+variable "governance_npm_registry_token" {
+  description = "Optional bearer token for a private npm registry used by the governance reconciler."
+  type        = string
+  sensitive   = true
+  default     = ""
+}
+
+variable "governance_mcp_builder_url" {
+  description = "HTTPS endpoint for the vendor-neutral MCP full-closure artifact builder. Required when the Git catalogue contains local MCP servers."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.governance_mcp_builder_url == "" || startswith(var.governance_mcp_builder_url, "https://")
+    error_message = "governance_mcp_builder_url must be empty or use HTTPS."
+  }
+}
+
+variable "governance_mcp_builder_token" {
+  description = "Bearer token shared with the MCP artifact builder."
+  type        = string
+  sensitive   = true
+  default     = ""
+}

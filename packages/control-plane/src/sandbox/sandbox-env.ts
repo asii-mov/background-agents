@@ -1,4 +1,5 @@
 import type { McpServerConfig } from "@open-inspect/shared/types/integrations";
+import type { SecurityPipelineConfig } from "@open-inspect/shared/types/security-pipelines";
 import { computeHmacHex } from "@open-inspect/shared/auth";
 import type { SourceControlProviderName } from "../source-control";
 import {
@@ -44,6 +45,8 @@ export interface SessionConfigPayload {
   /** Omitted from the serialized payload when undefined. */
   mcp_servers?: McpServerConfig[];
   /** Omitted from the serialized payload when undefined. */
+  security_pipelines?: SecurityPipelineConfig[];
+  /** Omitted from the serialized payload when undefined. */
   branch?: string | null;
   /** Ordered member list; only present for multi-repo sessions. */
   repositories?: SessionRepositoryConfigPayload[];
@@ -57,6 +60,7 @@ export interface SessionConfigInput {
   provider: string;
   model: string;
   mcpServers?: McpServerConfig[];
+  securityPipelines?: SecurityPipelineConfig[];
   branch?: string | null;
   repositories?: SessionRepositoryInfo[];
 }
@@ -77,6 +81,7 @@ export function buildSessionConfig(input: SessionConfigInput): SessionConfigPayl
     provider: input.provider,
     model: input.model,
     mcp_servers: input.mcpServers,
+    security_pipelines: input.securityPipelines,
   };
   if (input.branch !== undefined) {
     payload.branch = input.branch;

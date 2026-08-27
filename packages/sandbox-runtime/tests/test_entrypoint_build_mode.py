@@ -10,6 +10,7 @@ from unittest.mock import ANY, AsyncMock, MagicMock, patch
 import pytest
 
 from sandbox_runtime.repository_sync import (
+    RepositorySynchronizer,
     RepositorySyncOutcome,
     RepositorySyncResult,
     RepositorySyncStatus,
@@ -27,6 +28,10 @@ def isolate_optional_runtime_services(monkeypatch):
     monkeypatch.delenv("IMAGE_BUILD_MODE", raising=False)
     monkeypatch.delenv("RESTORED_FROM_SNAPSHOT", raising=False)
     monkeypatch.delenv("FROM_REPO_IMAGE", raising=False)
+    # Image-build behavior is under test here, not installation into the
+    # container's root-owned /usr/local/bin. Wrapper behavior has dedicated
+    # coverage in test_gh_wrapper.py.
+    monkeypatch.setattr(RepositorySynchronizer, "_install_gh_wrapper", lambda _self: None)
 
 
 def _repoint_primary(repository):

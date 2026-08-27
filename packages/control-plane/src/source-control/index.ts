@@ -20,6 +20,8 @@ export type {
   CreatePullRequestResult,
   PullRequestSnapshot,
   RepositoryAccessResult,
+  RepositoryScopedCredentialConfig,
+  RepositoryTokenTarget,
   ResolvedCommit,
   RepositoryTree,
   RepositoryTreeEntry,

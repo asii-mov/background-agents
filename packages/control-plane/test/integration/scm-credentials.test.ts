@@ -81,7 +81,11 @@ describe("POST /sessions/:id/scm-credentials", () => {
 
     const res = await SELF.fetch(url, {
       method: "POST",
-      headers: { Authorization: `Bearer ${sandboxToken}` },
+      headers: {
+        Authorization: `Bearer ${sandboxToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ repoOwner: "acme", repoName: "web-app" }),
     });
 
     // The test env has no GITHUB_APP_* bindings, so the provider raises

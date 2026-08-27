@@ -1,5 +1,6 @@
 import {
   createMcpServerInputSchema,
+  updateMcpServerCredentialsInputSchema,
   updateMcpServerInputSchema,
 } from "@open-inspect/shared/types/integrations";
 import {
@@ -10,9 +11,10 @@ import {
 import type { Env } from "../types";
 import { createLogger } from "../logger";
 import { requireRepoSecretsEncryptionKey } from "../env-validation";
+import { governanceCatalogConfigFromEnv } from "../governance/reconciler";
 import {
   type Route,
-  GITHUB_USER_OR_SERVICE_ROUTE,
+  SCM_AGNOSTIC_USER_OR_SERVICE_ROUTE,
   defineRoutes,
   type RequestContext,
   parsePattern,
@@ -22,6 +24,27 @@ import {
 } from "./shared";
 
 const logger = createLogger("router:mcp-servers");
+
+function gitManaged(env: Env): Response | null {
+  try {
+    return governanceCatalogConfigFromEnv(env)
+      ? error(
+          "Catalog metadata is managed by Git; submit a change to the governance repository",
+          409
+        )
+      : null;
+  } catch (value) {
+    return error(value instanceof Error ? value.message : "Invalid governance configuration", 500);
+  }
+}
+
+function canonicalUserId(ctx: RequestContext): string {
+  if (ctx.principal?.kind === "user") return ctx.principal.userId;
+  if (ctx.principal?.kind === "service") {
+    return ctx.principal.actor?.canonicalUserId ?? "system";
+  }
+  return "system";
+}
 
 async function handleListMcpServers(
   request: Request,
@@ -33,9 +56,10 @@ async function handleListMcpServers(
 
   const url = new URL(request.url);
   const repo = url.searchParams.get("repo") ?? undefined;
+  const environment = url.searchParams.get("environment") ?? undefined;
 
   const store = new McpServerStore(ctx.db, requireRepoSecretsEncryptionKey(env));
-  const servers = await store.list(repo);
+  const servers = await store.list(repo, environment);
   logger.info("MCP servers listed", {
     event: "mcp_server.list",
     request_id: ctx.request_id,
@@ -74,6 +98,8 @@ async function handleCreateMcpServer(
   ctx: RequestContext
 ): Promise<Response> {
   if (!ctx.db) return error("Database not configured", 503);
+  const managed = gitManaged(env);
+  if (managed) return managed;
 
   const body = await parseJsonBody<unknown>(request);
   if (body instanceof Response) return body;
@@ -83,7 +109,7 @@ async function handleCreateMcpServer(
   const encryptionKey = requireRepoSecretsEncryptionKey(env);
   try {
     const store = new McpServerStore(ctx.db, encryptionKey);
-    const server = await store.create(parsed.data);
+    const server = await store.create(parsed.data, canonicalUserId(ctx));
     logger.info("MCP server created", {
       event: "mcp_server.created",
       request_id: ctx.request_id,
@@ -109,6 +135,8 @@ async function handleUpdateMcpServer(
   const id = match.groups?.id;
   if (!id) return error("Missing server ID", 400);
   if (!ctx.db) return error("Database not configured", 503);
+  const managed = gitManaged(env);
+  if (managed) return managed;
 
   const body = await parseJsonBody<unknown>(request);
   if (body instanceof Response) return body;
@@ -119,7 +147,7 @@ async function handleUpdateMcpServer(
   try {
     const store = new McpServerStore(ctx.db, encryptionKey);
     const { revision, ...patch } = parsed.data;
-    const updated = await store.update(id, patch, revision);
+    const updated = await store.update(id, patch, revision, canonicalUserId(ctx));
     if (!updated) return error("MCP server not found", 404);
 
     logger.info("MCP server updated", {
@@ -149,10 +177,18 @@ async function handleDeleteMcpServer(
   const id = match.groups?.id;
   if (!id) return error("Missing server ID", 400);
   if (!ctx.db) return error("Database not configured", 503);
+  const managed = gitManaged(env);
+  if (managed) return managed;
 
   const store = new McpServerStore(ctx.db, requireRepoSecretsEncryptionKey(env));
-  const deleted = await store.delete(id);
-  if (!deleted) return error("MCP server not found", 404);
+  let deleted: boolean;
+  try {
+    deleted = await store.delete(id);
+    if (!deleted) return error("MCP server not found", 404);
+  } catch (err) {
+    if (err instanceof McpServerConflictError) return error(err.message, 409);
+    return error("Failed to delete MCP server", 503);
+  }
 
   logger.info("MCP server deleted", {
     event: "mcp_server.deleted",
@@ -163,7 +199,34 @@ async function handleDeleteMcpServer(
   return json({ ok: true });
 }
 
-export const mcpServerRoutes: Route[] = defineRoutes(GITHUB_USER_OR_SERVICE_ROUTE, [
+async function handleUpdateMcpCredentials(
+  request: Request,
+  env: Env,
+  match: RegExpMatchArray,
+  ctx: RequestContext
+): Promise<Response> {
+  const id = match.groups?.id;
+  if (!id) return error("Missing server ID", 400);
+  if (!ctx.db) return error("Database not configured", 503);
+  const body = await parseJsonBody<unknown>(request);
+  if (body instanceof Response) return body;
+  const parsed = updateMcpServerCredentialsInputSchema.safeParse(body);
+  if (!parsed.success) return error("Invalid MCP server credentials", 400);
+  const { revision, ...credentials } = parsed.data;
+  try {
+    const updated = await new McpServerStore(
+      ctx.db,
+      requireRepoSecretsEncryptionKey(env)
+    ).updateCredentials(id, credentials, revision, canonicalUserId(ctx));
+    return updated ? json(updated) : error("MCP server not found", 404);
+  } catch (value) {
+    if (value instanceof McpServerConflictError) return error(value.message, 409);
+    if (value instanceof McpServerValidationError) return error(value.message, 400);
+    return error("Failed to update MCP server credentials", 503);
+  }
+}
+
+export const mcpServerRoutes: Route[] = defineRoutes(SCM_AGNOSTIC_USER_OR_SERVICE_ROUTE, [
   {
     method: "GET",
     pattern: parsePattern("/mcp-servers"),
@@ -172,6 +235,7 @@ export const mcpServerRoutes: Route[] = defineRoutes(GITHUB_USER_OR_SERVICE_ROUT
   {
     method: "POST",
     pattern: parsePattern("/mcp-servers"),
+    requiredPermission: "catalog.write",
     handler: handleCreateMcpServer,
   },
   {
@@ -182,11 +246,19 @@ export const mcpServerRoutes: Route[] = defineRoutes(GITHUB_USER_OR_SERVICE_ROUT
   {
     method: "PUT",
     pattern: parsePattern("/mcp-servers/:id"),
+    requiredPermission: "catalog.write",
     handler: handleUpdateMcpServer,
+  },
+  {
+    method: "PUT",
+    pattern: parsePattern("/mcp-servers/:id/credentials"),
+    requiredPermission: "catalog.write",
+    handler: handleUpdateMcpCredentials,
   },
   {
     method: "DELETE",
     pattern: parsePattern("/mcp-servers/:id"),
+    requiredPermission: "catalog.write",
     handler: handleDeleteMcpServer,
   },
 ]);

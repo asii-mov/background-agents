@@ -51,7 +51,11 @@ describe("router sandbox-token fallback", () => {
     const response = await handleRequest(
       new Request("https://test.local/sessions/session-1/scm-credentials", {
         method: "POST",
-        headers: { Authorization: "Bearer valid-sandbox-token" },
+        headers: {
+          Authorization: "Bearer valid-sandbox-token",
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ repoOwner: "acme", repoName: "web-app" }),
       }),
       env as never,
       TEST_BACKGROUND_TASK_CONTEXT

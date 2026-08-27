@@ -5,6 +5,7 @@ import { generateId } from "../auth/crypto";
 import { resolveGitHubCredentialAuthority } from "../source-control/github-credential-authority";
 import { applyIdentityEnforcement, resolveCanonicalUserId } from "../auth/identity-enforcement";
 import { resolveEnvironmentTarget, resolveSessionRepositories } from "../repos/resolve";
+import { authorizeSessionRepositories } from "../repos/user-authorization";
 import { resolveScmProviderFromEnv } from "../source-control";
 import { EnvironmentStore } from "../db/environments";
 import { UserStore } from "../db/user-store";
@@ -26,6 +27,7 @@ import {
   json,
   parsePattern,
   resolveRepoOrError,
+  createRouteSourceControlProvider,
   type RequestContext,
   type Route,
   GITHUB_USER_OR_SERVICE_ROUTE,
@@ -129,6 +131,39 @@ async function handleCreateSession(
   const resolvedUserId = resolution.userId;
 
   const githubDeployment = resolveScmProviderFromEnv(env.SCM_PROVIDER) === "github";
+
+  // The shared GitHub App establishes that the installation can reach a
+  // repository. Separately verify that the initiating canonical user has a
+  // linked GitHub login with access to every repository in the sandbox.
+  const scopeMembers = repositories ?? (repoOwner && repoName ? [{ repoOwner, repoName }] : []);
+  if (githubDeployment && scopeMembers.length > 0) {
+    const identities = await userStore.getIdentitiesForUser(resolvedUserId);
+    const githubIdentity = identities.find(
+      (identity) => identity.provider === "github" && identity.providerLogin
+    );
+    if (!githubIdentity?.providerLogin) {
+      return error("A linked GitHub identity is required for repository sessions", 403);
+    }
+    const failures = await authorizeSessionRepositories(
+      createRouteSourceControlProvider(env),
+      githubIdentity.providerLogin,
+      scopeMembers
+    );
+    if (failures.length > 0) {
+      logger.warn("Repository user authorization denied", {
+        event: "repository.user_access_denied",
+        user_id: resolvedUserId,
+        scm_login: githubIdentity.providerLogin,
+        repositories: failures.map(
+          ({ repository, reason }) => `${repository.repoOwner}/${repository.repoName}:${reason}`
+        ),
+        request_id: ctx.request_id,
+        trace_id: ctx.trace_id,
+      });
+      return error("You are not authorized to use one or more selected repositories", 403);
+    }
+  }
+
   let scmLogin = body.scmLogin;
   let scmName = body.scmName;
   let scmEmail = body.scmEmail;
@@ -141,8 +176,8 @@ async function handleCreateSession(
 
   // Browser sessions resolve a linked GitHub identity/token through Better
   // Auth only when SCM enrichment is needed. Transitional callers retain the
-  // legacy D1 lookup. A user without a linked GitHub account uses the GitHub
-  // App bot fallback; account linking is intentionally deferred.
+  // legacy D1 lookup. Repository sessions have already required a linked
+  // GitHub identity above; repo-less sessions can legitimately have none.
   if (githubDeployment) {
     try {
       const enrichment = await resolveGitHubEnrichmentForRequest(
@@ -179,7 +214,6 @@ async function handleCreateSession(
   // §6.2). In list mode that is repositories[0]; otherwise the scalar pair — the
   // two are the same repo by the row-0-mirrors-scalars invariant. Launching
   // from a saved environment layers its overrides on top (design §13.5).
-  const scopeMembers = repositories ?? (repoOwner && repoName ? [{ repoOwner, repoName }] : []);
   const { codeServerEnabled, vncEnabled, sandboxSettings } = await resolveSessionScopedSettings(
     ctx.db,
     scopeMembers,

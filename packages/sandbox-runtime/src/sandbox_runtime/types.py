@@ -115,7 +115,29 @@ class McpServerConfig(TypedDict, total=False):
     env: dict[str, str]
     headers: dict[str, str]
     repoScopes: list[str] | None
+    revision: int
+    artifactSha256: str
+    artifactExecutable: str
     enabled: bool
+
+
+class SecurityPipelineCommandConfig(TypedDict):
+    """One argv-based centrally managed security check."""
+
+    name: str
+    command: list[str]
+    timeoutSeconds: int
+
+
+class SecurityPipelineConfig(TypedDict):
+    """A centrally assigned AppSec pipeline injected into one sandbox."""
+
+    id: str
+    name: str
+    commands: list[SecurityPipelineCommandConfig]
+    blocking: bool
+    maxRemediationAttempts: int
+    repoScopes: list[str] | None
 
 
 class SessionRepositoryConfig(TypedDict, total=False):
@@ -148,6 +170,7 @@ class SessionConfig(BaseModel):
     provider: str = "anthropic"
     model: str = "claude-sonnet-4-6"
     mcp_servers: list[McpServerConfig] | None = None
+    security_pipelines: list[SecurityPipelineConfig] | None = None
     # Ordered member list for multi-repo sessions; absent for scalar sessions
     # (the runtime synthesizes a one-entry list from repo_owner/repo_name).
     repositories: list[SessionRepositoryConfig] | None = None

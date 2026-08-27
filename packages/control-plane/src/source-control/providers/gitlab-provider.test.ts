@@ -1,6 +1,7 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
 import { GitLabSourceControlProvider, deriveGitLabMergeRequestStatus } from "./gitlab-provider";
 import { SourceControlProviderError } from "../errors";
+import { readRepositorySnapshot } from "../repository-snapshot";
 
 // Mock global fetch
 const mockFetch = vi.fn();
@@ -65,6 +66,48 @@ describe("GitLabSourceControlProvider", () => {
         "Failed to resolve branch head: unexpected response shape (commit.id)"
       );
       expect((err as SourceControlProviderError).errorType).toBe("permanent");
+    });
+  });
+
+  describe("readRepositorySnapshot", () => {
+    it("reads files at the resolved immutable GitLab commit", async () => {
+      mockFetch
+        .mockResolvedValueOnce(new Response(JSON.stringify({ id: "commit-sha" })))
+        .mockResolvedValueOnce(
+          new Response(
+            JSON.stringify([
+              {
+                id: "blob-sha",
+                path: ".openinspect/catalog.yaml",
+                type: "blob",
+                mode: "100644",
+              },
+            ])
+          )
+        )
+        .mockResolvedValueOnce(new Response("schemaVersion: 1"));
+      const provider = new GitLabSourceControlProvider(fakeConfig);
+
+      await expect(
+        readRepositorySnapshot(provider, {
+          owner: "acme/platform",
+          name: "governance",
+          ref: "main",
+          path: ".openinspect",
+          maxFiles: 10,
+          maxBytes: 1024,
+        })
+      ).resolves.toEqual({
+        commitSha: "commit-sha",
+        files: [
+          {
+            path: ".openinspect/catalog.yaml",
+            content: "schemaVersion: 1",
+            sha: "blob-sha",
+          },
+        ],
+      });
+      expect(mockFetch).toHaveBeenCalledTimes(3);
     });
   });
 
@@ -1393,6 +1436,30 @@ describe("managed-skill repository reads", () => {
     expect(tree.entries).toHaveLength(100);
     expect(String(mockFetch.mock.calls[1]?.[0])).toContain("page=2");
     expect(String(mockFetch.mock.calls[1]?.[0])).toContain("path=skills%2Fdeploy");
+  });
+
+  it("stops after page 20 and reports a continuing tree as truncated", async () => {
+    for (let page = 1; page <= 20; page++) {
+      const entries = Array.from({ length: 100 }, (_, index) => ({
+        path: `file-${page}-${index}`,
+        type: "blob",
+        mode: "100644",
+        id: `file-${page}-${index}`,
+      }));
+      mockFetch.mockResolvedValueOnce(
+        new Response(JSON.stringify(entries), {
+          headers: { "content-type": "application/json", "x-next-page": String(page + 1) },
+        })
+      );
+    }
+    const provider = new GitLabSourceControlProvider(fakeConfig);
+
+    const tree = await provider.listTree({ owner: "acme", name: "skills", commitSha: "abc" });
+
+    expect(tree).toMatchObject({ truncated: true });
+    expect(tree.entries).toHaveLength(2_000);
+    expect(mockFetch).toHaveBeenCalledTimes(20);
+    expect(String(mockFetch.mock.calls[19]?.[0])).toContain("page=20");
   });
 
   it("returns an empty scoped tree when GitLab reports a missing path", async () => {

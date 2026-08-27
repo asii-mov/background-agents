@@ -116,7 +116,11 @@ describe("SCM credentials router provider gate", () => {
     const response = await handleRequest(
       new Request("https://test.local/sessions/session-1/scm-credentials", {
         method: "POST",
-        headers: { Authorization: "Bearer sandbox-token" },
+        headers: {
+          Authorization: "Bearer sandbox-token",
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ repoOwner: "acme", repoName: "web-app" }),
       }),
       env as never,
       TEST_BACKGROUND_TASK_CONTEXT
@@ -126,6 +130,10 @@ describe("SCM credentials router provider gate", () => {
     expect(fetch).toHaveBeenCalledTimes(2);
     expect(new URL(fetch.mock.calls[0][0].url).pathname).toBe("/internal/verify-sandbox-token");
     expect(new URL(fetch.mock.calls[1][0].url).pathname).toBe("/internal/scm-credentials");
+    await expect(fetch.mock.calls[1][0].json()).resolves.toEqual({
+      repoOwner: "acme",
+      repoName: "web-app",
+    });
   });
 
   it("allows GitLab deployments to reach the tunnel URLs endpoint", async () => {

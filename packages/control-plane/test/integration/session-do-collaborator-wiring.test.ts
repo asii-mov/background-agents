@@ -7,7 +7,7 @@ import type { SourceControlProvider } from "../../src/source-control";
 import type { GitPushSpec } from "../../src/source-control";
 import { cleanD1Tables } from "./cleanup";
 import { componentsOf, runInSessionDO } from "./session-do-access";
-import { initSession, queryDO, seedMessage, waitForSandboxStatus } from "./helpers";
+import { initSession, queryDO, seedMessage, seedReadyDiff, waitForSandboxStatus } from "./helpers";
 
 /**
  * The SessionDO hands its collaborators to each other through thunks. Several
@@ -27,11 +27,8 @@ import { initSession, queryDO, seedMessage, waitForSandboxStatus } from "./helpe
  * snapshot trigger is silent. Spying is the only way to tell "wired correctly"
  * from "dropped entirely" from outside the DO.
  *
- * This does pin the DO's current private composition topology, which is a real
- * cost. It is deliberately confined to this one function so the cost is one
- * edit, not one per test: when the composition-root refactor replaces these
- * lazy getters with an explicit `SessionComponents` seam, repoint THIS function
- * at it and every test below should keep passing unchanged.
+ * This does pin the DO's current private composition topology. Keeping that
+ * dependency in this one function limits the maintenance cost to one edit.
  */
 function collaboratorsOf(
   instance: SessionDO
@@ -92,6 +89,7 @@ function stubSourceControlProvider(): SourceControlProvider {
       force: config.force ?? false,
     }),
     checkRepositoryAccess: () => notUsedHere("checkRepositoryAccess"),
+    checkRepositoryUserAccess: () => notUsedHere("checkRepositoryUserAccess"),
     listRepositories: () => notUsedHere("listRepositories"),
     listBranches: () => notUsedHere("listBranches"),
     getBranchHead: () => notUsedHere("getBranchHead"),
@@ -160,6 +158,7 @@ describe("SessionDO collaborator wiring", () => {
 
   it("routes a pull request's branch push through the sandbox event processor", async () => {
     const { stub } = await initSession({ userId: "user-1" });
+    await seedReadyDiff(stub);
     const participants = await queryDO<{ id: string }>(
       stub,
       "SELECT id FROM participants WHERE user_id = ?",

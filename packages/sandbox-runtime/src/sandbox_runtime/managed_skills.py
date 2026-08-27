@@ -67,6 +67,7 @@ class ManagedSkillFile:
 @dataclass(frozen=True)
 class ManagedSkill:
     name: str
+    required: bool
     files: tuple[ManagedSkillFile, ...]
 
 
@@ -291,6 +292,12 @@ def validate_installation_page(
                 f"duplicate managed skill name: {name}", code="installation_invalid"
             )
         names.add(name)
+        required = skill.get("required", False)
+        if not isinstance(required, bool):
+            raise ManagedSkillsError(
+                f"invalid required flag for managed skill {name}",
+                code="installation_invalid",
+            )
         raw_files = skill["files"]
         if not isinstance(raw_files, list) or not raw_files or len(raw_files) > MAX_SKILL_FILES:
             raise ManagedSkillsError("invalid skill files list", code="installation_invalid")
@@ -315,14 +322,14 @@ def validate_installation_page(
                 )
             paths.add(path)
             content = _require_string(file["content"], "skill file content", allow_empty=True)
-            content_bytes = content.encode("utf-8")
+            encoded_content = content.encode("utf-8")
             size_bytes = _require_int(file["sizeBytes"], "skill file size")
-            if len(content_bytes) > MAX_SKILL_FILE_BYTES or size_bytes != len(content_bytes):
+            if len(encoded_content) > MAX_SKILL_FILE_BYTES or size_bytes != len(encoded_content):
                 raise ManagedSkillsError(
                     f"invalid size for skill file {path}", code="installation_invalid"
                 )
             digest = _validate_sha256(file["sha256"], "skill file SHA-256")
-            if not hashlib.sha256(content_bytes).hexdigest() == digest:
+            if not hashlib.sha256(encoded_content).hexdigest() == digest:
                 raise ManagedSkillsError(
                     f"SHA-256 mismatch for skill file {path}", code="hash_mismatch"
                 )
@@ -335,7 +342,7 @@ def validate_installation_page(
                 raise ManagedSkillsError(
                     f"executable skill file must be under scripts/: {path}", code="path_invalid"
                 )
-            revision_bytes += len(content_bytes)
+            revision_bytes += len(encoded_content)
             files.append(ManagedSkillFile(path, content, digest, size_bytes, executable))
         if "SKILL.md" not in paths:
             raise ManagedSkillsError(
@@ -351,7 +358,7 @@ def validate_installation_page(
                 f"invalid total size for managed skill {name}", code="installation_invalid"
             )
         installation_content_bytes += revision_bytes
-        skills.append(ManagedSkill(name, tuple(files)))
+        skills.append(ManagedSkill(name, required, tuple(files)))
 
     if installation_content_bytes > MAX_MANAGED_SKILL_MANIFEST_BYTES:
         raise ManagedSkillsError(
@@ -584,8 +591,8 @@ class ManagedSkillsMaterializer:
             self._abort_staging(staging, backup, journal)
             raise
 
-    async def _fetch_into_staging(self, staging: Path) -> tuple[str, set[str]]:
-        """Stream every page into staging, returning the digest and installed names.
+    async def _fetch_into_staging(self, staging: Path) -> tuple[str, set[str], set[str]]:
+        """Stream every page, returning the digest, names, and required names.
 
         Nothing outside the staging tree is touched until the caller commits, so
         a failure part-way through a paged fetch leaves the previous
@@ -598,6 +605,7 @@ class ManagedSkillsMaterializer:
         instead — see validate_installation_page.
         """
         names: set[str] = set()
+        required_names: set[str] = set()
         content_bytes = 0
         manifest_sha256: str | None = None
         cursor: str | None = None
@@ -612,9 +620,10 @@ class ManagedSkillsMaterializer:
                 expected_manifest_sha256=manifest_sha256,
             )
             manifest_sha256 = page.manifest_sha256
+            required_names.update(skill.name for skill in page.skills if skill.required)
             self._stage_skills(staging, page.skills)
             if page.next_cursor is None:
-                return manifest_sha256, names
+                return manifest_sha256, names, required_names
             cursor = page.next_cursor
 
     async def materialize(self, repositories: Sequence[RepoEntry], workdir: Path) -> None:
@@ -622,9 +631,16 @@ class ManagedSkillsMaterializer:
         try:
             staging, backup, journal = self._begin_staging()
             try:
-                manifest_sha256, names = await self._fetch_into_staging(staging)
+                manifest_sha256, names, required_names = await self._fetch_into_staging(staging)
                 collisions = self._find_collisions(names, repositories, workdir)
                 if collisions:
+                    required_collisions = sorted(required_names.intersection(collisions))
+                    if required_collisions:
+                        raise ManagedSkillsError(
+                            "required managed skills are shadowed by discovered skills: "
+                            + ", ".join(required_collisions),
+                            code="required_skill_collision",
+                        )
                     for name in collisions:
                         self._remove_path(staging / name)
                     names.difference_update(collisions)

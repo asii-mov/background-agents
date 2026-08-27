@@ -15,6 +15,7 @@ import { SessionInternalPaths } from "./session/contracts";
 import { resolveManagedSkills } from "./session/skill-resolution";
 import { resolveSessionProviderAuth } from "./session/provider-account-resolution";
 import { ProviderAccountSelectionPolicyError } from "./model-provider-accounts/selection-policy";
+import { authorizeSessionRepositories } from "./repos/user-authorization";
 
 vi.mock("./db/session-index", () => ({
   SessionIndexStore: vi.fn(),
@@ -45,6 +46,14 @@ vi.mock("./routes/shared", async (importOriginal) => {
   };
 });
 
+vi.mock("./repos/user-authorization", async (importOriginal) => {
+  const actual = (await importOriginal()) as Record<string, unknown>;
+  return {
+    ...actual,
+    authorizeSessionRepositories: vi.fn(),
+  };
+});
+
 const USER_PRINCIPAL: Principal = {
   kind: "user",
   userId: "user-1",
@@ -68,12 +77,21 @@ describe("handleCreateSession D1 ordering", () => {
       repoId: 12345,
       defaultBranch: "main",
     } as never);
+    vi.mocked(authorizeSessionRepositories).mockResolvedValue([]);
     // Default identity fixture: the slack-bot's asserted actor resolves to an
-    // already-known canonical user with no linked GitHub identity.
+    // already-known canonical user with a linked GitHub identity. Repository
+    // admission is mocked above; provider behavior has its own focused tests.
     vi.mocked(UserStore).mockImplementation(function () {
       return {
         getIdentity: async () => ({ userId: "user-1" }),
-        getIdentitiesForUser: async () => [],
+        getIdentitiesForUser: async () => [
+          {
+            provider: "github",
+            providerUserId: "2002",
+            providerLogin: "ada",
+            providerEmail: "private@example.com",
+          },
+        ],
       } as never;
     });
   });
@@ -286,6 +304,39 @@ describe("handleCreateSession D1 ordering", () => {
     expect(initFetch).not.toHaveBeenCalled();
   });
 
+  it("rejects repository sessions without a linked GitHub identity", async () => {
+    vi.mocked(UserStore).mockImplementation(function () {
+      return {
+        getIdentity: async () => ({ userId: "user-1" }),
+        getIdentitiesForUser: async () => [],
+      } as never;
+    });
+
+    const response = await createSessionRequest(createEnv(vi.fn()));
+
+    expect(response.status).toBe(403);
+    await expect(response.json()).resolves.toEqual({
+      error: "A linked GitHub identity is required for repository sessions",
+    });
+    expect(authorizeSessionRepositories).not.toHaveBeenCalled();
+  });
+
+  it("rejects a session when repository authorization fails", async () => {
+    vi.mocked(authorizeSessionRepositories).mockResolvedValueOnce([
+      {
+        repository: { repoOwner: "Acme", repoName: "Web-App" },
+        reason: "denied",
+      },
+    ]);
+
+    const response = await createSessionRequest(createEnv(vi.fn()));
+
+    expect(response.status).toBe(403);
+    await expect(response.json()).resolves.toEqual({
+      error: "You are not authorized to use one or more selected repositories",
+    });
+  });
+
   it("creates the D1 session index before initializing the SessionDO", async () => {
     const create = vi.fn().mockResolvedValue(undefined);
     vi.mocked(SessionIndexStore).mockImplementation(function () {
@@ -397,7 +448,7 @@ describe("handleCreateSession D1 ordering", () => {
     expect(initFetch).toHaveBeenCalledOnce();
   });
 
-  it("resolves an unseen verified actor into a canonical user from display fields", async () => {
+  it("resolves an unseen verified actor without treating display email as identity proof", async () => {
     const create = vi.fn().mockResolvedValue(undefined);
     vi.mocked(SessionIndexStore).mockImplementation(function () {
       return { create } as never;
@@ -425,7 +476,6 @@ describe("handleCreateSession D1 ordering", () => {
       provider: "slack",
       providerUserId: "U0123",
       displayName: "Ada Lovelace",
-      providerEmail: "ada@example.com",
       avatarUrl: "https://avatars.example.com/ada.png",
     });
     expect(create).toHaveBeenCalledWith(expect.objectContaining({ userId: "user-9" }));

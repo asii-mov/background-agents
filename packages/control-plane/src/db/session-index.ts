@@ -396,6 +396,7 @@ export class SessionIndexStore {
           revision_number: skill.revisionNumber,
           revision_sha256: skill.revisionSha256,
           total_bytes: skill.totalBytes,
+          required: skill.required ? 1 : 0,
           assignment_sources: JSON.stringify(skill.assignmentSources),
         }))
       ),
@@ -419,9 +420,9 @@ export class SessionIndexStore {
         .prepare(
           `INSERT INTO session_skill_revisions
            (session_id, position, skill_id, revision_id, skill_name, description,
-            revision_number, revision_sha256, total_bytes, assignment_sources)
+            revision_number, revision_sha256, total_bytes, required, assignment_sources)
            SELECT ?, position, skill_id, revision_id, skill_name, description,
-                   revision_number, revision_sha256, total_bytes, assignment_sources
+                   revision_number, revision_sha256, total_bytes, required, assignment_sources
            FROM session_skill_revisions WHERE session_id = ? ORDER BY position`
         )
         .bind(childSessionId, parentSessionId),

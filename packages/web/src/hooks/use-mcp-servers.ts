@@ -59,3 +59,19 @@ export async function deleteMcpServer(id: string): Promise<void> {
     throw new Error(error.error || "Failed to delete MCP server");
   }
 }
+
+export async function updateMcpServerCredentials(
+  id: string,
+  input: { revision: number; env?: Record<string, string>; headers?: Record<string, string> }
+): Promise<McpServerMetadata> {
+  const response = await browserApiFetch(`${MCP_SERVERS_KEY}/${id}/credentials`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(input),
+  });
+  if (!response.ok) {
+    const body = (await response.json().catch(() => ({}))) as { error?: string };
+    throw new Error(body.error ?? "Failed to update MCP server credentials");
+  }
+  return response.json();
+}

@@ -10,7 +10,12 @@
  * spawn attempts within the same request.
  */
 
-import type { McpServerConfig, SandboxSettings } from "@open-inspect/shared/types/integrations";
+import type {
+  McpServerConfig,
+  SandboxNetworkPolicy,
+  SandboxSettings,
+} from "@open-inspect/shared/types/integrations";
+import type { SecurityPipelineConfig } from "@open-inspect/shared/types/security-pipelines";
 import { extractProviderAndModel } from "@open-inspect/shared/models";
 import type { ServerMessage } from "@open-inspect/shared/types/server-messages";
 import type { SandboxStatus } from "@open-inspect/shared/types/sessions";
@@ -229,6 +234,10 @@ export interface SandboxLifecycleConfig {
   getSessionId?: () => string;
   /** MCP server lookup for injecting servers into sandboxes. */
   mcpServerLookup?: McpServerLookup;
+  /** Centrally assigned AppSec pipeline lookup. Resolution failures block sandbox spawn. */
+  securityPipelineLookup?: SecurityPipelineLookup;
+  /** Resolves the current centrally owned network policy at every launch/restore. */
+  sandboxNetworkPolicyLookup?: SandboxNetworkPolicyLookup;
   /** Resolves the spawn-time agent-slack-notify gate. */
   slackAgentNotifyLookup?: SlackAgentNotifyLookup;
   /** Builds a provider dashboard URL for a persisted provider object ID. */
@@ -279,8 +288,24 @@ function multiRepoSpawnFields(
  */
 export interface McpServerLookup {
   getDecryptedForSession(
-    repositories: Array<{ repoOwner: string; repoName: string }>
+    sessionId: string,
+    repositories: Array<{ repoOwner: string; repoName: string }>,
+    environmentId: string | null
   ): Promise<McpServerConfig[]>;
+}
+
+export interface SecurityPipelineLookup {
+  getForSession(
+    repositories: Array<{ repoOwner: string; repoName: string }>,
+    environmentId: string | null
+  ): Promise<SecurityPipelineConfig[]>;
+}
+
+export interface SandboxNetworkPolicyLookup {
+  getForSession(
+    repositories: Array<{ repoOwner: string; repoName: string }>,
+    environmentId: string | null
+  ): Promise<SandboxNetworkPolicy | undefined>;
 }
 
 // ==================== Slack Agent-Notify Lookup ====================
@@ -566,12 +591,21 @@ export class SandboxLifecycleManager implements SandboxLifecycle {
       const prebuiltImageId: string | null = selectedImage?.providerImageId ?? null;
       const prebuiltImageSha: string | null = selectedImage?.primaryBaseSha ?? null;
 
-      const mcpServers = await this.loadMcpServers(repositories);
+      const mcpServers = await this.loadMcpServers(
+        session.id,
+        repositories,
+        session.environment_id
+      );
+      const securityPipelines = await this.loadSecurityPipelines(
+        repositories,
+        session.environment_id
+      );
 
       const codeServerEnabled = session.code_server_enabled === 1;
       const vncEnabled = session.vnc_enabled === 1;
       const agentSlackNotifyEnabled = await this.resolveAgentSlackNotifyEnabled(session);
-      const sandboxSettings = this.parseSandboxSettings(session);
+      const sandboxSettings = await this.resolveSandboxSettings(session, repositories);
+      this.assertNetworkEgressPolicySupported(sandboxSettings);
       const timeoutSeconds = this.resolveSandboxTimeoutSeconds(sandboxSettings);
       const createConfig: CreateSandboxConfig = {
         sessionId,
@@ -591,6 +625,7 @@ export class SandboxLifecycleManager implements SandboxLifecycle {
         vncEnabled,
         agentSlackNotifyEnabled,
         mcpServers,
+        securityPipelines,
         sandboxSettings,
         ...multiRepoFields,
       };
@@ -789,12 +824,16 @@ export class SandboxLifecycleManager implements SandboxLifecycle {
    * Returns undefined if none are found or DB is not configured.
    */
   private async loadMcpServers(
-    repositories: SessionRepositoryInfo[]
+    sessionId: string,
+    repositories: SessionRepositoryInfo[],
+    environmentId: string | null
   ): Promise<McpServerConfig[] | undefined> {
     try {
       if (!this.config.mcpServerLookup) return undefined;
       const servers = await this.config.mcpServerLookup.getDecryptedForSession(
-        repositories.map(({ repoOwner, repoName }) => ({ repoOwner, repoName }))
+        sessionId,
+        repositories.map(({ repoOwner, repoName }) => ({ repoOwner, repoName })),
+        environmentId
       );
       this.log.info("MCP servers loaded", {
         event: "mcp.loaded",
@@ -809,6 +848,24 @@ export class SandboxLifecycleManager implements SandboxLifecycle {
       });
       return undefined;
     }
+  }
+
+  /** Resolve mandatory pipeline configuration; fail closed if governance is unavailable. */
+  private async loadSecurityPipelines(
+    repositories: SessionRepositoryInfo[],
+    environmentId: string | null
+  ): Promise<SecurityPipelineConfig[] | undefined> {
+    if (!this.config.securityPipelineLookup) return undefined;
+    const pipelines = await this.config.securityPipelineLookup.getForSession(
+      repositories.map(({ repoOwner, repoName }) => ({ repoOwner, repoName })),
+      environmentId
+    );
+    this.log.info("Security pipelines loaded", {
+      event: "security_pipeline.loaded",
+      count: pipelines.length,
+      names: pipelines.map((pipeline) => pipeline.name),
+    });
+    return pipelines.length ? pipelines : undefined;
   }
 
   /**
@@ -892,8 +949,17 @@ export class SandboxLifecycleManager implements SandboxLifecycle {
       const codeServerEnabled = session.code_server_enabled === 1;
       const vncEnabled = session.vnc_enabled === 1;
       const agentSlackNotifyEnabled = await this.resolveAgentSlackNotifyEnabled(session);
-      const mcpServers = await this.loadMcpServers(repositories);
-      const sandboxSettings = this.parseSandboxSettings(session);
+      const mcpServers = await this.loadMcpServers(
+        session.id,
+        repositories,
+        session.environment_id
+      );
+      const securityPipelines = await this.loadSecurityPipelines(
+        repositories,
+        session.environment_id
+      );
+      const sandboxSettings = await this.resolveSandboxSettings(session, repositories);
+      this.assertNetworkEgressPolicySupported(sandboxSettings);
       const timeoutSeconds = this.resolveSandboxTimeoutSeconds(sandboxSettings);
       const result = await this.provider.restoreFromSnapshot({
         snapshotImageId,
@@ -912,6 +978,7 @@ export class SandboxLifecycleManager implements SandboxLifecycle {
         vncEnabled,
         agentSlackNotifyEnabled,
         mcpServers,
+        securityPipelines,
         sandboxSettings,
         ...multiRepoSpawnFields(repositories),
       });
@@ -1020,7 +1087,9 @@ export class SandboxLifecycleManager implements SandboxLifecycle {
         })
       );
 
-      const sandboxSettings = this.parseSandboxSettings(session);
+      const repositories = this.sessionContext.getSessionRepositories();
+      const sandboxSettings = await this.resolveSandboxSettings(session, repositories);
+      this.assertNetworkEgressPolicySupported(sandboxSettings);
       const timeoutSeconds = this.resolveSandboxTimeoutSeconds(sandboxSettings);
 
       const result = await this.provider.resumeSandbox({
@@ -1587,12 +1656,35 @@ export class SandboxLifecycleManager implements SandboxLifecycle {
     await this.storage.updateSandboxVnc(url, password);
   }
 
-  private parseSandboxSettings(session: SessionRow): SandboxSettings {
+  private async resolveSandboxSettings(
+    session: SessionRow,
+    repositories: SessionRepositoryInfo[]
+  ): Promise<SandboxSettings> {
+    let persisted: SandboxSettings;
     try {
-      return parsePersistedSandboxSettings(session.sandbox_settings);
+      persisted = parsePersistedSandboxSettings(session.sandbox_settings);
     } catch {
-      this.log.warn("Failed to parse sandbox_settings, using defaults");
-      return {};
+      this.log.warn("Failed to parse sandbox_settings, blocking sandbox network egress");
+      persisted = { networkPolicy: { mode: "blocked" } };
+    }
+
+    const lookup = this.config.sandboxNetworkPolicyLookup;
+    if (!lookup) return persisted;
+    const { networkPolicy: _snapshotPolicy, ...otherSettings } = persisted;
+    try {
+      const networkPolicy = await lookup.getForSession(
+        repositories.map(({ repoOwner, repoName }) => ({ repoOwner, repoName })),
+        session.environment_id
+      );
+      // An explicit unrestricted value ensures removing a central restriction
+      // also replaces an older restrictive session snapshot on the next launch.
+      return { ...otherSettings, networkPolicy: networkPolicy ?? { mode: "unrestricted" } };
+    } catch (error) {
+      this.log.warn("Failed to resolve current sandbox network policy; blocking egress", {
+        event: "sandbox.network_policy_resolve_failed",
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return { ...otherSettings, networkPolicy: { mode: "blocked" } };
     }
   }
 
@@ -1608,6 +1700,17 @@ export class SandboxLifecycleManager implements SandboxLifecycle {
     }
     const timeoutMs = sandboxSettings.sandboxTimeoutMs;
     return timeoutMs === undefined ? undefined : timeoutMs / 1000;
+  }
+
+  private assertNetworkEgressPolicySupported(sandboxSettings: SandboxSettings): void {
+    const policy = sandboxSettings.networkPolicy;
+    if (!policy || policy.mode === "unrestricted") return;
+    if (this.provider.capabilities.supportsNetworkEgressPolicy) return;
+
+    throw new SandboxProviderError(
+      `${this.provider.name} does not support centrally managed outbound network policies`,
+      "permanent"
+    );
   }
 
   private async storeAndBroadcastTunnelUrls(

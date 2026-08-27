@@ -6,7 +6,7 @@ import {
   OpenAITokenUnauthorizedError,
   OpenAITokenUpstreamError,
 } from "../../openai-token-refresh-service";
-import type { SandboxRow, SessionRow } from "../../types";
+import type { SandboxRow, SessionRepositoryRow, SessionRow } from "../../types";
 import { SandboxHandler } from "./sandbox.handler";
 import type { ArtifactRepository } from "../../artifact-repository";
 import type { ParticipantRepository } from "../../participant-repository";
@@ -15,6 +15,7 @@ import type { MessageRepository } from "../../message-repository";
 import type { SessionCoreRepository } from "../../session-core-repository";
 import type { SandboxRepository } from "../../sandbox-repository";
 import type { SessionSandboxEventProcessor } from "../../sandbox-events";
+import { buildSessionRepositories } from "../../repository-target";
 
 function createHandler({ managedSecretsConfigured = true } = {}) {
   const repository = {
@@ -27,6 +28,19 @@ function createHandler({ managedSecretsConfigured = true } = {}) {
   const getSandbox = vi.fn<() => SandboxRow | null>();
   const isValidSandboxToken = vi.fn();
   const getSession = vi.fn<() => SessionRow | null>();
+  let sessionRepositoryRows: SessionRepositoryRow[] = [];
+  const getSessionRepositories = vi.fn(() => {
+    const session = getSession();
+    if (!session?.repo_owner || !session.repo_name) return [];
+    return buildSessionRepositories(
+      {
+        repoOwner: session.repo_owner,
+        repoName: session.repo_name,
+        baseBranch: session.base_branch,
+      },
+      sessionRepositoryRows
+    );
+  });
   const refreshOpenAIToken = vi.fn();
   const refreshXaiToken = vi.fn();
   const getScmCredentials = vi.fn();
@@ -48,7 +62,7 @@ function createHandler({ managedSecretsConfigured = true } = {}) {
     repository as unknown as EventRepository,
     repository as unknown as ParticipantRepository,
     artifactRepository,
-    { getSession } as unknown as SessionCoreRepository,
+    { getSession, getSessionRepositories } as unknown as SessionCoreRepository,
     { getSandbox } as unknown as SandboxRepository,
     { processSandboxEvent } as unknown as SessionSandboxEventProcessor,
     messenger,
@@ -70,7 +84,15 @@ function createHandler({ managedSecretsConfigured = true } = {}) {
     verifySandboxToken: (request: Request) => sandboxHandler.verifySandboxToken(request, log),
     openaiTokenRefresh: () => sandboxHandler.openaiTokenRefresh(log),
     xaiTokenRefresh: () => sandboxHandler.xaiTokenRefresh(log),
-    scmCredentials: () => sandboxHandler.scmCredentials(log),
+    scmCredentials: (body: unknown = {}) =>
+      sandboxHandler.scmCredentials(
+        new Request("http://internal/internal/scm-credentials", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(body),
+        }),
+        log
+      ),
     tunnelUrls: () => sandboxHandler.tunnelUrls(log),
   };
 
@@ -82,6 +104,10 @@ function createHandler({ managedSecretsConfigured = true } = {}) {
     getSandbox,
     isValidSandboxToken,
     getSession,
+    getSessionRepositories,
+    setSessionRepositoryRows: (rows: SessionRepositoryRow[]) => {
+      sessionRepositoryRows = rows;
+    },
     refreshOpenAIToken,
     refreshXaiToken,
     getScmCredentials,
@@ -643,7 +669,7 @@ describe("SandboxHandler", () => {
   });
 
   it("returns scm credentials payload on success", async () => {
-    const { handler, getSession, getScmCredentials } = createHandler();
+    const { handler, getSession, getScmCredentials, log } = createHandler();
     getSession.mockReturnValue({
       id: "session-1",
       repo_owner: "acme",
@@ -666,6 +692,122 @@ describe("SandboxHandler", () => {
       password: "ghs_secret",
       expires_at_epoch_ms: expiresAt,
     });
+    expect(getScmCredentials).toHaveBeenCalledWith(
+      { owner: "acme", name: "web-app", providerRepoId: undefined },
+      log
+    );
+  });
+
+  it("mints credentials only for the requested session member", async () => {
+    const { handler, getSession, setSessionRepositoryRows, getScmCredentials, log } =
+      createHandler();
+    getSession.mockReturnValue({
+      id: "session-1",
+      repo_owner: "acme",
+      repo_name: "web-app",
+      base_branch: "main",
+    } as SessionRow);
+    setSessionRepositoryRows([
+      {
+        position: 0,
+        repo_owner: "acme",
+        repo_name: "web-app",
+        repo_id: 11,
+        base_branch: "main",
+        branch_name: null,
+        base_sha: null,
+        current_sha: null,
+      },
+      {
+        position: 1,
+        repo_owner: "acme",
+        repo_name: "backend",
+        repo_id: 22,
+        base_branch: "main",
+        branch_name: null,
+        base_sha: null,
+        current_sha: null,
+      },
+    ]);
+    getScmCredentials.mockResolvedValue({
+      ok: true,
+      username: "x-access-token",
+      password: "ghs_backend",
+      expiresAtEpochMs: Date.now() + 60_000,
+    });
+
+    const response = await handler.scmCredentials({ repoOwner: "Acme", repoName: "Backend" });
+
+    expect(response.status).toBe(200);
+    expect(getScmCredentials).toHaveBeenCalledWith(
+      { owner: "acme", name: "backend", providerRepoId: 22 },
+      log
+    );
+  });
+
+  it("rejects credential requests for repositories outside the session", async () => {
+    const { handler, getSession, getScmCredentials } = createHandler();
+    getSession.mockReturnValue({
+      id: "session-1",
+      repo_owner: "acme",
+      repo_name: "web-app",
+    } as SessionRow);
+
+    const response = await handler.scmCredentials({ repoOwner: "acme", repoName: "sibling" });
+
+    expect(response.status).toBe(403);
+    expect(getScmCredentials).not.toHaveBeenCalled();
+  });
+
+  it("rejects an ambiguous multi-repository credential request", async () => {
+    const { handler, getSession, setSessionRepositoryRows, getScmCredentials } = createHandler();
+    getSession.mockReturnValue({
+      id: "session-1",
+      repo_owner: "acme",
+      repo_name: "web-app",
+      base_branch: "main",
+    } as SessionRow);
+    setSessionRepositoryRows([
+      {
+        position: 0,
+        repo_owner: "acme",
+        repo_name: "web-app",
+        repo_id: 11,
+        base_branch: "main",
+        branch_name: null,
+        base_sha: null,
+        current_sha: null,
+      },
+      {
+        position: 1,
+        repo_owner: "acme",
+        repo_name: "backend",
+        repo_id: 22,
+        base_branch: "main",
+        branch_name: null,
+        base_sha: null,
+        current_sha: null,
+      },
+    ]);
+
+    const response = await handler.scmCredentials();
+
+    expect(response.status).toBe(400);
+    expect(getScmCredentials).not.toHaveBeenCalled();
+  });
+
+  it("rejects malformed credential targets", async () => {
+    const { handler, getSession, getScmCredentials } = createHandler();
+    getSession.mockReturnValue({
+      id: "session-1",
+      repo_owner: "acme",
+      repo_name: "web-app",
+    } as SessionRow);
+
+    const response = await handler.scmCredentials({ repoOwner: "acme" });
+
+    expect(response.status).toBe(400);
+    expect(getScmCredentials).not.toHaveBeenCalled();
   });
 
   it("returns 404 when tunnel URLs have no sandbox", async () => {

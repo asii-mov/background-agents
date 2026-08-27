@@ -19,38 +19,39 @@ Open-Inspect provides a hosted background coding agent that can:
 
 ## Security Model (Single-Tenant Only)
 
-> **Important**: This system is designed for **single-tenant deployment only**, where all users are
-> trusted members of the same organization with access to the same repositories.
+> **Important**: This system is designed for **single-tenant deployment only**. GitHub-backed
+> repository sessions enforce per-user repository admission, but the data model is not a
+> multi-tenant isolation boundary.
 
 ### How It Works
 
 The system uses a shared GitHub App installation for git operations (clone, fetch, push). The
-control plane mints short-lived installation tokens server-side and brokers them to sandboxes
-through the git credential helper on demand. This means:
+control plane mints short-lived, single-repository installation tokens server-side and brokers them
+to sandboxes through the git credential helper on demand. This means:
 
-- **All users share the same GitHub App credentials** - The GitHub App must be installed on your
-  organization's repositories, and any user of the system can access any repo the App has access to
-- **No per-user repository access validation** - The system does not verify that a user has
-  permission to access a specific repository before creating a session
+- **GitHub App credentials are shared but admission is per user** - Before creating a repository
+  session, the control plane requires a linked GitHub identity and verifies write-capable access to
+  every selected repository. Missing identities, read-only access, denials, and provider errors fail
+  closed.
+- **Repository-less sessions remain available** - They do not receive repository credentials.
 - **GitHub users' OAuth tokens are used for PR creation** - For GitHub logins, PRs are created using
   the user's GitHub OAuth token, ensuring proper attribution and that they can only create PRs on
   repos they have write access to. Users who sign in another way (e.g. Google) carry no SCM token,
-  so their PRs fall back to the shared GitHub App bot
+  so they must link GitHub before starting a repository-backed session
 
 ### Token Architecture
 
-| Token Type         | Purpose                                | Scope                            |
-| ------------------ | -------------------------------------- | -------------------------------- |
-| GitHub App Token   | Brokered git clone/fetch/push auth     | All repos where App is installed |
-| User OAuth Token   | Create PRs, user info                  | Repos user has access to         |
-| Sandbox Auth Token | Sandbox-to-control-plane session calls | Single session                   |
-| WebSocket Token    | Real-time session auth                 | Single session                   |
+| Token Type         | Purpose                                | Scope                    |
+| ------------------ | -------------------------------------- | ------------------------ |
+| GitHub App Token   | Brokered git clone/fetch/push auth     | One admitted repository  |
+| User OAuth Token   | Create PRs, user info                  | Repos user has access to |
+| Sandbox Auth Token | Sandbox-to-control-plane session calls | Single session           |
+| WebSocket Token    | Real-time session auth                 | Single session           |
 
 ### Why Single-Tenant Only
 
-This architecture follows
-[Ramp's Inspect design](https://builders.ramp.com/post/why-we-built-our-background-agent), which was
-built for internal use where all employees are trusted and have access to company repositories.
+The installation still shares control-plane storage, provider configuration, and administrative
+catalogues. GitLab deployments do not yet have linked per-user GitLab identity admission.
 
 **For multi-tenant deployment**, you would need:
 
@@ -68,6 +69,8 @@ built for internal use where all employees are trusted and have access to compan
    organization membership (`ALLOWED_GITHUB_ORGS`)
 4. **Use GitHub's repository selection** - When installing the App, select specific repositories
    rather than "All repositories"
+5. **Bootstrap platform ownership** - Set `platform_admin_users` and optionally
+   `platform_editor_users`, then manage persisted roles under Settings > AppSec
 
 ## Architecture
 
@@ -142,6 +145,10 @@ To set up recurring scheduled tasks, see **[docs/AUTOMATIONS.md](docs/AUTOMATION
 To create and use reusable agent instructions, see
 **[docs/MANAGED_SKILLS.md](docs/MANAGED_SKILLS.md)**.
 
+For centrally governed Skills/MCPs/components, per-user repository admission, autonomous AppSec
+remediation, sandbox egress policy, and risk-gated PRs, see
+**[docs/SECURE_GENERATION.md](docs/SECURE_GENERATION.md)**.
+
 ## Key Features
 
 ### Fast Startup
@@ -173,7 +180,21 @@ Create reusable instructions and supporting files that agents receive when a ses
 - Assign shared skills globally or to selected repositories and environments
 - Save personal profiles for frequently used skill sets
 - Pin exact skill revisions to each session for repeatable behavior
+- Mark organization-mandated Skills as required so users cannot omit them from matching sessions
 - See [docs/MANAGED_SKILLS.md](docs/MANAGED_SKILLS.md) for the user guide
+
+### Secure Generation Governance
+
+- Installation-wide member, editor, and administrator roles
+- Approved, scoped, provenance-bearing MCP catalogue with verified, content-addressed artifacts
+- Optional [Git-backed Skills and MCP desired state](docs/GIT_GOVERNANCE_CATALOG.md), with automatic
+  MCP channel/range resolution to exact per-session runtime revisions
+- Approved libraries, services, templates, and snippets with revision-aware consumer inventory
+- Managed AppSec checks that block the managed push path, feed failures back to the agent, and rerun
+- Centrally managed sandbox egress policy with fail-closed provider capability checks
+- Repository criticality × change criticality scoring that forces high-risk PRs to draft review
+- See [docs/SECURE_GENERATION.md](docs/SECURE_GENERATION.md) for the architecture and operations
+  guide
 
 ### Multiplayer Sessions
 
@@ -292,8 +313,7 @@ docker compose up -d postgres redis
   - `SETUP_TIMEOUT_SECONDS` (default `300`)
   - `START_TIMEOUT_SECONDS` (default `120`)
 - Both hooks receive `OPENINSPECT_BOOT_MODE` (`build`, `fresh`, `repo_image`, `snapshot_restore`)
-- Git operations in hooks can authenticate to other private repos on the configured SCM host when
-  the shared installation has access
+- Git operations in hooks can authenticate only to repositories admitted to the current session
 
 ## License
 

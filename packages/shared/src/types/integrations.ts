@@ -170,6 +170,27 @@ export const DEFAULT_MAX_TOTAL_CHILD_SESSIONS = 15;
 /** Minimum configurable sandbox session lifetime, in milliseconds. */
 export const MIN_SANDBOX_TIMEOUT_MS = 1000;
 
+/** Maximum entries in each centrally managed sandbox network allowlist. */
+export const MAX_SANDBOX_NETWORK_ALLOWLIST_ENTRIES = 100;
+
+/**
+ * Outbound network boundary requested for an agent sandbox.
+ *
+ * This is deliberately provider-agnostic. Providers must either enforce the
+ * complete policy or reject the sandbox launch; silently weakening a
+ * restrictive policy is not permitted.
+ */
+export type SandboxNetworkPolicy =
+  | { mode: "unrestricted" }
+  | { mode: "blocked" }
+  | {
+      mode: "allowlist";
+      /** IP ranges in CIDR notation. */
+      allowedCidrs?: string[];
+      /** TLS destinations, optionally with a leading `*.` wildcard. */
+      allowedDomains?: string[];
+    };
+
 /** Whether a sandbox lifetime is a safe positive whole-second millisecond value. */
 export function isValidSandboxTimeoutMs(value: unknown): value is number {
   return (
@@ -203,6 +224,8 @@ export const MAX_BUILD_TIMEOUT_SECONDS = 3600;
  * uses the provider default instead of inheriting a global resource default.
  */
 export interface SandboxSettings {
+  /** Centrally governed outbound network policy for the sandbox session. */
+  networkPolicy?: SandboxNetworkPolicy;
   /** Extra ports to expose via tunnels (e.g., dev server ports 3000, 5173). */
   tunnelPorts?: number[];
   /** Enable a browser-based terminal (ttyd) in sandbox sessions. */
@@ -363,7 +386,7 @@ export function normalizeRoutingRules(rules: SlackRoutingRule[] | undefined): Sl
     const isEnvironment = rule?.targetType === "environment";
     const target = isEnvironment ? rawTarget : rawTarget.toLowerCase();
     if (!keyword || !target) continue;
-    const dedupeKey = `${keyword} ${isEnvironment ? "environment" : "repository"} ${target}`;
+    const dedupeKey = `${keyword}\0${isEnvironment ? "environment" : "repository"}\0${target}`;
     if (seen.has(dedupeKey)) continue;
     seen.add(dedupeKey);
     normalized.push(
@@ -430,6 +453,7 @@ export type SlackGlobalConfig = IntegrationSettingsMap["slack"]["global"];
 /** Full MCP server config with decrypted credentials. Internal use only. */
 export interface McpServerConfig {
   id: string;
+  revision?: number;
   name: string;
   type: "local" | "remote";
   command?: string[];
@@ -437,14 +461,32 @@ export interface McpServerConfig {
   env?: Record<string, string>;
   headers?: Record<string, string>;
   repoScopes?: string[] | null;
+  environmentScopes?: string[] | null;
+  resolvedVersion?: string;
+  resolvedIntegrity?: string;
+  artifactSha256?: string;
+  artifactExecutable?: string;
+  sourceCommitSha?: string;
   enabled: boolean;
 }
 
 export const DEFAULT_MCP_SERVER_ENABLED = true;
+export const DEFAULT_MCP_SERVER_LIFECYCLE = "development" as const;
+export type McpServerLifecycle = "development" | "approved" | "deprecated";
+export type CatalogSourceKind = "app" | "git";
+
+/** Desired package policy from Git. The reconciler turns this into an exact runtime revision. */
+export interface McpPackageUpdatePolicy {
+  automatic: true;
+  channel: string;
+  range?: string;
+}
 
 const mcpServerCommonFields = {
   name: z.string().trim().min(1),
   repoScopes: z.array(z.string()).nullable().optional(),
+  environmentScopes: z.array(z.string().trim().min(1)).nullable().optional(),
+  lifecycle: z.enum(["development", "approved", "deprecated"]).optional(),
   enabled: z.boolean().optional(),
 };
 
@@ -456,6 +498,7 @@ export const createMcpServerInputSchema = z.discriminatedUnion("type", [
       command: z.array(z.string()).min(1),
       env: z.record(z.string(), z.string()).optional(),
       enabled: mcpServerCommonFields.enabled.default(DEFAULT_MCP_SERVER_ENABLED),
+      lifecycle: mcpServerCommonFields.lifecycle.default(DEFAULT_MCP_SERVER_LIFECYCLE),
     })
     .strict(),
   z
@@ -465,6 +508,7 @@ export const createMcpServerInputSchema = z.discriminatedUnion("type", [
       url: z.url(),
       headers: z.record(z.string(), z.string()).optional(),
       enabled: mcpServerCommonFields.enabled.default(DEFAULT_MCP_SERVER_ENABLED),
+      lifecycle: mcpServerCommonFields.lifecycle.default(DEFAULT_MCP_SERVER_LIFECYCLE),
     })
     .strict(),
 ]);
@@ -480,7 +524,18 @@ export const updateMcpServerInputSchema = z
     headers: z.record(z.string(), z.string()),
   })
   .partial()
-  .strict();
+  .strict()
+  .required({ revision: true });
+
+export const updateMcpServerCredentialsInputSchema = z
+  .strictObject({
+    revision: z.number().int().positive(),
+    env: z.record(z.string(), z.string()).optional(),
+    headers: z.record(z.string(), z.string()).optional(),
+  })
+  .refine((value) => (value.env === undefined) !== (value.headers === undefined), {
+    message: "provide exactly one of env or headers",
+  });
 
 export type CreateMcpServerRequest = z.input<typeof createMcpServerInputSchema>;
 export type UpdateMcpServerRequest = Omit<
@@ -504,6 +559,16 @@ export interface McpServerMetadata {
   hasEnv: boolean;
   hasHeaders: boolean;
   repoScopes?: string[] | null;
+  environmentScopes?: string[] | null;
+  lifecycle: McpServerLifecycle;
+  createdBy: string;
+  updatedBy: string;
+  sourceKind?: CatalogSourceKind;
+  sourcePath?: string;
+  sourceCommitSha?: string;
+  updatePolicy?: McpPackageUpdatePolicy;
+  resolvedVersion?: string;
+  resolvedIntegrity?: string;
   enabled: boolean;
 }
 

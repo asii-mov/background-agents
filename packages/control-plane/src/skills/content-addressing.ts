@@ -9,20 +9,21 @@ import {
 
 const encoder = new TextEncoder();
 const REVISION_DOMAIN = encoder.encode("OPEN_INSPECT_SKILL_REVISION_V1\0");
-const MANIFEST_DOMAIN = encoder.encode("OPEN_INSPECT_SKILL_MANIFEST_V1\0");
+const MANIFEST_DOMAIN = encoder.encode("OPEN_INSPECT_SKILL_MANIFEST_V2\0");
 const IMPORT_DOMAIN = encoder.encode("OPEN_INSPECT_SKILL_IMPORT_V1\0");
 
 /**
  * Domain strings, field ordering, and resolver version define persisted IDs.
  * Incompatible serialization changes require new domains and a new version.
  */
-export const SKILL_RESOLVER_VERSION = 1;
+export const SKILL_RESOLVER_VERSION = 2;
 
 interface ManifestHashSkill {
   skillId: string;
   revisionId: string;
   name: string;
   revisionSha256: string;
+  required: boolean;
   assignmentSources: SkillAssignment[];
 }
 
@@ -188,7 +189,8 @@ export async function hashSessionSkillManifest(
       ...stringBytes(skill.skillId),
       ...stringBytes(skill.revisionId),
       ...stringBytes(skill.name),
-      hexBytes(skill.revisionSha256)
+      hexBytes(skill.revisionSha256),
+      Uint8Array.of(skill.required ? 1 : 0)
     );
     const sources = [...skill.assignmentSources].sort((left, right) => {
       const leftValues = sourceValues(left);

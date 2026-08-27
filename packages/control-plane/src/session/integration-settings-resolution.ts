@@ -88,10 +88,10 @@ export async function resolveSandboxSettings(
       const globalSettings = await store.getGlobal("sandbox");
       return (globalSettings?.defaults ?? {}) as SandboxSettings;
     } catch (e) {
-      logger.warn("Failed to resolve global sandbox settings, using defaults", {
+      logger.warn("Failed to resolve global sandbox settings, blocking network egress", {
         error: e instanceof Error ? e.message : String(e),
       });
-      return {};
+      return { networkPolicy: { mode: "blocked" } };
     }
   }
   const repo = `${repoOwner}/${repoName}`;
@@ -103,13 +103,18 @@ export async function resolveSandboxSettings(
       environmentId
     );
     // enabledRepos: null -> all repos, [] -> none, [...] -> allowlist
-    if (enabledRepos !== null && !enabledRepos.includes(repo.toLowerCase())) return {};
+    // The allowlist gates user-facing convenience/resource settings, but it
+    // must never disable a centrally assigned network security boundary.
+    if (enabledRepos !== null && !enabledRepos.includes(repo.toLowerCase())) {
+      const { networkPolicy } = settings as SandboxSettings;
+      return networkPolicy ? { networkPolicy } : {};
+    }
     return settings as SandboxSettings;
   } catch (e) {
-    logger.warn("Failed to resolve sandbox settings, using defaults", {
+    logger.warn("Failed to resolve sandbox settings, blocking network egress", {
       error: e instanceof Error ? e.message : String(e),
     });
-    return {};
+    return { networkPolicy: { mode: "blocked" } };
   }
 }
 

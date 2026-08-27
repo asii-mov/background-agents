@@ -1,7 +1,8 @@
 "use client";
 
+import { preloadHighlighter } from "@pierre/diffs";
 import { PatchDiff, type VirtualFileMetrics } from "@pierre/diffs/react";
-import type { CSSProperties } from "react";
+import { type CSSProperties, useEffect, useState } from "react";
 import type { DiffStyle } from "@/hooks/use-session-diff-preferences";
 
 const COMPACT_DIFF_METRICS: VirtualFileMetrics = {
@@ -27,6 +28,34 @@ export default function PierreDiffRenderer({
   wrap: boolean;
   themeType: "light" | "dark";
 }) {
+  const [rendererState, setRendererState] = useState<"loading" | "ready" | "failed">("loading");
+
+  useEffect(() => {
+    let active = true;
+    preloadHighlighter({
+      langs: ["typescript"],
+      themes: ["pierre-light", "pierre-dark"],
+    }).then(
+      () => {
+        if (active) setRendererState("ready");
+      },
+      () => {
+        if (active) setRendererState("failed");
+      }
+    );
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  if (rendererState === "loading") {
+    return <div className="p-3 text-xs text-muted-foreground">Rendering patch…</div>;
+  }
+
+  if (rendererState === "failed") {
+    return <pre className="overflow-auto p-3 text-xs whitespace-pre-wrap">{patch}</pre>;
+  }
+
   return (
     <div className="box-border min-w-0 w-full pr-3">
       <PatchDiff

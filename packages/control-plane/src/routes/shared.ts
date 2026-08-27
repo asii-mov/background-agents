@@ -11,6 +11,7 @@ import type { Env } from "../types";
 import type { Logger } from "../logger";
 import type { BackgroundTasks } from "../platform-ports";
 import type { BetterAuthRuntime, UserAuthRuntime } from "../auth/user/runtime";
+import type { PlatformPermission } from "../db/platform-roles";
 import {
   createSourceControlProviderFromEnv,
   SourceControlProviderError,
@@ -53,6 +54,8 @@ export interface RouteDefinition<Context extends RequestContext = RequestContext
   method: string;
   pattern: RegExp;
   cacheControl?: "no-store" | "private, no-store";
+  /** Installation-wide permission enforced after authentication and before the handler. */
+  requiredPermission?: PlatformPermission;
   handler: (request: Request, env: Env, match: RegExpMatchArray, ctx: Context) => Promise<Response>;
 }
 

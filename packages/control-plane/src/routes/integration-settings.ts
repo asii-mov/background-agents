@@ -21,6 +21,7 @@ import {
   supportsEnvironmentSettings,
 } from "../db/integration-settings";
 import { EnvironmentStore } from "../db/environments";
+import { PlatformRoleStore } from "../db/platform-roles";
 import type { Env } from "../types";
 import type { SqlDatabase } from "../db/sql-database";
 import { createLogger } from "../logger";
@@ -37,6 +38,45 @@ import {
 } from "./shared";
 
 const logger = createLogger("router:integration-settings");
+
+function sandboxNetworkPolicy(
+  settings: Record<string, unknown> | null,
+  level: "global" | "override"
+): unknown {
+  if (!settings) return undefined;
+  const target =
+    level === "global" && typeof settings.defaults === "object" && settings.defaults !== null
+      ? (settings.defaults as Record<string, unknown>)
+      : level === "global"
+        ? null
+        : settings;
+  return target?.networkPolicy;
+}
+
+async function enforceNetworkPolicyOwnership(
+  env: Env,
+  ctx: RequestContext,
+  current: unknown,
+  requested: unknown
+): Promise<Response | null> {
+  if (JSON.stringify(current) === JSON.stringify(requested)) return null;
+  if (!ctx.principal) return error("Forbidden", 403);
+  const authorization = await new PlatformRoleStore(ctx.db, {
+    adminUsers: env.PLATFORM_ADMIN_USERS,
+    editorUsers: env.PLATFORM_EDITOR_USERS,
+  }).authorize(ctx.principal, "catalog.write");
+  if (authorization.allowed) return null;
+
+  logger.warn("Sandbox network policy mutation denied", {
+    event: "auth.authorization_denied",
+    permission: "catalog.write",
+    resource: "sandbox.network_policy",
+    principal_kind: ctx.principal.kind,
+    request_id: ctx.request_id,
+    trace_id: ctx.trace_id,
+  });
+  return error("Forbidden", 403);
+}
 
 function extractIntegrationId(match: RegExpMatchArray): IntegrationId | null {
   const id = match.groups?.id;
@@ -111,6 +151,16 @@ async function handleSetIntegrationSettings(
   const store = new IntegrationSettingsStore(ctx.db);
 
   try {
+    if (id === "sandbox") {
+      const current = await store.getGlobal("sandbox");
+      const denied = await enforceNetworkPolicyOwnership(
+        env,
+        ctx,
+        sandboxNetworkPolicy(current as Record<string, unknown> | null, "global"),
+        sandboxNetworkPolicy(body.settings, "global")
+      );
+      if (denied) return denied;
+    }
     await store.setGlobal(id, body.settings);
 
     logger.info("integration_settings.updated", {
@@ -146,6 +196,16 @@ async function handleDeleteIntegrationSettings(
   const store = new IntegrationSettingsStore(ctx.db);
 
   try {
+    if (id === "sandbox") {
+      const current = await store.getGlobal("sandbox");
+      const denied = await enforceNetworkPolicyOwnership(
+        env,
+        ctx,
+        sandboxNetworkPolicy(current as Record<string, unknown> | null, "global"),
+        undefined
+      );
+      if (denied) return denied;
+    }
     await store.deleteGlobal(id);
 
     logger.info("integration_settings.deleted", {
@@ -224,6 +284,16 @@ async function handleSetRepoSettings(
   const repo = `${owner}/${name}`;
 
   try {
+    if (id === "sandbox") {
+      const current = await store.getRepoSettings("sandbox", repo);
+      const denied = await enforceNetworkPolicyOwnership(
+        env,
+        ctx,
+        sandboxNetworkPolicy(current as Record<string, unknown> | null, "override"),
+        sandboxNetworkPolicy(body.settings, "override")
+      );
+      if (denied) return denied;
+    }
     await store.setRepoSettings(id, repo, body.settings);
 
     logger.info("integration_repo_settings.updated", {
@@ -265,6 +335,16 @@ async function handleDeleteRepoSettings(
   const repo = `${owner}/${name}`;
 
   try {
+    if (id === "sandbox") {
+      const current = await store.getRepoSettings("sandbox", repo);
+      const denied = await enforceNetworkPolicyOwnership(
+        env,
+        ctx,
+        sandboxNetworkPolicy(current as Record<string, unknown> | null, "override"),
+        undefined
+      );
+      if (denied) return denied;
+    }
     await store.deleteRepoSettings(id, repo);
 
     logger.info("integration_repo_settings.deleted", {
@@ -318,6 +398,16 @@ async function handleSetEnvironmentSettings(
   }
 
   try {
+    if (integrationId === "sandbox") {
+      const current = await store.getEnvironmentSettings("sandbox", environmentId);
+      const denied = await enforceNetworkPolicyOwnership(
+        env,
+        ctx,
+        sandboxNetworkPolicy(current as Record<string, unknown> | null, "override"),
+        sandboxNetworkPolicy(body.settings, "override")
+      );
+      if (denied) return denied;
+    }
     await store.setEnvironmentSettings(integrationId, environmentId, body.settings);
 
     logger.info("integration_environment_settings.updated", {
@@ -353,6 +443,16 @@ async function handleDeleteEnvironmentSettings(
   const { integrationId, environmentId, store } = params;
 
   try {
+    if (integrationId === "sandbox") {
+      const current = await store.getEnvironmentSettings("sandbox", environmentId);
+      const denied = await enforceNetworkPolicyOwnership(
+        env,
+        ctx,
+        sandboxNetworkPolicy(current as Record<string, unknown> | null, "override"),
+        undefined
+      );
+      if (denied) return denied;
+    }
     await store.deleteEnvironmentSettings(integrationId, environmentId);
 
     logger.info("integration_environment_settings.deleted", {
@@ -469,6 +569,7 @@ async function handleGetResolvedConfig(
       integrationId: id,
       repo,
       config: {
+        networkPolicy: sandboxSettings.networkPolicy ?? { mode: "unrestricted" },
         tunnelPorts: sandboxSettings.tunnelPorts ?? [],
         terminalEnabled: sandboxSettings.terminalEnabled ?? false,
         maxConcurrentChildSessions:

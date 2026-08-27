@@ -217,6 +217,57 @@ async def test_handle_push_targets_member_from_spec(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+async def test_handle_push_runs_blocking_security_gate_before_git(tmp_path: Path):
+    bridge = _create_bridge(tmp_path)
+    _write_manifest(bridge, tmp_path, [("open-inspect", "backend")])
+    backend = tmp_path / "backend"
+    (backend / ".git").mkdir(parents=True)
+    bridge._send_event = AsyncMock()
+    bridge._run_git_push = AsyncMock()
+    failed_report = MagicMock()
+    failed_report.blocking_failures = (object(),)
+    failed_report.remediation_prompt.return_value = "Verified secret scanner finding"
+    runner = MagicMock()
+    runner.pipelines = (object(),)
+    runner.run = AsyncMock(return_value=failed_report)
+    bridge.security_pipelines = runner
+
+    await bridge._handle_push(_multi_repo_push_command())
+
+    runner.run.assert_awaited_once_with(
+        workdir=backend,
+        repo_full_name="open-inspect/backend",
+    )
+    bridge._run_git_push.assert_not_awaited()
+    event = bridge._send_event.await_args.args[0]
+    assert event["type"] == "push_error"
+    assert "Push blocked by centrally managed" in event["error"]
+    assert "Verified secret scanner finding" in event["error"]
+
+
+@pytest.mark.asyncio
+async def test_handle_push_allows_nonblocking_findings_before_git(tmp_path: Path):
+    bridge = _create_bridge(tmp_path)
+    _write_manifest(bridge, tmp_path, [("open-inspect", "backend")])
+    backend = tmp_path / "backend"
+    (backend / ".git").mkdir(parents=True)
+    bridge._send_event = AsyncMock()
+    bridge._run_git_push = AsyncMock()
+    report = MagicMock()
+    report.blocking_failures = ()
+    runner = MagicMock()
+    runner.pipelines = (object(),)
+    runner.run = AsyncMock(return_value=report)
+    bridge.security_pipelines = runner
+
+    await bridge._handle_push(_multi_repo_push_command())
+
+    bridge._run_git_push.assert_awaited_once()
+    event = bridge._send_event.await_args.args[0]
+    assert event["type"] == "push_complete"
+
+
+@pytest.mark.asyncio
 async def test_handle_push_matches_member_case_insensitively(tmp_path: Path):
     """Identity matching is case-insensitive but the canonical path is used."""
     bridge = _create_bridge(tmp_path)

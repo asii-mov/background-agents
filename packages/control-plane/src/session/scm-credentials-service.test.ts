@@ -4,6 +4,8 @@ import type { SourceControlProvider } from "../source-control";
 import { SourceControlProviderError } from "../source-control/errors";
 import { ScmCredentialsService } from "./scm-credentials-service";
 
+const REPOSITORY = { owner: "acme", name: "web", providerRepoId: 42 };
+
 function createTestLogger(): Logger {
   return {
     debug: vi.fn(),
@@ -27,16 +29,19 @@ function makeProvider(
 describe("ScmCredentialsService", () => {
   it("returns credentials on success", async () => {
     const expiresAtEpochMs = Date.now() + 60 * 60 * 1000;
+    const generateCredentialHelperAuth = vi.fn().mockResolvedValue({
+      username: "x-access-token",
+      password: "ghs_token",
+      expiresAtEpochMs,
+    });
     const provider = makeProvider({
       name: "github",
-      generateCredentialHelperAuth: vi.fn().mockResolvedValue({
-        username: "x-access-token",
-        password: "ghs_token",
-        expiresAtEpochMs,
-      }),
+      generateCredentialHelperAuth,
     });
 
-    const result = await new ScmCredentialsService(provider, createTestLogger()).getCredentials();
+    const result = await new ScmCredentialsService(provider, createTestLogger()).getCredentials(
+      REPOSITORY
+    );
 
     expect(result).toEqual({
       ok: true,
@@ -44,6 +49,7 @@ describe("ScmCredentialsService", () => {
       password: "ghs_token",
       expiresAtEpochMs,
     });
+    expect(generateCredentialHelperAuth).toHaveBeenCalledWith({ repositories: [REPOSITORY] });
   });
 
   it("rejects invalid provider credential payloads", async () => {
@@ -56,7 +62,7 @@ describe("ScmCredentialsService", () => {
       }),
     });
 
-    const result = await new ScmCredentialsService(provider, log).getCredentials();
+    const result = await new ScmCredentialsService(provider, log).getCredentials(REPOSITORY);
 
     expect(result).toEqual({
       ok: false,
@@ -78,7 +84,9 @@ describe("ScmCredentialsService", () => {
       }),
     });
 
-    const result = await new ScmCredentialsService(provider, createTestLogger()).getCredentials();
+    const result = await new ScmCredentialsService(provider, createTestLogger()).getCredentials(
+      REPOSITORY
+    );
 
     expect(result).toEqual({
       ok: false,
@@ -96,7 +104,7 @@ describe("ScmCredentialsService", () => {
         .mockRejectedValue(new SourceControlProviderError("App not configured", "permanent")),
     });
 
-    const result = await new ScmCredentialsService(provider, log).getCredentials();
+    const result = await new ScmCredentialsService(provider, log).getCredentials(REPOSITORY);
 
     expect(result).toEqual({
       ok: false,
@@ -120,7 +128,9 @@ describe("ScmCredentialsService", () => {
         .mockRejectedValue(new SourceControlProviderError("GitHub API unavailable", "transient")),
     });
 
-    const result = await new ScmCredentialsService(provider, createTestLogger()).getCredentials();
+    const result = await new ScmCredentialsService(provider, createTestLogger()).getCredentials(
+      REPOSITORY
+    );
 
     expect(result).toEqual({ ok: false, status: 502, error: "GitHub API unavailable" });
   });
@@ -131,7 +141,7 @@ describe("ScmCredentialsService", () => {
       generateCredentialHelperAuth: vi.fn().mockRejectedValue(new Error("network blew up")),
     });
 
-    const result = await new ScmCredentialsService(provider, log).getCredentials();
+    const result = await new ScmCredentialsService(provider, log).getCredentials(REPOSITORY);
 
     expect(result).toEqual({
       ok: false,

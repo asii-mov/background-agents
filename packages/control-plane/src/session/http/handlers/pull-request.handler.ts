@@ -14,6 +14,7 @@ import type { ArtifactRepository } from "../../artifact-repository";
 import type { ParticipantService } from "../../participant-service";
 import type { SessionCoreRepository } from "../../session-core-repository";
 import type { SessionRow } from "../../types";
+import type { RiskAssessment } from "../../../risk/change-risk";
 import { z } from "zod";
 
 const createPrRequestSchema = z.object({
@@ -27,6 +28,11 @@ const createPrRequestSchema = z.object({
 });
 
 type CreatePrRequest = z.infer<typeof createPrRequestSchema>;
+
+export interface PullRequestRiskPolicy {
+  getChangedPaths(repository: SessionRepositoryEntry): string[] | null;
+  assessRisk(repository: SessionRepositoryEntry, paths: readonly string[]): Promise<RiskAssessment>;
+}
 
 /**
  * HTTP boundary for the pull-request endpoints: PR creation, sandbox-reported
@@ -45,7 +51,8 @@ export class PullRequestHandler {
     ) => Promise<CreatePullRequestResult>,
     /** Kicks off a background read-through refresh. */
     private readonly triggerPullRequestRefresh: () => void,
-    private readonly now: () => number = Date.now
+    private readonly now: () => number = Date.now,
+    private readonly riskPolicy?: PullRequestRiskPolicy
   ) {}
 
   async createPr(request: Request, log: Logger): Promise<Response> {
@@ -102,13 +109,28 @@ export class PullRequestHandler {
       return Response.json({ error: authResolution.error }, { status: authResolution.status });
     }
 
+    let risk: RiskAssessment | null = null;
+    if (this.riskPolicy) {
+      const paths = this.riskPolicy.getChangedPaths(target);
+      if (paths === null) {
+        return Response.json(
+          { error: "Change risk is not ready; wait for the session diff to refresh" },
+          { status: 409 }
+        );
+      }
+      risk = await this.riskPolicy.assessRisk(target, paths);
+    }
+    const riskNotice = risk?.requiresSecurityReview
+      ? `\n\n---\nSecurity review required: repository ${risk.repositoryCriticality}, change ${risk.changeSensitivity}, score ${risk.score}.`
+      : "";
+
     // Base-branch defaulting happens in the service (requested > target
     // repo's base branch > repo default), so the raw request value passes
     // through untouched.
     const result = await this.createPullRequest(
       {
         title: body.title,
-        body: body.body,
+        body: `${body.body}${riskNotice}`,
         baseBranch: body.baseBranch,
         headBranch: body.headBranch,
         repoOwner: target.repoOwner,
@@ -116,7 +138,7 @@ export class PullRequestHandler {
         promptingUserId: promptingParticipant.user_id,
         promptingAuth: authResolution.auth,
         sessionUrl: this.getSessionUrl(session),
-        draft: body.draft,
+        draft: risk?.requiresSecurityReview === true ? true : body.draft,
       },
       log
     );
@@ -132,6 +154,7 @@ export class PullRequestHandler {
       headBranch: result.headBranch,
       baseBranch: result.baseBranch,
       updated: result.updated,
+      ...(risk ? { risk } : {}),
     });
   }
 

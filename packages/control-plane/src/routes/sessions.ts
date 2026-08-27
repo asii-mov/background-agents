@@ -11,6 +11,7 @@ import { sessionAttachmentRoutes } from "./session-attachments";
 import { sessionWsTokenRoutes } from "./session-ws-token";
 import { sessionDiffRoutes } from "./session-diffs";
 import { sessionSkillRoutes } from "./session-skills";
+import { sessionMcpArtifactRoutes } from "./session-mcp-artifacts";
 
 export const sessionRoutes: Route[] = [
   ...sessionCreateRoutes,
@@ -23,6 +24,7 @@ export const sessionRoutes: Route[] = [
   ...sessionAttachmentRoutes,
   ...sessionDiffRoutes,
   ...sessionSkillRoutes,
+  ...sessionMcpArtifactRoutes,
   ...sessionChildSpawnRoutes,
   ...sessionChildRoutes,
 ];

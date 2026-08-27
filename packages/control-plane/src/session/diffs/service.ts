@@ -53,6 +53,17 @@ export class SessionDiffService {
     );
   }
 
+  /** Return paths from the latest complete diff for one session member. */
+  getChangedPaths(repository: SessionRepositoryEntry): string[] | null {
+    const state = this.getPublicState();
+    if (!state.current || state.unavailableReason) return null;
+    const current = state.current.repositories.find((candidate) =>
+      repoIdentityEquals(candidate, repository)
+    );
+    if (!current || current.status !== "ready") return null;
+    return current.files.map((file) => file.path);
+  }
+
   /**
    * Pin immutable baselines advertised by the sandbox's ready event.
    * Repository order and identity must match the session's configured repositories.

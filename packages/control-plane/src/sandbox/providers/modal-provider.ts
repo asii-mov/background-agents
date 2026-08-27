@@ -87,6 +87,7 @@ export class ModalSandboxProvider implements SandboxProvider, ModalImageBuildPro
 
   readonly capabilities: SandboxProviderCapabilities = {
     supportsSandboxTimeout: true,
+    supportsNetworkEgressPolicy: true,
     supportsSnapshots: true,
     supportsRestore: true,
     supportsPersistentResume: false,
@@ -120,6 +121,7 @@ export class ModalSandboxProvider implements SandboxProvider, ModalImageBuildPro
           vncEnabled: config.vncEnabled,
           agentSlackNotifyEnabled: config.agentSlackNotifyEnabled,
           mcpServers: config.mcpServers,
+          securityPipelines: config.securityPipelines,
           sandboxSettings: config.sandboxSettings,
           repositories: config.repositories,
         },
@@ -164,6 +166,7 @@ export class ModalSandboxProvider implements SandboxProvider, ModalImageBuildPro
           vncEnabled: config.vncEnabled,
           agentSlackNotifyEnabled: config.agentSlackNotifyEnabled,
           mcpServers: config.mcpServers,
+          securityPipelines: config.securityPipelines,
           sandboxSettings: config.sandboxSettings,
           repositories: config.repositories,
         },

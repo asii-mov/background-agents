@@ -331,8 +331,14 @@ project_root = "../../../"
 enable_durable_object_bindings = false
 enable_service_bindings = false
 
-# Override these only for an explicit Durable Object migration. The production
-# workflow stages the SchedulerDO v2-to-v3 deletion only when state is still v2.
+# Override these only for an explicit Durable Object migration. An existing v1
+# control-plane deployment must first apply the GovernanceCatalogDO migration
+# with bindings disabled, then re-enable bindings in the next apply:
+# control_plane_migration_tag = "v2"
+# control_plane_migration_old_tag = "v1"
+# control_plane_new_sqlite_classes = ["GovernanceCatalogDO"]
+# Fresh deployments keep the v1 defaults and create both configured classes in
+# their first bindings-disabled apply.
 # control_plane_migration_tag = "v1"
 # control_plane_migration_old_tag = null
 # control_plane_new_sqlite_classes = []
@@ -368,3 +374,26 @@ allowed_github_orgs = ""
 # Explicitly bypass the Terraform access-control safety check and allow any
 # authenticated user to sign in when all allowlists are empty.
 unsafe_allow_all_users = false
+
+# Bootstrap central-governance ownership. Values may be internal user IDs,
+# verified email addresses, or provider-scoped SCM logins such as github:octocat.
+# Keep at least one administrator here
+# so database role mistakes cannot lock every operator out.
+platform_admin_users  = "security-lead@example.com"
+platform_editor_users = "appsec@example.com,github:platform-engineering"
+
+# Optional Git-backed catalogue. When enabled, Skill and MCP metadata is edited
+# through pull requests; the control plane reconciles it every 15 minutes.
+# The Git MCP definition declares an automatic channel/range, while the runtime
+# catalogue records the exact resolved package version and integrity hash.
+governance_repo_owner       = "your-security-org"
+governance_repo_name        = "agent-governance"
+governance_repo_ref         = "main"
+governance_repo_path        = ".openinspect"
+governance_npm_registry_url = "https://registry.npmjs.org"
+governance_mcp_builder_url  = "https://mcp-artifact-builder.example.com"
+
+# Keep private registry credentials out of Git. Supply this through a secure
+# tfvars/CI secret, not by committing it here.
+# governance_npm_registry_token = "..."
+# governance_mcp_builder_token  = "..."

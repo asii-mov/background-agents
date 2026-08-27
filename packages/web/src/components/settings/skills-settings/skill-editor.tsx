@@ -17,6 +17,7 @@ import {
 import { useEnvironments } from "@/hooks/use-environments";
 import { useRepos } from "@/hooks/use-repos";
 import { Button } from "@/components/ui/button";
+import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
@@ -72,6 +73,7 @@ export function SkillEditor({
   const [assignmentKeys, setAssignmentKeys] = useState(
     () => new Set(initialAssignments.map(assignmentKey))
   );
+  const [required, setRequired] = useState(skill?.required ?? false);
   const [saving, setSaving] = useState(false);
   const [reimporting, setReimporting] = useState(false);
   const [validation, setValidation] = useState<{
@@ -92,6 +94,7 @@ export function SkillEditor({
         .filter(({ path }) => path !== "SKILL.md")
         .map(({ path, content, executable }) => ({ path, content, executable })) ?? [],
     assignments: initialAssignments.map(assignmentKey).sort(),
+    required: skill?.required ?? false,
   });
   const dirty =
     JSON.stringify({
@@ -103,6 +106,7 @@ export function SkillEditor({
       metadataText,
       files,
       assignments: [...assignmentKeys].sort(),
+      required,
     }) !== initialState;
 
   useEffect(() => {
@@ -147,13 +151,14 @@ export function SkillEditor({
       const saveContent = { ...content, metadata: parsedMetadata() };
       const assignments = buildAssignments(assignmentKeys, repos, environments, initialAssignments);
       if (creating) {
-        const created = await createSkill({ name, content: saveContent, assignments });
+        const created = await createSkill({ name, content: saveContent, assignments, required });
         toast.success("Skill created");
         onSaved(created.id);
       } else if (skill) {
         const revised = await replaceSkillContentAndAssignments(skill.id, skill.currentRevisionId, {
           content: saveContent,
           assignments,
+          required,
         });
         toast.success(`Saved revision ${revised.revisionNumber}`);
         onSaved(skill.id);
@@ -278,6 +283,21 @@ export function SkillEditor({
         Managed skills are trusted instructions, not a permission boundary. Review scripts and
         content carefully because agents can use capabilities already available in the session.
       </div>
+
+      <label className="flex items-start gap-3 rounded border border-border-muted p-4">
+        <Checkbox
+          checked={required}
+          onCheckedChange={(value) => setRequired(value === true)}
+          aria-label="Required managed skill"
+        />
+        <span>
+          <span className="block text-sm font-medium text-foreground">Required for its scope</span>
+          <span className="mt-1 block text-xs text-muted-foreground">
+            Always installs even when a user selects no Skills or a personal profile. A repository
+            Skill with the same name blocks sandbox startup instead of shadowing this one.
+          </span>
+        </span>
+      </label>
 
       {skill && (
         <div className="rounded border border-border-muted p-3 text-xs text-muted-foreground">

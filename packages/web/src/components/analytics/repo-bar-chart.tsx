@@ -120,7 +120,13 @@ export function AnalyticsRepoBarChart({ entries, loading }: RepoBarChartProps) {
 
       <div className="mt-6 max-h-[420px] overflow-y-auto rounded-lg border border-border-muted bg-background p-3 pr-2 sm:p-4">
         <div style={{ height: chartHeight }}>
-          <ResponsiveContainer width="100%" height="100%">
+          <ResponsiveContainer
+            width="100%"
+            height="100%"
+            minWidth={0}
+            minHeight={0}
+            initialDimension={{ width: 800, height: chartHeight }}
+          >
             <BarChart
               data={chartData}
               layout="vertical"

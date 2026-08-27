@@ -144,6 +144,7 @@ export const createSkillInputSchema = z.strictObject({
   name: skillNameSchema,
   content: skillContentInputSchema,
   assignments: z.array(skillAssignmentInputSchema).optional().default([]),
+  required: z.boolean().optional(),
 });
 
 export const setSkillEnabledInputSchema = z.strictObject({ enabled: z.boolean() });
@@ -151,6 +152,7 @@ export const setSkillEnabledInputSchema = z.strictObject({ enabled: z.boolean() 
 export const replaceSkillContentAndAssignmentsInputSchema = z.strictObject({
   content: skillContentInputSchema,
   assignments: z.array(skillAssignmentInputSchema),
+  required: z.boolean().optional(),
 });
 
 export const skillFileSchema = z.strictObject({
@@ -241,6 +243,7 @@ export const skillSummarySchema = z.strictObject({
   name: skillNameSchema,
   description: z.string(),
   enabled: z.boolean(),
+  required: z.boolean().default(false),
   currentRevisionId: z.string(),
   revisionNumber: z.number().int().positive(),
   revisionSha256: z.string(),
@@ -256,6 +259,9 @@ export const skillSummarySchema = z.strictObject({
   source: skillImportProvenanceSchema.nullable().optional().default(null),
   createdBy: z.string(),
   updatedBy: z.string(),
+  sourceKind: z.enum(["app", "git"]).optional(),
+  sourcePath: z.string().optional(),
+  sourceCommitSha: z.string().optional(),
   createdAt: z.number(),
   updatedAt: z.number(),
 });
@@ -450,6 +456,7 @@ export const resolvedSkillSchema = z.strictObject({
   revisionNumber: z.number().int().positive(),
   revisionSha256: z.string(),
   totalBytes: z.number().int().nonnegative(),
+  required: z.boolean(),
   assignmentSources: z.array(skillAssignmentSchema),
 });
 
@@ -471,7 +478,7 @@ const sessionSkillManifestSelectionSchema = z.union([
 
 export const sessionSkillsViewSchema = z.strictObject({
   manifestSha256: z.string(),
-  resolverVersion: z.literal(1),
+  resolverVersion: z.union([z.literal(1), z.literal(2)]),
   selection: sessionSkillManifestSelectionSchema,
   resolvedAt: z.number(),
   skills: z.array(resolvedSkillSchema),
@@ -491,6 +498,7 @@ export const sandboxSkillInstallationSchema = z.object({
   skills: z.array(
     z.object({
       name: skillNameSchema,
+      required: z.boolean().default(false),
       files: z.array(skillFileSchema),
     })
   ),

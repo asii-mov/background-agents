@@ -13,17 +13,36 @@ expect.extend(matchers);
 const mocks = vi.hoisted(() => ({
   mutate: vi.fn(),
   updateMcpServer: vi.fn(),
+  updateMcpServerCredentials: vi.fn(),
+  governanceStatus: undefined as
+    | undefined
+    | {
+        configured: true;
+        source: { provider: string; owner: string; name: string; ref: string; path: string };
+        lastStatus: "succeeded";
+      },
 }));
 
 vi.mock("sonner", () => ({ toast: { success: vi.fn(), error: vi.fn() } }));
 vi.mock("@/hooks/use-repos", () => ({
   useRepos: () => ({ repos: [], loading: false }),
 }));
+vi.mock("@/hooks/use-environments", () => ({
+  useEnvironments: () => ({ environments: [], loading: false }),
+}));
+vi.mock("@/hooks/use-platform-role", () => ({
+  usePlatformRole: () => ({ canWriteCatalog: true }),
+}));
 vi.mock("@/hooks/use-mcp-servers", () => ({
   useMcpServers: () => ({ servers, loading: false, mutate: mocks.mutate }),
   createMcpServer: vi.fn(),
   updateMcpServer: mocks.updateMcpServer,
+  updateMcpServerCredentials: mocks.updateMcpServerCredentials,
   deleteMcpServer: vi.fn(),
+}));
+vi.mock("@/hooks/use-governance-catalog", () => ({
+  useGovernanceCatalog: () => ({ status: mocks.governanceStatus, mutate: vi.fn() }),
+  syncGovernanceCatalog: vi.fn(),
 }));
 
 const servers: McpServerMetadata[] = [
@@ -36,6 +55,10 @@ const servers: McpServerMetadata[] = [
     hasEnv: false,
     hasHeaders: false,
     repoScopes: null,
+    environmentScopes: null,
+    lifecycle: "approved",
+    createdBy: "security-user",
+    updatedBy: "security-user",
     enabled: true,
   },
   {
@@ -47,6 +70,10 @@ const servers: McpServerMetadata[] = [
     hasEnv: false,
     hasHeaders: false,
     repoScopes: null,
+    environmentScopes: ["production"],
+    lifecycle: "approved",
+    createdBy: "security-user",
+    updatedBy: "security-user",
     enabled: true,
   },
 ];
@@ -54,9 +81,17 @@ const servers: McpServerMetadata[] = [
 afterEach(() => {
   cleanup();
   vi.clearAllMocks();
+  mocks.governanceStatus = undefined;
+  delete servers[0].sourceKind;
 });
 
 describe("McpServersSettings", () => {
+  it("renders environment-only scope instead of calling the server global", () => {
+    render(<McpServersSettings />);
+
+    expect(screen.getByText(/environment production/)).toBeInTheDocument();
+  });
+
   it("does not close a newer draft when an older save completes", async () => {
     let resolveSave!: (server: McpServerMetadata) => void;
     mocks.updateMcpServer.mockReturnValue(
@@ -101,9 +136,47 @@ describe("McpServersSettings", () => {
       name: "Server A",
       enabled: true,
       repoScopes: null,
+      environmentScopes: null,
+      lifecycle: "approved",
       type: "local",
       command: ["npx", "tool"],
       revision: 3,
     });
+  });
+
+  it("keeps Git metadata read-only while allowing credential rotation", async () => {
+    mocks.governanceStatus = {
+      configured: true,
+      source: {
+        provider: "github",
+        owner: "security",
+        name: "governance",
+        ref: "main",
+        path: ".openinspect",
+      },
+      lastStatus: "succeeded",
+    };
+    servers[0].sourceKind = "git";
+    mocks.updateMcpServerCredentials.mockResolvedValue(servers[0]);
+    const user = userEvent.setup();
+    render(<McpServersSettings />);
+
+    expect(screen.queryByRole("button", { name: "Add Server" })).not.toBeInTheDocument();
+    for (const item of screen.getAllByRole("switch", { name: "Disable" })) {
+      expect(item).toBeDisabled();
+    }
+    await user.click(screen.getByRole("button", { name: /Server A/ }));
+    expect(screen.queryByDisplayValue("https://a.example.com")).not.toBeInTheDocument();
+    await user.type(screen.getByPlaceholderText("Header-Name"), "Authorization");
+    await user.type(screen.getByPlaceholderText("value"), "secret");
+    await user.click(screen.getByRole("button", { name: "Save Credentials" }));
+
+    await waitFor(() =>
+      expect(mocks.updateMcpServerCredentials).toHaveBeenCalledWith("server-a", {
+        revision: 3,
+        headers: { Authorization: "secret" },
+      })
+    );
+    expect(mocks.updateMcpServer).not.toHaveBeenCalled();
   });
 });

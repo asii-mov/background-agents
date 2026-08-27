@@ -47,9 +47,11 @@ function globalSettings(
 }
 
 function renderWithSWR(fallbackData: unknown) {
-  const fetchMock = vi.fn(async () => {
-    throw new Error("unexpected fetch");
-  });
+  const fetchMock = vi.fn(
+    async (_input: RequestInfo | URL, _init?: RequestInit): Promise<Response> => {
+      throw new Error("unexpected fetch");
+    }
+  );
   vi.stubGlobal("fetch", fetchMock);
 
   const result = render(
@@ -87,9 +89,38 @@ describe("SandboxSettingsPage — tunnel ports editor", () => {
   it("groups related sandbox controls under accessible names", () => {
     renderWithSWR({ integrationId: "sandbox", settings: null });
 
-    for (const name of ["Service Ports", "Tunnel Ports", "Child Sessions", "Resources"]) {
+    for (const name of [
+      "Outbound Network",
+      "Service Ports",
+      "Tunnel Ports",
+      "Child Sessions",
+      "Resources",
+    ]) {
       expect(screen.getByRole("group", { name })).toBeInTheDocument();
     }
+  });
+
+  it("saves a centrally managed outbound allowlist", async () => {
+    const { fetchMock } = renderWithSWR({ integrationId: "sandbox", settings: null });
+    fetchMock.mockImplementation(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      if (init?.method === "PUT") return new Response(JSON.stringify({}), { status: 200 });
+      throw new Error("unexpected fetch");
+    });
+
+    await user.selectOptions(screen.getByLabelText("Egress policy"), "allowlist");
+    await user.type(screen.getByLabelText("TLS domains"), "api.openai.com{enter}*.github.com");
+    await user.type(screen.getByLabelText("CIDR ranges"), "10.0.0.0/8");
+    await user.click(screen.getByText("Save Settings"));
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalled());
+    const putCall = fetchMock.mock.calls.find(([, init]) => init?.method === "PUT");
+    expect(putCall).toBeDefined();
+    const body = JSON.parse(String(putCall?.[1]?.body));
+    expect(body.settings.defaults.networkPolicy).toEqual({
+      mode: "allowlist",
+      allowedCidrs: ["10.0.0.0/8"],
+      allowedDomains: ["api.openai.com", "*.github.com"],
+    });
   });
 
   it("displays session timeout in minutes and saves milliseconds", async () => {

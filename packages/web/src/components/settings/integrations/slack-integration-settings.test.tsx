@@ -665,7 +665,8 @@ describe("SlackIntegrationSettings", () => {
 
       const section = routingSection();
       // Save is disabled until the form is dirty; edit a keyword (keeping it
-      // valid) so the only remaining problem is the over-limit count.
+      // valid) so the only remaining problem is the over-limit count. The
+      // 101-row DOM is intentionally large and needs a wider CI budget.
       await user.type(
         within(section).getAllByRole("textbox", { name: /routing keyword/i })[0],
         "x"
@@ -676,7 +677,7 @@ describe("SlackIntegrationSettings", () => {
         expect.stringContaining(String(MAX_SLACK_ROUTING_RULES))
       );
       expect(fetchMock).not.toHaveBeenCalled();
-    });
+    }, 10_000);
 
     it("warns when a rule targets a repository that is not accessible", () => {
       setupSWR({

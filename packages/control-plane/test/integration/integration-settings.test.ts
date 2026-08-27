@@ -487,6 +487,42 @@ describe("Integration settings API", () => {
   });
 
   describe("sandbox settings API", () => {
+    async function seedMemberActor(): Promise<void> {
+      const now = Date.now();
+      await env.DB.batch([
+        env.DB.prepare(
+          `INSERT INTO users
+             (id, display_name, email, email_verified, avatar_url, platform_role, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+        ).bind(
+          "network-member",
+          "Network Member",
+          "member@test.local",
+          1,
+          null,
+          "member",
+          now,
+          now
+        ),
+        env.DB.prepare(
+          `INSERT INTO user_identities
+             (id, user_id, provider, provider_user_id, provider_login, provider_email,
+              provider_issuer, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        ).bind(
+          "network-member-github",
+          "network-member",
+          "github",
+          "network-member-gh",
+          "network-member",
+          "member@test.local",
+          "https://github.com",
+          now,
+          now
+        ),
+      ]);
+    }
+
     it("GET /integration-settings/sandbox returns null settings when unconfigured", async () => {
       const response = await serviceFetch("https://test.local/integration-settings/sandbox");
       expect(response.status).toBe(200);
@@ -514,6 +550,44 @@ describe("Integration settings API", () => {
         };
       }>();
       expect(body.settings.defaults.tunnelPorts).toEqual([3000]);
+    });
+
+    it("keeps outbound network policy under editor ownership", async () => {
+      const approvedPolicy = {
+        mode: "allowlist",
+        allowedDomains: ["api.openai.com", "*.github.com"],
+      };
+      const configured = await serviceFetch("https://test.local/integration-settings/sandbox", {
+        method: "PUT",
+        body: JSON.stringify({ settings: { defaults: { networkPolicy: approvedPolicy } } }),
+      });
+      expect(configured.status).toBe(200);
+      await seedMemberActor();
+
+      const memberRequest = (defaults: Record<string, unknown>) =>
+        serviceFetch("https://test.local/integration-settings/sandbox", {
+          service: "github-bot",
+          actor: "github:network-member-gh",
+          method: "PUT",
+          body: JSON.stringify({ settings: { defaults } }),
+        });
+
+      // A member can change an unrelated setting only while preserving the
+      // centrally owned policy verbatim.
+      expect(
+        (await memberRequest({ networkPolicy: approvedPolicy, terminalEnabled: true })).status
+      ).toBe(200);
+      expect(
+        (await memberRequest({ networkPolicy: { mode: "blocked" }, terminalEnabled: true })).status
+      ).toBe(403);
+      expect((await memberRequest({ terminalEnabled: false })).status).toBe(403);
+
+      const resolved = await serviceFetch(
+        "https://test.local/integration-settings/sandbox/resolved/testowner/testrepo"
+      );
+      await expect(resolved.json()).resolves.toMatchObject({
+        config: { networkPolicy: approvedPolicy, terminalEnabled: true },
+      });
     });
 
     it("PUT /integration-settings/sandbox with invalid tunnelPorts returns 400", async () => {

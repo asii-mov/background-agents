@@ -47,6 +47,11 @@ from .log_config import configure_logging, get_logger
 from .opencode_client import OpenCodeClient
 from .prompt_stream import OpenCodePromptStream
 from .repo_config import find_repo_entry, load_repo_manifest
+from .security_pipeline import (
+    SecurityPipelineReport,
+    SecurityPipelineRunner,
+    parse_security_pipelines,
+)
 from .types import GitUser
 
 configure_logging()
@@ -236,6 +241,11 @@ class AgentBridge:
         self.opencode_session_id: str | None = None
         self.session_id_file = Path(tempfile.gettempdir()) / "opencode-session-id"
         self.repo_path = Path("/workspace")
+        self.security_pipelines = SecurityPipelineRunner(
+            parse_security_pipelines(os.environ.get("SESSION_CONFIG", "{}")),
+            self.repo_path,
+            self.log,
+        )
         # Supervisor-written canonical repo manifest; push targeting resolves
         # member checkout paths through it rather than joining spec-supplied
         # names into the filesystem.
@@ -734,6 +744,63 @@ class AgentBridge:
                     reasoning_effort=reasoning_effort,
                 )
 
+            if not had_error and self.security_pipelines.pipelines:
+                for remediation_attempt in range(
+                    self.security_pipelines.max_remediation_attempts + 1
+                ):
+                    report = await self._run_security_pipelines_for_workspace()
+                    if not report.failures:
+                        await self._send_event(
+                            {
+                                "type": "warning",
+                                "scope": "security_pipeline",
+                                "message": "Centrally managed application-security checks passed.",
+                            }
+                        )
+                        break
+
+                    await self._send_event(
+                        {
+                            "type": "warning",
+                            "scope": "security_pipeline",
+                            "message": (
+                                f"{len(report.failures)} application-security check(s) failed; "
+                                + (
+                                    "requesting autonomous remediation."
+                                    if remediation_attempt
+                                    < self.security_pipelines.max_remediation_attempts
+                                    else "remediation attempts exhausted."
+                                )
+                            ),
+                        }
+                    )
+                    if remediation_attempt >= self.security_pipelines.max_remediation_attempts:
+                        if report.blocking_failures:
+                            had_error = True
+                            error_message = (
+                                "Centrally managed application-security checks still fail after "
+                                "autonomous remediation."
+                            )
+                        break
+
+                    remediation_had_error = False
+                    async for event in self._stream_opencode_response_sse(
+                        message_id,
+                        report.remediation_prompt(),
+                        model,
+                        reasoning_effort,
+                        [],
+                    ):
+                        if event.get("type") == "error":
+                            remediation_had_error = True
+                            error_message = event.get("error")
+                        elif event.get("type") in ("token", "tool_call", "step_finish"):
+                            emitted_output = True
+                        await self._send_event(event)
+                    if remediation_had_error:
+                        had_error = True
+                        break
+
             if had_error:
                 outcome = "error"
 
@@ -862,6 +929,7 @@ class AgentBridge:
         try:
             self._validate_push_request(request, spec_present=push_spec is not None)
             repo_dir = self._resolve_push_checkout(request)
+            await self._enforce_security_pipelines_before_push(request, repo_dir)
             await self._run_git_push(request, repo_dir)
         except PushRejected as rejection:
             await self._send_push_error(str(rejection), request)
@@ -885,6 +953,53 @@ class AgentBridge:
                 "timestamp": time.time(),
             }
         )
+
+    async def _run_security_pipelines_for_workspace(self) -> SecurityPipelineReport:
+        """Run each assigned pipeline from every applicable repository root."""
+        repositories = load_repo_manifest(self.repo_manifest_path)
+        if not repositories:
+            return await self.security_pipelines.run(workdir=self.repo_path)
+        reports = [
+            await self.security_pipelines.run(
+                workdir=repository.path,
+                repo_full_name=f"{repository.owner}/{repository.name}",
+            )
+            for repository in repositories
+        ]
+        return SecurityPipelineReport.combine(reports)
+
+    async def _enforce_security_pipelines_before_push(
+        self, request: PushRequest, repo_dir: Path
+    ) -> None:
+        """Reject a push unless blocking centrally assigned checks pass.
+
+        The create-pull-request tool waits for this bridge operation, so the
+        agent receives the verified diagnostics in the same turn, can patch
+        the findings, and can retry. No branch or PR is created first.
+        """
+        if not self.security_pipelines.pipelines:
+            return
+        repo_full_name = request.repo_full_name if request.has_repo_identity else None
+        if repo_full_name is None:
+            for repository in load_repo_manifest(self.repo_manifest_path):
+                if repository.path == repo_dir:
+                    repo_full_name = f"{repository.owner}/{repository.name}"
+                    break
+        report = await self.security_pipelines.run(
+            workdir=repo_dir,
+            repo_full_name=repo_full_name,
+        )
+        if report.blocking_failures:
+            self._reject_push(
+                reason="security_pipeline_failed",
+                message=(
+                    "Push blocked by centrally managed application-security checks.\n\n"
+                    f"{report.remediation_prompt()}"
+                ),
+                repo_owner=request.repo_owner,
+                repo_name=request.repo_name,
+                failed_checks=len(report.blocking_failures),
+            )
 
     def _reject_push(self, *, reason: str, message: str, **log_fields: Any) -> NoReturn:
         """Log a push rejection and raise it toward _handle_push's emitter."""

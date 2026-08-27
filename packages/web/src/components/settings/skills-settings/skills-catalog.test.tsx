@@ -10,8 +10,9 @@ import { SkillsCatalog } from "./skills-catalog";
 
 expect.extend(matchers);
 
-const { useSkillCatalogPageMock } = vi.hoisted(() => ({
+const { useSkillCatalogPageMock, governance } = vi.hoisted(() => ({
   useSkillCatalogPageMock: vi.fn(),
+  governance: { configured: false },
 }));
 
 vi.mock("@/hooks/use-managed-skills", () => ({
@@ -21,6 +22,12 @@ vi.mock("@/hooks/use-managed-skills", () => ({
   useSkill: () => ({ skill: undefined, loading: false, error: undefined, mutate: vi.fn() }),
   useSkillCatalogPage: useSkillCatalogPageMock,
 }));
+vi.mock("@/hooks/use-platform-role", () => ({
+  usePlatformRole: () => ({ canWriteCatalog: true }),
+}));
+vi.mock("@/hooks/use-governance-catalog", () => ({
+  useGovernanceCatalog: () => ({ status: governance }),
+}));
 
 function skill(id: string, name: string): SkillSummary {
   return {
@@ -28,6 +35,7 @@ function skill(id: string, name: string): SkillSummary {
     name,
     description: `${name} description`,
     enabled: true,
+    required: false,
     currentRevisionId: `revision-${id}`,
     revisionNumber: 1,
     revisionSha256: "a".repeat(64),
@@ -45,6 +53,7 @@ function skill(id: string, name: string): SkillSummary {
 }
 
 beforeEach(() => {
+  governance.configured = false;
   useSkillCatalogPageMock.mockReset();
   useSkillCatalogPageMock.mockImplementation((cursor: string | null) =>
     cursor
@@ -68,6 +77,16 @@ beforeEach(() => {
 afterEach(cleanup);
 
 describe("SkillsCatalog", () => {
+  it("makes the shared catalogue read-only when Git governance is configured", () => {
+    governance.configured = true;
+    render(<SkillsCatalog />);
+
+    expect(screen.queryByRole("button", { name: "New skill" })).not.toBeInTheDocument();
+    expect(screen.getByRole("switch", { name: "Disable first-skill" })).toBeDisabled();
+    expect(screen.queryByRole("button", { name: "Delete" })).not.toBeInTheDocument();
+    expect(screen.getByText(/Skills are read-only here/)).toBeInTheDocument();
+  });
+
   it("loads catalog pages on demand and navigates back with cursor history", async () => {
     const user = userEvent.setup();
     render(<SkillsCatalog />);

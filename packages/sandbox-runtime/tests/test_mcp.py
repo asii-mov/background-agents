@@ -1,9 +1,14 @@
 """Tests for MCP server resolution, package installation, and config building."""
 
+import hashlib
+import io
 import json
 import os
+import tarfile
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
 
 from tests.runtime_helpers import make_opencode_server
@@ -130,6 +135,92 @@ class TestInstallMcpPackages:
         with patch("asyncio.create_subprocess_exec") as mock_exec:
             await sup._install_mcp_packages([])
             mock_exec.assert_not_called()
+
+    @staticmethod
+    def _artifact() -> bytes:
+        output = io.BytesIO()
+        with tarfile.open(fileobj=output, mode="w:gz") as archive:
+            for name, content, mode in [
+                ("artifact.json", b'{"schemaVersion":1}', 0o644),
+                ("node_modules/.bin/context-mcp", b"#!/bin/sh\nexit 0\n", 0o755),
+            ]:
+                info = tarfile.TarInfo(name)
+                info.size = len(content)
+                info.mode = mode
+                archive.addfile(info, io.BytesIO(content))
+        return output.getvalue()
+
+    async def test_materializes_and_rewrites_a_pinned_artifact(self, tmp_path: Path):
+        artifact = self._artifact()
+        sha256 = hashlib.sha256(artifact).hexdigest()
+        server = {
+            "id": "mcp-1",
+            "revision": 3,
+            "name": "context",
+            "type": "local",
+            "command": ["context-mcp", "--safe"],
+            "artifactSha256": sha256,
+            "artifactExecutable": "context-mcp",
+        }
+        sup = _make_supervisor({"session_id": "session-1"})
+        client_type = httpx.AsyncClient
+
+        def client_factory(*_args, **_kwargs):
+            transport = httpx.MockTransport(lambda _request: httpx.Response(200, content=artifact))
+            return client_type(transport=transport)
+
+        env = {
+            "CONTROL_PLANE_URL": "https://control.example",
+            "SANDBOX_AUTH_TOKEN": "sandbox-secret",
+            "SESSION_CONFIG": json.dumps({"session_id": "session-1"}),
+            "OI_MCP_ARTIFACT_DIR": str(tmp_path),
+        }
+        with (
+            patch.dict(os.environ, env, clear=False),
+            patch("sandbox_runtime.opencode_server.httpx.AsyncClient", side_effect=client_factory),
+            patch("asyncio.create_subprocess_exec") as mock_exec,
+        ):
+            await sup._install_mcp_packages([server])
+
+        assert server["command"] == [
+            str(tmp_path / sha256 / "node_modules/.bin/context-mcp"),
+            "--safe",
+        ]
+        assert Path(server["command"][0]).read_text() == "#!/bin/sh\nexit 0\n"
+        mock_exec.assert_not_called()
+
+    async def test_rejects_an_artifact_whose_bytes_do_not_match(self, tmp_path: Path):
+        artifact = self._artifact()
+        server = {
+            "id": "mcp-1",
+            "revision": 3,
+            "type": "local",
+            "command": ["context-mcp"],
+            "artifactSha256": "0" * 64,
+            "artifactExecutable": "context-mcp",
+        }
+        sup = _make_supervisor({"session_id": "session-1"})
+        client_type = httpx.AsyncClient
+
+        def client_factory(*_args, **_kwargs):
+            transport = httpx.MockTransport(lambda _request: httpx.Response(200, content=artifact))
+            return client_type(transport=transport)
+
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "CONTROL_PLANE_URL": "https://control.example",
+                    "SANDBOX_AUTH_TOKEN": "sandbox-secret",
+                    "SESSION_CONFIG": json.dumps({"session_id": "session-1"}),
+                    "OI_MCP_ARTIFACT_DIR": str(tmp_path),
+                },
+                clear=False,
+            ),
+            patch("sandbox_runtime.opencode_server.httpx.AsyncClient", side_effect=client_factory),
+            pytest.raises(RuntimeError, match="digest"),
+        ):
+            await sup._install_mcp_packages([server])
 
 
 # ─── _build_mcp_config ──────────────────────────────────────────────────────

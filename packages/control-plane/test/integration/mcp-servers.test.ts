@@ -13,6 +13,10 @@ interface McpServerMetadata {
   hasEnv: boolean;
   hasHeaders: boolean;
   repoScopes: string[] | null;
+  environmentScopes: string[] | null;
+  lifecycle: "development" | "approved" | "deprecated";
+  createdBy: string;
+  updatedBy: string;
   enabled: boolean;
 }
 
@@ -39,6 +43,8 @@ describe("MCP Servers API", () => {
       expect(body.enabled).toBe(true);
       expect(body.id).toBeTruthy();
       expect(body.revision).toBe(1);
+      expect(body.lifecycle).toBe("development");
+      expect(body.createdBy).toBe("11111111111111111111111111111111");
     });
 
     it("creates a remote server", async () => {
@@ -128,6 +134,31 @@ describe("MCP Servers API", () => {
       });
 
       expect(response.status).toBe(400);
+    });
+
+    it("requires Git-built artifacts before approving an npx server", async () => {
+      const unpinned = await serviceFetch("https://test.local/mcp-servers", {
+        method: "POST",
+        body: JSON.stringify({
+          name: "unpinned-approved",
+          type: "local",
+          command: ["npx", "-y", "@playwright/mcp"],
+          lifecycle: "approved",
+        }),
+      });
+      expect(unpinned.status).toBe(400);
+
+      const pinned = await serviceFetch("https://test.local/mcp-servers", {
+        method: "POST",
+        body: JSON.stringify({
+          name: "pinned-approved",
+          type: "local",
+          command: ["npx", "-y", "@playwright/mcp@0.0.40"],
+          lifecycle: "approved",
+          environmentScopes: ["production"],
+        }),
+      });
+      expect(pinned.status).toBe(400);
     });
 
     it("returns 400 for duplicate name", async () => {
@@ -254,13 +285,35 @@ describe("MCP Servers API", () => {
 
       const response = await serviceFetch(`https://test.local/mcp-servers/${created.id}`, {
         method: "PUT",
-        body: JSON.stringify({ name: "updated-name", url: "https://new.example.com" }),
+        body: JSON.stringify({
+          name: "updated-name",
+          url: "https://new.example.com",
+          revision: created.revision,
+        }),
       });
       expect(response.status).toBe(200);
       const body = await response.json<McpServerMetadata>();
       expect(body.name).toBe("updated-name");
       expect(body.url).toBe("https://new.example.com");
       expect(body.revision).toBe(2);
+    });
+
+    it("requires a revision precondition", async () => {
+      const createRes = await serviceFetch("https://test.local/mcp-servers", {
+        method: "POST",
+        body: JSON.stringify({
+          name: "revision-required",
+          type: "remote",
+          url: "https://original.example.com",
+        }),
+      });
+      const created = await createRes.json<McpServerMetadata>();
+
+      const response = await serviceFetch(`https://test.local/mcp-servers/${created.id}`, {
+        method: "PUT",
+        body: JSON.stringify({ name: "unconditional-write" }),
+      });
+      expect(response.status).toBe(400);
     });
 
     it("rejects a stale revision and accepts a retry from the latest revision", async () => {
@@ -332,7 +385,7 @@ describe("MCP Servers API", () => {
     it("returns 404 for missing server", async () => {
       const response = await serviceFetch("https://test.local/mcp-servers/nonexistent", {
         method: "PUT",
-        body: JSON.stringify({ name: "nope" }),
+        body: JSON.stringify({ name: "nope", revision: 1 }),
       });
       expect(response.status).toBe(404);
     });
@@ -351,7 +404,7 @@ describe("MCP Servers API", () => {
       // Change to local without providing command
       const response = await serviceFetch(`https://test.local/mcp-servers/${created.id}`, {
         method: "PUT",
-        body: JSON.stringify({ type: "local" }),
+        body: JSON.stringify({ type: "local", revision: created.revision }),
       });
       expect(response.status).toBe(400);
     });
@@ -370,7 +423,11 @@ describe("MCP Servers API", () => {
 
       const response = await serviceFetch(`https://test.local/mcp-servers/${created.id}`, {
         method: "PUT",
-        body: JSON.stringify({ type: "remote", url: "https://remote.example.com" }),
+        body: JSON.stringify({
+          type: "remote",
+          url: "https://remote.example.com",
+          revision: created.revision,
+        }),
       });
 
       expect(response.status).toBe(200);
@@ -399,7 +456,11 @@ describe("MCP Servers API", () => {
 
       const response = await serviceFetch(`https://test.local/mcp-servers/${created.id}`, {
         method: "PUT",
-        body: JSON.stringify({ type: "local", command: ["npx", "x"] }),
+        body: JSON.stringify({
+          type: "local",
+          command: ["npx", "x"],
+          revision: created.revision,
+        }),
       });
 
       expect(response.status).toBe(200);
@@ -436,7 +497,7 @@ describe("MCP Servers API", () => {
 
       const response = await serviceFetch(`https://test.local/mcp-servers/${created.id}`, {
         method: "PUT",
-        body: JSON.stringify(patch),
+        body: JSON.stringify({ ...patch, revision: created.revision }),
       });
 
       expect(response.status).toBe(400);
@@ -451,10 +512,50 @@ describe("MCP Servers API", () => {
 
       const response = await serviceFetch(`https://test.local/mcp-servers/${created.id}`, {
         method: "PUT",
-        body: JSON.stringify({ headers: { Authorization: "secret" } }),
+        body: JSON.stringify({
+          headers: { Authorization: "secret" },
+          revision: created.revision,
+        }),
       });
 
       expect(response.status).toBe(400);
+    });
+  });
+
+  describe("PUT /mcp-servers/:id/credentials", () => {
+    it("rotates secrets without changing the immutable runtime revision", async () => {
+      const createRes = await serviceFetch("https://test.local/mcp-servers", {
+        method: "POST",
+        body: JSON.stringify({
+          name: "credential-only",
+          type: "remote",
+          url: "https://mcp.example.com",
+        }),
+      });
+      const created = await createRes.json<McpServerMetadata>();
+
+      const response = await serviceFetch(
+        `https://test.local/mcp-servers/${created.id}/credentials`,
+        {
+          method: "PUT",
+          body: JSON.stringify({
+            revision: created.revision,
+            headers: { Authorization: "Bearer rotated" },
+          }),
+        }
+      );
+
+      expect(response.status).toBe(200);
+      await expect(response.json<McpServerMetadata>()).resolves.toMatchObject({
+        revision: created.revision,
+        hasHeaders: true,
+      });
+      const revisions = await env.DB.prepare(
+        "SELECT COUNT(*) AS count FROM mcp_catalog_revisions WHERE mcp_server_id = ?"
+      )
+        .bind(created.id)
+        .first<{ count: number }>();
+      expect(revisions?.count).toBe(1);
     });
   });
 

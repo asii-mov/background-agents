@@ -14,6 +14,7 @@ on:
       - "packages/control-plane/**"
       - "packages/github-bot/**"
       - "packages/linear-bot/**"
+      - "packages/mcp-artifact-builder/**"
       - "packages/opencomputer-infra/**"
       - "packages/sandbox-runtime/**"
       - "packages/shared/**"
@@ -23,6 +24,8 @@ on:
       - "terraform/d1/migrations/**"
       - "vitest.workspace.ts"
       - "!**/*.md"
+      - ".cursor/skills/verify-openinspect/**"
+      - "docs/REPO_MAP.md"
   pull_request:
     branches: [main]
     paths:
@@ -36,6 +39,7 @@ on:
       - "packages/control-plane/**"
       - "packages/github-bot/**"
       - "packages/linear-bot/**"
+      - "packages/mcp-artifact-builder/**"
       - "packages/opencomputer-infra/**"
       - "packages/sandbox-runtime/**"
       - "packages/shared/**"
@@ -45,6 +49,8 @@ on:
       - "terraform/d1/migrations/**"
       - "vitest.workspace.ts"
       - "!**/*.md"
+      - ".cursor/skills/verify-openinspect/**"
+      - "docs/REPO_MAP.md"
 
 permissions:
   contents: read
@@ -76,6 +82,9 @@ jobs:
 
       - name: Test complexity reporter
         run: npm run test:lint-complexity
+
+      - name: Check repository map
+        run: npm run repo-map:check
 
       - name: Check Prettier formatting
         run: npm run format:check
@@ -155,6 +164,9 @@ jobs:
       - name: Run control-plane unit tests
         run: npm test -w @open-inspect/control-plane
 
+      - name: Run MCP artifact builder tests
+        run: npm test -w @open-inspect/mcp-artifact-builder
+
   test-cp-integration:
     name: Test (control-plane integration ${{ matrix.shard }})
     runs-on: ubuntu-latest
@@ -204,6 +216,34 @@ jobs:
 
       - name: Run web tests
         run: npm test -w @open-inspect/web
+
+  test-web-browser:
+    name: Test (web browser journeys)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install Chromium
+        run: npx playwright install --with-deps chromium
+
+      - name: Build shared package
+        run: npm run build -w @open-inspect/shared
+
+      - name: Run browser journeys
+        run: npm run test:e2e -w @open-inspect/web
+        env:
+          OPENINSPECT_VERIFY_BROWSER: chromium
 
   test-bots:
     name: Test (bots)

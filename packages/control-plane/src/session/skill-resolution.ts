@@ -62,9 +62,10 @@ export async function resolveManagedSkills(
     }
 
     // Profiles filter the already-applicable set; membership never bypasses
-    // disabled state or repository/environment assignment scope.
+    // disabled state or repository/environment assignment scope. Required
+    // skills are selected independently of the user's optional profile.
     const resolved = applicable
-      .filter((skill) => selectedIds === null || selectedIds.has(skill.id))
+      .filter((skill) => skill.required || selectedIds === null || selectedIds.has(skill.id))
       .map<ResolvedSkill>((skill) => ({
         skillId: skill.id,
         revisionId: skill.currentRevisionId,
@@ -73,6 +74,7 @@ export async function resolveManagedSkills(
         revisionNumber: skill.revisionNumber,
         revisionSha256: skill.revisionSha256,
         totalBytes: skill.totalBytes,
+        required: skill.required,
         assignmentSources: skill.assignments,
       }));
     const applicableIds = new Set(applicable.map((skill) => skill.id));

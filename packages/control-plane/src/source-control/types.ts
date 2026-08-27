@@ -54,6 +54,15 @@ export interface GitPushAuthContext {
   token: string;
 }
 
+export interface RepositoryTokenTarget extends GetRepositoryConfig {
+  /** Provider-specific repository id, when the session row already stores it. */
+  providerRepoId?: string | number | null;
+}
+
+export interface RepositoryScopedCredentialConfig {
+  repositories: readonly [RepositoryTokenTarget, ...RepositoryTokenTarget[]];
+}
+
 /**
  * Credentials returned to a sandbox's git credential helper.
  *
@@ -135,6 +144,25 @@ export interface GetRepositoryConfig {
   name: string;
 }
 
+export interface ReadRepositorySnapshotConfig extends GetRepositoryConfig {
+  ref: string;
+  path: string;
+  maxFiles: number;
+  maxBytes: number;
+}
+
+export interface RepositorySnapshotFile {
+  readonly path: string;
+  readonly content: string;
+  readonly sha?: string;
+}
+
+/** Bounded, immutable repository view used by central Git reconcilers. */
+export interface RepositorySnapshot {
+  readonly commitSha: string;
+  readonly files: readonly RepositorySnapshotFile[];
+}
+
 /**
  * Result of checking repository access via app-level credentials.
  */
@@ -147,6 +175,18 @@ export interface RepositoryAccessResult {
   repoName: string;
   /** Repository's default branch (e.g., "main") */
   defaultBranch: string;
+}
+
+type RepositoryPermission = "admin" | "maintain" | "write" | "triage" | "read";
+
+/** Verified repository permission for a named human user. */
+export interface RepositoryUserAccessResult {
+  permission: RepositoryPermission;
+}
+
+export interface CheckRepositoryUserAccessConfig extends GetRepositoryConfig {
+  /** Provider login/username linked to the canonical platform user. */
+  userLogin: string;
 }
 
 /**
@@ -387,6 +427,15 @@ export interface SourceControlProvider {
   checkRepositoryAccess(config: GetRepositoryConfig): Promise<RepositoryAccessResult | null>;
 
   /**
+   * Check a human user's effective access using installation/service credentials.
+   * Returns null for an explicit denial or missing repository. Throws when the
+   * provider cannot perform the check or the upstream request fails.
+   */
+  checkRepositoryUserAccess(
+    config: CheckRepositoryUserAccessConfig
+  ): Promise<RepositoryUserAccessResult | null>;
+
+  /**
    * List all repositories accessible to this deployment's app-level credentials.
    *
    * @returns Array of installation repositories
@@ -477,7 +526,7 @@ export interface SourceControlProvider {
    * @returns Git push authentication context with app token
    * @throws SourceControlProviderError
    */
-  generatePushAuth(): Promise<GitPushAuthContext>;
+  generatePushAuth(config: RepositoryScopedCredentialConfig): Promise<GitPushAuthContext>;
 
   /**
    * Generate credentials for the sandbox's git credential helper.
@@ -490,7 +539,9 @@ export interface SourceControlProvider {
    *
    * @throws SourceControlProviderError on configuration or upstream errors
    */
-  generateCredentialHelperAuth(): Promise<CredentialHelperAuth>;
+  generateCredentialHelperAuth(
+    config: RepositoryScopedCredentialConfig
+  ): Promise<CredentialHelperAuth>;
 
   /**
    * Build provider-specific URL for manual pull request creation.

@@ -239,6 +239,9 @@ describe("resolveCanonicalUserId", () => {
     expect(resolveOrCreateUser).toHaveBeenCalledWith(
       expect.objectContaining({ provider: "slack", providerUserId: "U0123", displayName: "Dana" })
     );
+    expect(resolveOrCreateUser).not.toHaveBeenCalledWith(
+      expect.objectContaining({ providerEmail: "d@example.com" })
+    );
   });
 
   it("fails closed with a 500 if a participant ever lacks both a canonical user and an actor", async () => {

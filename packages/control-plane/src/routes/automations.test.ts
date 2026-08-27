@@ -789,7 +789,7 @@ describe("automation route handlers", () => {
       );
     });
 
-    it("resolves an unseen bot actor via the user store with body display fields", async () => {
+    it("resolves an unseen bot actor without treating display email as identity proof", async () => {
       mockStore.getById.mockResolvedValue(sampleRow);
 
       const res = await callRoute("POST", "/automations", {
@@ -807,7 +807,6 @@ describe("automation route handlers", () => {
         provider: "slack",
         providerUserId: "U0123",
         displayName: "Alice",
-        providerEmail: "alice@corp.com",
         avatarUrl: "https://avatars.test/alice.png",
       });
       expect(mockStore.bindAutomationInsert).toHaveBeenCalledWith(

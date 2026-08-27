@@ -54,6 +54,7 @@ describe("managed skill content addressing", () => {
       revisionId: "skillrev_1",
       name: "acme-deploy",
       revisionSha256: first.revisionSha256,
+      required: false,
       assignmentSources: [
         { id: "assign_repo", type: "repository" as const, repoOwner: "acme", repoName: "api" },
         { id: "assign_global", type: "global" as const },
@@ -67,6 +68,12 @@ describe("managed skill content addressing", () => {
     await expect(hashSessionSkillManifest({ mode: "all" }, [skill])).resolves.toBe(
       golden.manifestSha256
     );
+    await expect(
+      Promise.all([
+        hashSessionSkillManifest({ mode: "all" }, [skill]),
+        hashSessionSkillManifest({ mode: "all" }, [{ ...skill, required: true }]),
+      ])
+    ).resolves.toSatisfy(([optional, required]) => optional !== required);
     expect(first.files).toEqual(golden.files);
   });
 });

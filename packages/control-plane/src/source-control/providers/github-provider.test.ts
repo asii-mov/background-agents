@@ -1,27 +1,30 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { GitHubSourceControlProvider } from "./github-provider";
 import { SourceControlProviderError } from "../errors";
+import { readRepositorySnapshot } from "../repository-snapshot";
 
 // Mock the upstream GitHub App auth functions
 vi.mock("../../auth/github-app", () => ({
+  createScopedInstallationTokenWithExpiry: vi.fn(),
   getCachedInstallationToken: vi.fn(),
-  getCachedInstallationTokenWithExpiry: vi.fn(),
   getInstallationRepository: vi.fn(),
   listInstallationRepositories: vi.fn(),
   fetchWithTimeout: vi.fn(),
 }));
 
 import {
+  createScopedInstallationTokenWithExpiry,
   fetchWithTimeout,
   getCachedInstallationToken,
-  getCachedInstallationTokenWithExpiry,
   getInstallationRepository,
   listInstallationRepositories,
 } from "../../auth/github-app";
 
 const mockGetInstallationRepository = vi.mocked(getInstallationRepository);
 const mockListInstallationRepositories = vi.mocked(listInstallationRepositories);
-const mockGetCachedInstallationTokenWithExpiry = vi.mocked(getCachedInstallationTokenWithExpiry);
+const mockCreateScopedInstallationTokenWithExpiry = vi.mocked(
+  createScopedInstallationTokenWithExpiry
+);
 const mockGetCachedInstallationToken = vi.mocked(getCachedInstallationToken);
 const mockFetchWithTimeout = vi.mocked(fetchWithTimeout);
 
@@ -48,6 +51,10 @@ const fakeAppConfig = {
   appId: "123",
   privateKey: "fake-key",
   installationId: "456",
+};
+
+const fakeRepositoryCredentialConfig = {
+  repositories: [{ owner: "acme", name: "web", providerRepoId: 1 }] as const,
 };
 
 describe("GitHubSourceControlProvider", () => {
@@ -96,6 +103,94 @@ describe("GitHubSourceControlProvider", () => {
         "Failed to resolve branch head: unexpected response shape (object.sha)"
       );
       expect((err as SourceControlProviderError).errorType).toBe("permanent");
+    });
+  });
+
+  describe("readRepositorySnapshot", () => {
+    it("resolves the ref once and returns bounded UTF-8 files from that commit", async () => {
+      mockGetCachedInstallationToken.mockResolvedValue("installation-token");
+      mockFetchWithTimeout
+        .mockResolvedValueOnce(new Response("commit-sha"))
+        .mockResolvedValueOnce(
+          makeJsonResponse({
+            tree: [
+              {
+                path: ".openinspect",
+                type: "tree",
+                mode: "040000",
+                sha: "governance-tree",
+              },
+            ],
+          })
+        )
+        .mockResolvedValueOnce(
+          makeJsonResponse({
+            truncated: false,
+            tree: [
+              {
+                path: "catalog.yaml",
+                type: "blob",
+                mode: "100644",
+                sha: "blob-sha",
+                size: 16,
+              },
+            ],
+          })
+        )
+        .mockResolvedValueOnce(new Response("schemaVersion: 1"));
+      const provider = new GitHubSourceControlProvider({ appConfig: fakeAppConfig });
+
+      await expect(
+        readRepositorySnapshot(provider, {
+          owner: "acme",
+          name: "governance",
+          ref: "main",
+          path: ".openinspect",
+          maxFiles: 10,
+          maxBytes: 1024,
+        })
+      ).resolves.toEqual({
+        commitSha: "commit-sha",
+        files: [
+          {
+            path: ".openinspect/catalog.yaml",
+            content: "schemaVersion: 1",
+            sha: "blob-sha",
+          },
+        ],
+      });
+      expect(mockFetchWithTimeout).toHaveBeenCalledTimes(4);
+      expect(mockFetchWithTimeout.mock.calls[2][0]).toContain("/git/trees/governance-tree");
+    });
+
+    it("fails closed when GitHub truncates the recursive tree", async () => {
+      mockGetCachedInstallationToken.mockResolvedValue("installation-token");
+      mockFetchWithTimeout
+        .mockResolvedValueOnce(new Response("commit-sha"))
+        .mockResolvedValueOnce(
+          makeJsonResponse({
+            tree: [
+              {
+                path: ".openinspect",
+                type: "tree",
+                mode: "040000",
+                sha: "governance-tree",
+              },
+            ],
+          })
+        )
+        .mockResolvedValueOnce(makeJsonResponse({ truncated: true, tree: [] }));
+      const provider = new GitHubSourceControlProvider({ appConfig: fakeAppConfig });
+      await expect(
+        readRepositorySnapshot(provider, {
+          owner: "acme",
+          name: "governance",
+          ref: "main",
+          path: ".openinspect",
+          maxFiles: 10,
+          maxBytes: 1024,
+        })
+      ).rejects.toThrow(/truncated/);
     });
   });
 
@@ -267,6 +362,48 @@ describe("GitHubSourceControlProvider", () => {
       const result = await provider.checkRepositoryAccess({ owner: "old-owner", name: "old-repo" });
 
       expect(result).toMatchObject({ repoOwner: "new-owner", repoName: "renamed-repo" });
+    });
+  });
+
+  describe("checkRepositoryUserAccess", () => {
+    it("returns the verified user permission", async () => {
+      mockGetCachedInstallationToken.mockResolvedValueOnce("installation-token");
+      mockFetchWithTimeout.mockResolvedValueOnce(makeResponse({ permission: "write" }));
+      const provider = new GitHubSourceControlProvider({ appConfig: fakeAppConfig });
+
+      await expect(
+        provider.checkRepositoryUserAccess({
+          owner: "acme",
+          name: "web",
+          userLogin: "ada",
+        })
+      ).resolves.toEqual({ permission: "write" });
+      expect(mockFetchWithTimeout).toHaveBeenCalledWith(
+        "https://api.github.com/repos/acme/web/collaborators/ada/permission",
+        expect.objectContaining({
+          headers: expect.objectContaining({ Authorization: "Bearer installation-token" }),
+        })
+      );
+    });
+
+    it("returns null when GitHub confirms no access", async () => {
+      mockGetCachedInstallationToken.mockResolvedValueOnce("installation-token");
+      mockFetchWithTimeout.mockResolvedValueOnce(makeResponse({ message: "Not Found" }, 404));
+      const provider = new GitHubSourceControlProvider({ appConfig: fakeAppConfig });
+
+      await expect(
+        provider.checkRepositoryUserAccess({ owner: "acme", name: "web", userLogin: "ada" })
+      ).resolves.toBeNull();
+    });
+
+    it("treats an explicit none permission as denied", async () => {
+      mockGetCachedInstallationToken.mockResolvedValueOnce("installation-token");
+      mockFetchWithTimeout.mockResolvedValueOnce(makeResponse({ permission: "none" }));
+      const provider = new GitHubSourceControlProvider({ appConfig: fakeAppConfig });
+
+      await expect(
+        provider.checkRepositoryUserAccess({ owner: "acme", name: "web", userLogin: "ada" })
+      ).resolves.toBeNull();
     });
   });
 
@@ -459,7 +596,9 @@ describe("GitHubSourceControlProvider", () => {
   describe("generateCredentialHelperAuth", () => {
     it("throws a permanent error when the App is not configured", async () => {
       const provider = new GitHubSourceControlProvider();
-      const err = await provider.generateCredentialHelperAuth().catch((e: unknown) => e);
+      const err = await provider
+        .generateCredentialHelperAuth(fakeRepositoryCredentialConfig)
+        .catch((e: unknown) => e);
 
       expect(err).toBeInstanceOf(SourceControlProviderError);
       expect((err as SourceControlProviderError).errorType).toBe("permanent");
@@ -468,30 +607,36 @@ describe("GitHubSourceControlProvider", () => {
 
     it("forwards a fresh installation token with its expiry and x-access-token username", async () => {
       const expiresAtEpochMs = Date.now() + 60 * 60 * 1000;
-      mockGetCachedInstallationTokenWithExpiry.mockResolvedValueOnce({
+      mockCreateScopedInstallationTokenWithExpiry.mockResolvedValueOnce({
         token: "ghs_fresh",
         expiresAtEpochMs,
       });
 
       const provider = new GitHubSourceControlProvider({ appConfig: fakeAppConfig });
-      const auth = await provider.generateCredentialHelperAuth();
+      const auth = await provider.generateCredentialHelperAuth(fakeRepositoryCredentialConfig);
 
       expect(auth).toEqual({
         username: "x-access-token",
         password: "ghs_fresh",
         expiresAtEpochMs,
       });
-      expect(mockGetCachedInstallationTokenWithExpiry).toHaveBeenCalledWith(
+      expect(mockCreateScopedInstallationTokenWithExpiry).toHaveBeenCalledWith(
         fakeAppConfig,
+        {
+          repositoryIds: [1],
+          permissions: { contents: "read" },
+        },
         expect.objectContaining({ userAgent: expect.any(String) })
       );
     });
 
     it("wraps upstream errors as SourceControlProviderError", async () => {
-      mockGetCachedInstallationTokenWithExpiry.mockRejectedValueOnce(new Error("GitHub 500"));
+      mockCreateScopedInstallationTokenWithExpiry.mockRejectedValueOnce(new Error("GitHub 500"));
 
       const provider = new GitHubSourceControlProvider({ appConfig: fakeAppConfig });
-      const err = await provider.generateCredentialHelperAuth().catch((e: unknown) => e);
+      const err = await provider
+        .generateCredentialHelperAuth(fakeRepositoryCredentialConfig)
+        .catch((e: unknown) => e);
 
       expect(err).toBeInstanceOf(SourceControlProviderError);
       expect((err as SourceControlProviderError).message).toContain("GitHub 500");
@@ -501,10 +646,12 @@ describe("GitHubSourceControlProvider", () => {
       const httpError = Object.assign(new Error("Failed to get installation token: 500 down"), {
         status: 500,
       });
-      mockGetCachedInstallationTokenWithExpiry.mockRejectedValueOnce(httpError);
+      mockCreateScopedInstallationTokenWithExpiry.mockRejectedValueOnce(httpError);
 
       const provider = new GitHubSourceControlProvider({ appConfig: fakeAppConfig });
-      const err = await provider.generateCredentialHelperAuth().catch((e: unknown) => e);
+      const err = await provider
+        .generateCredentialHelperAuth(fakeRepositoryCredentialConfig)
+        .catch((e: unknown) => e);
 
       expect(err).toBeInstanceOf(SourceControlProviderError);
       // Transient → the service maps this to 502, not 500.

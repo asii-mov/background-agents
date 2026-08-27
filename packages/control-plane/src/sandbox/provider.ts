@@ -10,6 +10,7 @@ import type { SandboxSettings } from "@open-inspect/shared/types/integrations";
 import type { CorrelationContext } from "../logger";
 import { RequestDeadlineError } from "./request-deadline";
 import type { McpServerConfig } from "@open-inspect/shared/types/integrations";
+import type { SecurityPipelineConfig } from "@open-inspect/shared/types/security-pipelines";
 
 /** Default sandbox lifetime in seconds (2 hours). */
 export const DEFAULT_SANDBOX_TIMEOUT_SECONDS = 7200;
@@ -53,6 +54,8 @@ export interface ImageBuildProviderTriggerConfig {
 export interface SandboxProviderCapabilities {
   /** Whether explicit sandbox session lifetimes are enforced by this provider. */
   supportsSandboxTimeout: boolean;
+  /** Whether the provider enforces blocked and allowlisted outbound network policies. */
+  supportsNetworkEgressPolicy?: boolean;
   /** Whether the provider supports filesystem snapshots */
   supportsSnapshots: boolean;
   /** Whether the provider supports restoring from snapshots */
@@ -128,6 +131,8 @@ export interface CreateSandboxConfig {
   agentSlackNotifyEnabled?: boolean;
   /** MCP servers to inject into the agent session */
   mcpServers?: McpServerConfig[];
+  /** Centrally assigned AppSec pipelines run after agent generation. */
+  securityPipelines?: SecurityPipelineConfig[];
   /** Sandbox settings (tunnel ports, etc.) resolved from integration settings */
   sandboxSettings?: SandboxSettings;
   /**
@@ -207,6 +212,7 @@ export interface RestoreConfig {
   branch?: string | null;
   /** MCP servers to inject into the sandbox */
   mcpServers?: McpServerConfig[];
+  securityPipelines?: SecurityPipelineConfig[];
   /** Correlation context for downstream tracing */
   correlation?: CorrelationContext;
   /** Whether to enable code-server (browser-based editor) in the sandbox */

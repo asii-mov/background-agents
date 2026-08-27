@@ -41,8 +41,9 @@ revisions were included.
 Profiles do not change a skill's assignments. If a profile contains a disabled skill or one that
 does not apply to the selected target, Open-Inspect ignores that entry.
 
-Shared skills are installation-wide. Any signed-in user can create, edit, enable, disable, assign,
-or delete them. Coordinate changes with other users of your Open-Inspect instance.
+Shared skills are installation-wide. Members can inspect and use them; platform editors and
+administrators can create, edit, enable, disable, assign, require, or delete them. See
+[Secure generation governance](SECURE_GENERATION.md) for role configuration.
 
 ---
 
@@ -75,6 +76,8 @@ Use this skill when deploying the API service to staging.
 
 ### Optional fields
 
+- **Required** makes every enabled, applicable revision mandatory. Users cannot remove it by
+  choosing **None** or by selecting a profile that omits it.
 - **License** records licensing information for the skill.
 - **Compatibility** describes environment or tool requirements.
 - **Metadata** accepts a JSON object whose keys and values are strings, for example
@@ -97,8 +100,13 @@ scripts/preflight.sh
 Supporting files must be UTF-8 text; binary uploads and archive imports are not supported. Mark a
 file **Executable** only when its path is under `scripts/`.
 
-You can author files directly in the editor or import them from a repository. Managed skills cannot
-be imported from a marketplace, a local directory, or an archive.
+Without Git governance, you can author files directly in the editor or import them from a
+repository. Managed skills cannot be imported from a marketplace, a local directory, or an archive.
+
+When the deployment configures a central governance repository, shared skills are instead authored
+as `SKILL.md` directories and reviewed through Git. The Settings catalog becomes read-only and
+serves the last fully validated commit; personal profiles remain editable. See
+[`GIT_GOVERNANCE_CATALOG.md`](GIT_GOVERNANCE_CATALOG.md).
 
 ### Validate before saving
 
@@ -247,8 +255,8 @@ page, open the skill selector beside the model and reasoning controls.
 | Selection            | Result                                                                                 |
 | -------------------- | -------------------------------------------------------------------------------------- |
 | **All applicable**   | Includes every enabled skill whose assignment matches the target. This is the default. |
-| **None**             | Starts the session without managed skills.                                             |
-| **Personal profile** | Includes the enabled, applicable skills saved in that profile.                         |
+| **None**             | Excludes optional managed skills; enabled, applicable required Skills remain.          |
+| **Personal profile** | Includes matching profile Skills plus enabled, applicable required Skills.             |
 
 The number beside the selector previews how many skills will be included. If a profile shows **N
 ignored**, those entries are disabled or are not assigned to the selected target.
@@ -289,7 +297,7 @@ the same revisions; it does not pick up newer edits. Start a new session to use 
 | Supporting files                   | 99 per skill revision |
 | Individual file                    |               256 KiB |
 | Complete skill revision            |                 1 MiB |
-| Skills in a profile or session     |                    20 |
+| Skills in a personal profile       |                    20 |
 | Managed skill content in a session |                 5 MiB |
 
 Supporting-file paths must:
@@ -326,3 +334,7 @@ sandbox, Open-Inspect keeps the discovered skill and drops the colliding managed
 managed skills are still installed and the session continues to start. Rename or remove the
 discovered skill, or create a new managed skill with a different canonical name and update its
 assignments and profiles.
+
+Required Skills behave differently: a repository, user, or bundled collision fails sandbox startup
+with `required_skill_collision`. This prevents repository content from silently replacing mandatory
+organizational instructions.

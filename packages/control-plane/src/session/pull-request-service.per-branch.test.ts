@@ -287,6 +287,39 @@ describe("per-branch pull requests", () => {
     expect(harness.artifacts.filter((artifact) => artifact.type === "pr")).toHaveLength(1);
   });
 
+  it("refuses to push a draft-required change into an existing non-draft PR", async () => {
+    harness.artifacts.push(prArtifact({ id: "artifact-pr-1", number: 7, head: "feature-x" }));
+
+    const result = await harness.service.createPullRequest(
+      createInput({ headBranch: "feature-x", draft: true })
+    );
+
+    expect(result).toEqual({
+      kind: "error",
+      status: 409,
+      error:
+        "Existing pull request #7 must be converted to draft before this change can be pushed.",
+    });
+    expect(harness.deps.pushBranchToRemote).not.toHaveBeenCalled();
+    expect(harness.provider.createPullRequest).not.toHaveBeenCalled();
+  });
+
+  it("reuses an existing draft PR when the change still requires draft mode", async () => {
+    harness.artifacts.push(prArtifact({ id: "artifact-pr-1", number: 7, head: "feature-x" }));
+    vi.mocked(harness.provider.getPullRequest).mockResolvedValue({
+      ...prSnapshot({ number: 7, head: "feature-x" }),
+      isDraft: true,
+    });
+
+    const result = await harness.service.createPullRequest(
+      createInput({ headBranch: "feature-x", draft: true })
+    );
+
+    expect(result).toMatchObject({ kind: "created", prNumber: 7, state: "draft", updated: true });
+    expect(harness.deps.pushBranchToRemote).toHaveBeenCalledTimes(1);
+    expect(harness.provider.createPullRequest).not.toHaveBeenCalled();
+  });
+
   it("creates a new PR from the same head after the existing one merged, despite stale-open metadata", async () => {
     harness.artifacts.push(
       prArtifact({ id: "artifact-pr-1", number: 7, head: "open-inspect/session-name-1" })

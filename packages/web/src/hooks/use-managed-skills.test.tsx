@@ -26,6 +26,7 @@ function previewResponse(name: string) {
         revisionNumber: 1,
         revisionSha256: "abc",
         totalBytes: 10,
+        required: false,
         assignmentSources: [],
       },
     ],

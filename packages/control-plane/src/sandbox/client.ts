@@ -8,6 +8,7 @@
 import { generateInternalToken } from "@open-inspect/shared/auth";
 import type { ImageBuildScopeKind } from "@open-inspect/shared/types/image-builds";
 import type { McpServerConfig, SandboxSettings } from "@open-inspect/shared/types/integrations";
+import type { SecurityPipelineConfig } from "@open-inspect/shared/types/security-pipelines";
 import { z } from "zod";
 import { createLogger } from "../logger";
 import type { CorrelationContext } from "../logger";
@@ -175,6 +176,7 @@ export interface CreateSandboxRequest {
   vncEnabled?: boolean;
   agentSlackNotifyEnabled?: boolean;
   mcpServers?: McpServerConfig[];
+  securityPipelines?: SecurityPipelineConfig[];
   sandboxSettings?: SandboxSettings;
   repositories?: SessionRepositoryInfo[];
   signal?: AbortSignal;
@@ -209,6 +211,7 @@ export interface RestoreSandboxRequest {
   vncEnabled?: boolean;
   agentSlackNotifyEnabled?: boolean;
   mcpServers?: McpServerConfig[];
+  securityPipelines?: SecurityPipelineConfig[];
   sandboxSettings?: SandboxSettings;
   repositories?: SessionRepositoryInfo[];
   signal?: AbortSignal;
@@ -422,6 +425,7 @@ export class ModalClient {
           vnc_enabled: request.vncEnabled ?? false,
           agent_slack_notify_enabled: request.agentSlackNotifyEnabled ?? false,
           mcp_servers: request.mcpServers || null,
+          security_pipelines: request.securityPipelines || null,
           sandbox_settings: request.sandboxSettings ?? null,
           // Flat keys matching SessionConfig field names — Modal's create
           // handler builds its SessionConfig from the request by field name

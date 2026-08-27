@@ -27,6 +27,7 @@ interface RevisionRow {
   revision_number: number;
   revision_sha256: string;
   total_bytes: number;
+  required: number;
   assignment_sources: string;
 }
 
@@ -39,7 +40,7 @@ export class SessionSkillStore {
     if (!loaded) return null;
     return {
       manifestSha256: loaded.manifest.manifest_sha256,
-      resolverVersion: 1,
+      resolverVersion: this.resolverVersion(loaded.manifest),
       selection: this.selection(loaded.manifest),
       resolvedAt: loaded.manifest.resolved_at,
       skills: loaded.revisions.map((row) => this.resolvedSkill(row)),
@@ -74,7 +75,7 @@ export class SessionSkillStore {
         if (!files?.some((file) => file.path === "SKILL.md")) {
           throw new Error(`Missing files for session skill revision ${row.revision_id}`);
         }
-        return { name: row.skill_name, files };
+        return { name: row.skill_name, required: row.required === 1, files };
       }),
       nextCursor: hasMore ? String(revisions[revisions.length - 1]?.position) : null,
     };
@@ -109,9 +110,7 @@ export class SessionSkillStore {
   }
 
   private selection(manifest: ManifestRow): SessionSkillsView["selection"] {
-    if (manifest.resolver_version !== 1) {
-      throw new Error(`Unsupported managed skill resolver version: ${manifest.resolver_version}`);
-    }
+    this.resolverVersion(manifest);
     if (manifest.selection_mode === "profile") {
       if (!manifest.profile_id || !manifest.profile_name) {
         throw new Error("Invalid profile selection: profile id and name are required");
@@ -126,6 +125,13 @@ export class SessionSkillStore {
       throw new Error("Invalid non-profile selection: profile fields must be null");
     }
     return { mode: manifest.selection_mode };
+  }
+
+  private resolverVersion(manifest: ManifestRow): 1 | 2 {
+    if (manifest.resolver_version !== 1 && manifest.resolver_version !== 2) {
+      throw new Error(`Unsupported managed skill resolver version: ${manifest.resolver_version}`);
+    }
+    return manifest.resolver_version;
   }
 
   private resolvedSkill(row: RevisionRow) {
@@ -143,6 +149,7 @@ export class SessionSkillStore {
       revisionNumber: row.revision_number,
       revisionSha256: row.revision_sha256,
       totalBytes: row.total_bytes,
+      required: row.required === 1,
       assignmentSources,
     };
   }

@@ -15,7 +15,7 @@ from sandbox_runtime.managed_skills import (
 )
 
 
-def _installation(*, name="managed", path="SKILL.md", content=None):
+def _installation(*, name="managed", path="SKILL.md", content=None, required=False):
     if content is None:
         content = f'---\nname: {name}\ndescription: "Managed skill"\n---\n# Managed\n'
     content_bytes = content.encode()
@@ -34,6 +34,7 @@ def _installation(*, name="managed", path="SKILL.md", content=None):
         "skills": [
             {
                 "name": name,
+                "required": required,
                 "files": files,
             }
         ],
@@ -97,6 +98,7 @@ def test_installation_ignores_additive_contract_fields():
     installation = validate_installation(json.dumps(document).encode())
 
     assert installation.skills[0].name == "managed"
+    assert installation.skills[0].required is False
 
 
 async def test_client_uses_session_url_and_sandbox_bearer_auth():
@@ -196,6 +198,37 @@ async def test_materializer_drops_only_managed_skills_that_collide_with_discover
             {"name": "conflict", "paths": [str(discovered)]},
         ],
     )
+
+
+async def test_materializer_fails_when_a_required_skill_would_be_shadowed(tmp_path):
+    document = _installation(name="required-review", required=True)
+    client = MagicMock()
+    client.fetch_installation = AsyncMock(return_value=json.dumps(document).encode())
+    repository = tmp_path / "repository"
+    discovered = repository / ".agents" / "skills" / "required-review"
+    discovered.mkdir(parents=True)
+    (discovered / "SKILL.md").write_text("---\nname: required-review\n---\n")
+    destination = tmp_path / "global" / "skills"
+    materializer = ManagedSkillsMaterializer(
+        client,
+        destination,
+        MagicMock(),
+        bundled_skills_path=tmp_path / "missing-bundled",
+    )
+
+    with pytest.raises(ManagedSkillsError, match="required-review") as raised:
+        await materializer.materialize((MagicMock(path=repository),), tmp_path / "workspace")
+
+    assert raised.value.code == "required_skill_collision"
+    assert not destination.exists()
+
+
+def test_installation_rejects_non_boolean_required_flag():
+    document = _installation()
+    document["skills"][0]["required"] = "yes"
+
+    with pytest.raises(ManagedSkillsError, match="required flag"):
+        validate_installation(json.dumps(document).encode())
 
 
 async def test_materializer_ignores_invalid_utf8_during_collision_scan(tmp_path):

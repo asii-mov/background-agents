@@ -36,6 +36,13 @@ interface InstallationTokenCacheBindings {
   userAgent?: string;
 }
 
+type GitHubRepositoryPermission = "read" | "write";
+
+export interface GitHubInstallationTokenScope {
+  repositoryIds: readonly number[];
+  permissions?: Partial<Record<string, GitHubRepositoryPermission>>;
+}
+
 function resolveUserAgent(env: InstallationTokenCacheBindings | undefined): string {
   const value = env?.userAgent?.trim();
   return value && value.length > 0 ? value : DEFAULT_APP_NAME;
@@ -245,9 +252,16 @@ async function generateAppJwt(appId: string, privateKey: string): Promise<string
 async function getInstallationTokenWithMetadata(
   jwt: string,
   installationId: string,
-  userAgent: string
+  userAgent: string,
+  scope?: GitHubInstallationTokenScope
 ): Promise<InstallationTokenResponse> {
   const url = `https://api.github.com/app/installations/${installationId}/access_tokens`;
+  const body = scope
+    ? JSON.stringify({
+        repository_ids: scope.repositoryIds,
+        ...(scope.permissions ? { permissions: scope.permissions } : {}),
+      })
+    : undefined;
 
   const response = await fetchWithTimeout(url, {
     method: "POST",
@@ -256,7 +270,9 @@ async function getInstallationTokenWithMetadata(
       Accept: "application/vnd.github+json",
       "X-GitHub-Api-Version": "2022-11-28",
       "User-Agent": userAgent,
+      ...(body ? { "Content-Type": "application/json" } : {}),
     },
+    ...(body ? { body } : {}),
   });
 
   if (!response.ok) {
@@ -281,6 +297,24 @@ async function getInstallationTokenWithMetadata(
     throw new Error("Failed to get installation token: invalid response");
   }
   return parsed.data;
+}
+
+export async function createScopedInstallationTokenWithExpiry(
+  config: GitHubAppConfig,
+  scope: GitHubInstallationTokenScope,
+  env?: InstallationTokenCacheBindings
+): Promise<{ token: string; expiresAtEpochMs: number }> {
+  if (scope.repositoryIds.length === 0) {
+    throw new Error("Scoped GitHub installation token requires at least one repository id");
+  }
+  const jwt = await generateAppJwt(config.appId, config.privateKey);
+  const token = await getInstallationTokenWithMetadata(
+    jwt,
+    config.installationId,
+    resolveUserAgent(env),
+    scope
+  );
+  return { token: token.token, expiresAtEpochMs: token.expiresAtEpochMs };
 }
 
 function getInstallationTokenCacheKey(config: GitHubAppConfig): string {

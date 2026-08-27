@@ -10,7 +10,7 @@
   },
   "skillMarkdown": "---\nname: acme-deploy\ndescription: \"Deploy the service\"\nlicense: \"MIT\"\nmetadata:\n  \"alpha\": \"first\"\n  \"zeta\": \"last\"\n---\n# Deploy\n\nFollow the runbook.\n",
   "revisionSha256": "c790a542b2ee5c4d5c0492c1caaff4f4278511dd796b0d3dbf903667e8935af9",
-  "manifestSha256": "1d5b45f528c2ae235df021faf63e045c7d9e03e83137b4c3decd705a09761eba",
+  "manifestSha256": "3e98d403a6aad5a3ffd115aab16b375960bd286e468f31c5ab013727156f5650",
   "limits": {
     "maxSkillFiles": 100,
     "maxSkillFileBytes": 262144,

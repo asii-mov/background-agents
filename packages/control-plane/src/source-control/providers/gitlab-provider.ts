@@ -26,6 +26,8 @@ import type {
   ResolvedCommit,
   RepositoryTree,
   RepositoryTreeEntry,
+  CheckRepositoryUserAccessConfig,
+  RepositoryUserAccessResult,
 } from "../types";
 import {
   readResponseBytesWithinLimit,
@@ -44,7 +46,7 @@ const PER_PAGE = 100;
 
 /**
  * Pages of a recursive tree listing to follow before reporting truncation.
- * Bounds the work one import can force; skill directories are far smaller.
+ * Bounds one import to 2,000 tree entries before it fails closed.
  */
 const MAX_TREE_PAGES = 20;
 
@@ -481,6 +483,15 @@ export class GitLabSourceControlProvider implements SourceControlProvider {
         error
       );
     }
+  }
+
+  async checkRepositoryUserAccess(
+    _config: CheckRepositoryUserAccessConfig
+  ): Promise<RepositoryUserAccessResult | null> {
+    throw new SourceControlProviderError(
+      "Per-user GitLab repository authorization is not implemented",
+      "permanent"
+    );
   }
 
   /**

@@ -84,7 +84,13 @@ export function AnalyticsTimeseriesChart({ series, loading }: TimeseriesChartPro
 
       <div className="mt-6 rounded-lg border border-border-muted bg-background p-3 sm:p-4">
         <div className="h-[320px]">
-          <ResponsiveContainer width="100%" height="100%">
+          <ResponsiveContainer
+            width="100%"
+            height="100%"
+            minWidth={0}
+            minHeight={0}
+            initialDimension={{ width: 800, height: 320 }}
+          >
             <AreaChart data={data} margin={{ top: 8, right: 12, left: 0, bottom: 0 }}>
               <defs>
                 {groupKeys.map((groupKey, index) => {

@@ -8,6 +8,7 @@ import type { ImageBuildFinalizationJob } from "./image-builds/finalization-job"
 export interface Env {
   // Durable Objects
   SESSION: DurableObjectNamespace;
+  GOVERNANCE_CATALOG?: DurableObjectNamespace;
 
   // KV Namespaces
   REPOS_CACHE: KVNamespace; // Short-lived cache for /repos listing
@@ -63,6 +64,8 @@ export interface Env {
   // GitLab secrets (for git operations and API access when SCM_PROVIDER=gitlab)
   GITLAB_ACCESS_TOKEN?: string;
   GITLAB_NAMESPACE?: string; // Group namespace to scope repository listing
+  GOVERNANCE_NPM_REGISTRY_TOKEN?: string; // Optional bearer token for a private npm registry
+  GOVERNANCE_MCP_BUILDER_TOKEN?: string;
 
   // Variables
   DEPLOYMENT_NAME: string;
@@ -76,6 +79,16 @@ export interface Env {
   ALLOWED_EMAILS?: string;
   ALLOWED_GITHUB_ORGS?: string;
   UNSAFE_ALLOW_ALL_USERS?: string;
+  /** Comma-separated canonical IDs, emails, or provider-scoped logins bootstrapped as platform admins. */
+  PLATFORM_ADMIN_USERS?: string;
+  /** Comma-separated canonical IDs, emails, or provider-scoped logins bootstrapped as catalogue editors. */
+  PLATFORM_EDITOR_USERS?: string;
+  GOVERNANCE_REPO_OWNER?: string;
+  GOVERNANCE_REPO_NAME?: string;
+  GOVERNANCE_REPO_REF?: string;
+  GOVERNANCE_REPO_PATH?: string;
+  GOVERNANCE_NPM_REGISTRY_URL?: string;
+  GOVERNANCE_MCP_BUILDER_URL?: string;
   CF_ACCOUNT_ID?: string; // Cloudflare account ID
   SANDBOX_PROVIDER?: string; // "modal" (default), "daytona", "vercel", "opencomputer", or "e2b"
   MODAL_WORKSPACE?: string; // Modal workspace name

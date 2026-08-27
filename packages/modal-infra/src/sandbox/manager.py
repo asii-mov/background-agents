@@ -89,6 +89,33 @@ def _resource_kwargs(settings: dict[str, Any] | None) -> dict:
     return kwargs
 
 
+def _network_policy_kwargs(settings: dict[str, Any] | None) -> dict[str, Any]:
+    """Map the provider-neutral outbound policy to Modal launch arguments.
+
+    Restrictive policies are never silently weakened: unknown or empty
+    allowlist policies raise before Modal creates the sandbox.
+    """
+    policy = (settings or {}).get("networkPolicy")
+    if policy is None or policy.get("mode") == "unrestricted":
+        return {}
+    if policy.get("mode") == "blocked":
+        return {"block_network": True}
+    if policy.get("mode") != "allowlist":
+        raise ValueError("Unsupported sandbox network policy mode")
+
+    cidrs = policy.get("allowedCidrs") or []
+    domains = policy.get("allowedDomains") or []
+    if not cidrs and not domains:
+        raise ValueError("Sandbox network allowlist must not be empty")
+
+    kwargs: dict[str, Any] = {}
+    if cidrs:
+        kwargs["outbound_cidr_allowlist"] = cidrs
+    if domains:
+        kwargs["outbound_domain_allowlist"] = domains
+    return kwargs
+
+
 @dataclass
 class SandboxConfig:
     """Configuration for creating a sandbox."""
@@ -462,6 +489,7 @@ class SandboxManager:
             "workdir": "/workspace",
             "env": env_vars,
             **_resource_kwargs(config.settings),
+            **_network_policy_kwargs(config.settings),
         }
         if exposed_ports:
             create_kwargs["encrypted_ports"] = exposed_ports

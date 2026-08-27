@@ -3,7 +3,7 @@ import type { Logger } from "../../../logger";
 import type { SessionRepositoryRow } from "../../types";
 import { buildSessionRepositories, type SessionRepositoryEntry } from "../../repository-target";
 import type { ArtifactRow, ParticipantRow, SessionRow } from "../../types";
-import { PullRequestHandler } from "./pull-request.handler";
+import { PullRequestHandler, type PullRequestRiskPolicy } from "./pull-request.handler";
 import type { SessionCoreRepository } from "../../session-core-repository";
 import type { ArtifactRepository } from "../../artifact-repository";
 import type { ParticipantService } from "../../participant-service";
@@ -75,7 +75,7 @@ function createParticipant(overrides: Partial<ParticipantRow> = {}): Participant
   };
 }
 
-function createHandler() {
+function createHandler(riskPolicy?: PullRequestRiskPolicy) {
   const getSession = vi.fn<() => SessionRow | null>();
   let repositoryRows: SessionRepositoryRow[] = [];
   // Mirrors SessionCoreRepository.getSessionRepositories: members derive from the
@@ -114,7 +114,8 @@ function createHandler() {
     getSessionUrl,
     createPullRequest,
     triggerPullRequestRefresh,
-    now
+    now,
+    riskPolicy
   );
 
   // Bind the request-scoped log so call sites exercise the threading without
@@ -147,6 +148,73 @@ function createHandler() {
 }
 
 describe("PullRequestHandler", () => {
+  it("forces a high-risk change into draft review and records the score", async () => {
+    const harness = createHandler({
+      getChangedPaths: () => ["src/auth/authorize.ts"],
+      assessRisk: async () => ({
+        repositoryCriticality: "high",
+        changeSensitivity: "critical",
+        score: 12,
+        requiresSecurityReview: true,
+        matchedPaths: ["src/auth/authorize.ts"],
+      }),
+    });
+    harness.getSession.mockReturnValue(createSession());
+    harness.getPromptingParticipantForPR.mockResolvedValue({ participant: createParticipant() });
+    harness.resolveAuthForPR.mockResolvedValue({ auth: null });
+    harness.getSessionUrl.mockReturnValue("https://app.example.com/session/public-session-1");
+    harness.createPullRequest.mockResolvedValue({
+      kind: "created",
+      prNumber: 7,
+      prUrl: "https://github.com/acme/repo/pull/7",
+      state: "draft",
+      headBranch: "feature/test",
+      baseBranch: "main",
+      updated: false,
+    });
+
+    const response = await harness.handler.createPr(
+      new Request("http://internal/internal/create-pr", {
+        method: "POST",
+        body: JSON.stringify({ title: "Auth change", body: "Updates access checks" }),
+      })
+    );
+
+    expect(response.status).toBe(200);
+    expect(harness.createPullRequest).toHaveBeenCalledWith(
+      expect.objectContaining({
+        draft: true,
+        body: expect.stringContaining("Security review required"),
+      }),
+      harness.log
+    );
+    await expect(response.json()).resolves.toMatchObject({
+      risk: { score: 12, requiresSecurityReview: true },
+    });
+  });
+
+  it("fails closed when the current diff is not ready for classification", async () => {
+    const assessRisk = vi.fn<PullRequestRiskPolicy["assessRisk"]>();
+    const harness = createHandler({
+      getChangedPaths: () => null,
+      assessRisk,
+    });
+    harness.getSession.mockReturnValue(createSession());
+    harness.getPromptingParticipantForPR.mockResolvedValue({ participant: createParticipant() });
+    harness.resolveAuthForPR.mockResolvedValue({ auth: null });
+
+    const response = await harness.handler.createPr(
+      new Request("http://internal/internal/create-pr", {
+        method: "POST",
+        body: JSON.stringify({ title: "PR", body: "desc" }),
+      })
+    );
+
+    expect(response.status).toBe(409);
+    expect(assessRisk).not.toHaveBeenCalled();
+    expect(harness.createPullRequest).not.toHaveBeenCalled();
+  });
+
   it("returns 404 when session is missing", async () => {
     const { handler, getSession } = createHandler();
     getSession.mockReturnValue(null);

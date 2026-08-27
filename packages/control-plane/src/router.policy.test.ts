@@ -106,6 +106,37 @@ describe("route policy table", () => {
     expect(routeFor(method, path)?.authentication.kind).toBe("user-or-service");
   });
 
+  it.each([
+    ["POST", "/skills"],
+    ["POST", "/skills/import/preview"],
+    ["POST", "/skills/import"],
+    ["POST", "/skills/skill-1/reimport/preview"],
+    ["POST", "/skills/skill-1/reimport"],
+    ["PATCH", "/skills/skill-1"],
+    ["PUT", "/skills/skill-1"],
+    ["DELETE", "/skills/skill-1"],
+    ["POST", "/mcp-servers"],
+    ["PUT", "/mcp-servers/mcp-1"],
+    ["PUT", "/mcp-servers/mcp-1/credentials"],
+    ["DELETE", "/mcp-servers/mcp-1"],
+    ["POST", "/security-pipelines"],
+    ["PUT", "/security-pipelines/pipeline-1"],
+    ["DELETE", "/security-pipelines/pipeline-1"],
+    ["PUT", "/repository-risk"],
+    ["POST", "/approved-components"],
+    ["PUT", "/approved-components/component-1"],
+    ["DELETE", "/approved-components/component-1"],
+  ])("requires catalog.write for %s %s", (method, path) => {
+    expect(routeFor(method, path)?.requiredPermission).toBe("catalog.write");
+  });
+
+  it.each([
+    ["GET", "/platform/users"],
+    ["PATCH", "/platform/users/user-1/role"],
+  ])("requires platform.manage for %s %s", (method, path) => {
+    expect(routeFor(method, path)?.requiredPermission).toBe("platform.manage");
+  });
+
   it("keeps diff authentication method-specific", () => {
     expect(routeFor("GET", "/sessions/session-1/diff")?.authentication.kind).toBe(
       "user-or-service"

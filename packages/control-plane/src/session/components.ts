@@ -39,10 +39,15 @@ import {
   type IdGenerator,
   type ImageBuildLookup,
   type McpServerLookup,
+  type SandboxNetworkPolicyLookup,
+  type SecurityPipelineLookup,
   type SlackAgentNotifyLookup,
 } from "../sandbox/lifecycle/manager";
 import { McpServerStore } from "../db/mcp-servers";
 import { IntegrationSettingsStore, resolveSlackSettings } from "../db/integration-settings";
+import { SecurityPipelineStore } from "../db/security-pipelines";
+import { RepositoryRiskStore } from "../db/repository-risk";
+import { assessChangeRisk } from "../risk/change-risk";
 import { SessionIndexStore } from "../db/session-index";
 import { parsePersistedSandboxSettings } from "../sandbox/settings";
 import { createSourceControlProviderFromEnv, type SourceControlProvider } from "../source-control";
@@ -60,6 +65,7 @@ import { ParticipantRepository } from "./participant-repository";
 import { WsClientMappingRepository } from "./ws-client-mapping-repository";
 import { createLatchedPublicSessionIdResolver, resolvePublicSessionId } from "./public-session-id";
 import { resolveScmSettings } from "./scm-settings-resolution";
+import { resolveSessionScopedSettings } from "./integration-settings-resolution";
 import {
   isValidSandboxToken,
   resolveSandboxDashboardUrl,
@@ -526,8 +532,10 @@ export function createSessionRuntime(platform: SessionPlatform, env: Env): Sessi
     );
     return service.refresh(sessionRow);
   };
-  const getScmCredentials = (requestLog: Logger) =>
-    new ScmCredentialsService(sourceControlProvider(), requestLog).getCredentials();
+  const getScmCredentials = (
+    repository: Parameters<ScmCredentialsService["getCredentials"]>[0],
+    requestLog: Logger
+  ) => new ScmCredentialsService(sourceControlProvider(), requestLog).getCredentials(repository);
 
   const sandboxHandler = new SandboxHandler(
     messageRepository,
@@ -600,7 +608,21 @@ export function createSessionRuntime(platform: SessionPlatform, env: Env): Sessi
 
       return pullRequestService.createPullRequest(input);
     },
-    () => schedulePullRequestRefresh("manual")
+    () => schedulePullRequestRefresh("manual"),
+    Date.now,
+    db
+      ? {
+          getChangedPaths: (repository) => diffService.getChangedPaths(repository),
+          assessRisk: async (repository, paths) =>
+            assessChangeRisk(
+              await new RepositoryRiskStore(db).getCriticality(
+                repository.repoOwner,
+                repository.repoName
+              ),
+              paths
+            ),
+        }
+      : undefined
   );
 
   const participantsHandler = new ParticipantsHandler(participantRepository);
@@ -680,7 +702,8 @@ export function createSessionRuntime(platform: SessionPlatform, env: Env): Sessi
     openaiTokenRefresh: (_request, _url, requestLog) =>
       sandboxHandler.openaiTokenRefresh(requestLog),
     xaiTokenRefresh: (_request, _url, requestLog) => sandboxHandler.xaiTokenRefresh(requestLog),
-    scmCredentials: (_request, _url, requestLog) => sandboxHandler.scmCredentials(requestLog),
+    scmCredentials: (request, _url, requestLog) =>
+      sandboxHandler.scmCredentials(request, requestLog),
     tunnelUrls: (_request, _url, requestLog) => sandboxHandler.tunnelUrls(requestLog),
     spawnContext: () => childSessionsHandler.getSpawnContext(),
     activePromptAuthor: () => childSessionsHandler.getActivePromptAuthor(),
@@ -835,10 +858,23 @@ function createLifecycleManager(deps: LifecycleManagerDeps): SandboxLifecycleMan
 
   // Create D1-backed lookups if database is available
   let mcpServerLookup: McpServerLookup | undefined;
+  let securityPipelineLookup: SecurityPipelineLookup | undefined;
+  let sandboxNetworkPolicyLookup: SandboxNetworkPolicyLookup | undefined;
   if (db) {
     const mcpStore = new McpServerStore(db, repoSecretsEncryptionKey);
     mcpServerLookup = {
-      getDecryptedForSession: (repositories) => mcpStore.getDecryptedForSession(repositories),
+      getDecryptedForSession: (sessionId, repositories, environmentId) =>
+        mcpStore.getDecryptedForSession(sessionId, repositories, environmentId),
+    };
+    const securityPipelines = new SecurityPipelineStore(db);
+    securityPipelineLookup = {
+      getForSession: (repositories, environmentId) =>
+        securityPipelines.getForSession(repositories, environmentId),
+    };
+    sandboxNetworkPolicyLookup = {
+      getForSession: async (repositories, environmentId) =>
+        (await resolveSessionScopedSettings(db, repositories, environmentId)).sandboxSettings
+          .networkPolicy,
     };
   }
 
@@ -882,6 +918,8 @@ function createLifecycleManager(deps: LifecycleManagerDeps): SandboxLifecycleMan
       timeoutMs: parseInt(env.SANDBOX_INACTIVITY_TIMEOUT_MS || "600000", 10),
     },
     mcpServerLookup,
+    securityPipelineLookup,
+    sandboxNetworkPolicyLookup,
     slackAgentNotifyLookup,
     sandboxDashboardUrlBuilder,
   };

@@ -5,9 +5,15 @@
   "compatibility_date": "2024-09-23",
   "compatibility_flags": ["nodejs_compat"],
   "durable_objects": {
-    "bindings": [{ "name": "SESSION", "class_name": "SessionDO" }],
+    "bindings": [
+      { "name": "SESSION", "class_name": "SessionDO" },
+      { "name": "GOVERNANCE_CATALOG", "class_name": "GovernanceCatalogDO" },
+    ],
   },
-  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["SessionDO"] }],
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["SessionDO"] },
+    { "tag": "v2", "new_sqlite_classes": ["GovernanceCatalogDO"] },
+  ],
   "d1_databases": [
     {
       "binding": "DB",

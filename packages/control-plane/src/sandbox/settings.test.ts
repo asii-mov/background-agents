@@ -76,6 +76,55 @@ describe("normalizeSandboxSettings", () => {
     });
   });
 
+  it("normalizes centrally managed outbound network policies", () => {
+    expect(normalizeSandboxSettings({ networkPolicy: { mode: "unrestricted" } })).toEqual({
+      networkPolicy: { mode: "unrestricted" },
+    });
+    expect(normalizeSandboxSettings({ networkPolicy: { mode: "blocked" } })).toEqual({
+      networkPolicy: { mode: "blocked" },
+    });
+    expect(
+      normalizeSandboxSettings({
+        networkPolicy: {
+          mode: "allowlist",
+          allowedCidrs: ["10.0.0.0/8", "2001:db8::/32", "10.0.0.0/8"],
+          allowedDomains: ["API.OPENAI.COM", "*.github.com", "api.openai.com"],
+        },
+      })
+    ).toEqual({
+      networkPolicy: {
+        mode: "allowlist",
+        allowedCidrs: ["10.0.0.0/8", "2001:db8::/32"],
+        allowedDomains: ["api.openai.com", "*.github.com"],
+      },
+    });
+  });
+
+  it("rejects malformed or empty network allowlists", () => {
+    for (const networkPolicy of [
+      { mode: "allowlist" },
+      { mode: "allowlist", allowedCidrs: ["10.0.0.0/99"] },
+      { mode: "allowlist", allowedDomains: ["https://github.com"] },
+      { mode: "unknown" },
+    ]) {
+      expect(() => normalizeSandboxSettings({ networkPolicy })).toThrow(
+        SandboxSettingsValidationError
+      );
+    }
+  });
+
+  it("fails closed when a persisted restrictive network policy is malformed", () => {
+    expect(
+      normalizeSandboxSettings(
+        {
+          networkPolicy: { mode: "allowlist", allowedDomains: ["https://github.com"] },
+          terminalEnabled: true,
+        },
+        { invalid: "omit" }
+      )
+    ).toEqual({ networkPolicy: { mode: "blocked" }, terminalEnabled: true });
+  });
+
   it("accepts a valid buildTimeoutSeconds", () => {
     expect(normalizeSandboxSettings({ buildTimeoutSeconds: 2400 })).toEqual({
       buildTimeoutSeconds: 2400,

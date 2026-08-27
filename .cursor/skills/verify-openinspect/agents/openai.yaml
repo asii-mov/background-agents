@@ -1,0 +1,4 @@
+interface:
+  display_name: "Verify OpenInspect"
+  short_description: "Drive and diagnose OpenInspect through its real browser UI"
+  default_prompt: "Use $verify-openinspect to locate this feature, reproduce the user-visible behavior in Chrome, and retain evidence."

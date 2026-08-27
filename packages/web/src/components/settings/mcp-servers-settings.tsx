@@ -4,16 +4,24 @@ import { useState, useCallback, type ClipboardEvent } from "react";
 import { toast } from "sonner";
 import type {
   CreateMcpServerRequest,
+  McpServerLifecycle,
   McpServerMetadata,
 } from "@open-inspect/shared/types/integrations";
-import { DEFAULT_MCP_SERVER_ENABLED } from "@open-inspect/shared/types/integrations";
+import {
+  DEFAULT_MCP_SERVER_ENABLED,
+  DEFAULT_MCP_SERVER_LIFECYCLE,
+} from "@open-inspect/shared/types/integrations";
 import {
   useMcpServers,
   createMcpServer,
   updateMcpServer,
+  updateMcpServerCredentials,
   deleteMcpServer,
 } from "@/hooks/use-mcp-servers";
 import { useRepos } from "@/hooks/use-repos";
+import { useEnvironments } from "@/hooks/use-environments";
+import { usePlatformRole } from "@/hooks/use-platform-role";
+import { syncGovernanceCatalog, useGovernanceCatalog } from "@/hooks/use-governance-catalog";
 import { parseMaybeEnvContent } from "@/lib/env-paste";
 import { PlusIcon, TerminalIcon, GlobeIcon, ChevronRightIcon } from "@/components/ui/icons";
 import { Button } from "@/components/ui/button";
@@ -60,7 +68,9 @@ type FormState = {
   url: string;
   envRows: EnvRow[];
   repoScopes: string[];
+  environmentScopes: string[];
   scopeMode: ScopeMode;
+  lifecycle: McpServerLifecycle;
   enabled: boolean;
 };
 
@@ -71,7 +81,9 @@ const emptyForm: FormState = {
   url: "",
   envRows: [createEnvRow()],
   repoScopes: [],
+  environmentScopes: [],
   scopeMode: "global",
+  lifecycle: DEFAULT_MCP_SERVER_LIFECYCLE,
   enabled: DEFAULT_MCP_SERVER_ENABLED,
 };
 
@@ -88,9 +100,29 @@ function metadataToForm(metadata: McpServerMetadata): FormState {
     url: metadata.url ?? "",
     envRows: [createEnvRow()],
     repoScopes: metadata.repoScopes ?? [],
-    scopeMode: metadata.repoScopes?.length ? "selected" : "global",
+    environmentScopes: metadata.environmentScopes ?? [],
+    scopeMode:
+      metadata.repoScopes?.length || metadata.environmentScopes?.length ? "selected" : "global",
+    lifecycle: metadata.lifecycle,
     enabled: metadata.enabled,
   };
+}
+
+function scopeSummary(server: McpServerMetadata): string {
+  const scopes: string[] = [];
+  if (server.repoScopes?.length) {
+    scopes.push(
+      server.repoScopes.length === 1 ? server.repoScopes[0] : `${server.repoScopes.length} repos`
+    );
+  }
+  if (server.environmentScopes?.length) {
+    scopes.push(
+      server.environmentScopes.length === 1
+        ? `environment ${server.environmentScopes[0]}`
+        : `${server.environmentScopes.length} environments`
+    );
+  }
+  return scopes.length > 0 ? scopes.join(" · ") : "global";
 }
 
 /** Minimal shell-quote aware parser: respects "..." and '...' grouping. */
@@ -261,7 +293,9 @@ interface McpServerFormProps {
   form: FormState;
   setForm: (form: FormState) => void;
   repos: { fullName: string; private?: boolean }[];
+  environments: { id: string; name: string }[];
   loadingRepos: boolean;
+  loadingEnvironments: boolean;
   radioPrefix: string;
   hasExistingCredentials?: boolean;
 }
@@ -270,11 +304,14 @@ function McpServerForm({
   form,
   setForm,
   repos,
+  environments,
   loadingRepos,
+  loadingEnvironments,
   radioPrefix,
   hasExistingCredentials,
 }: McpServerFormProps) {
   const selectedRepoScopes = new Set(form.repoScopes);
+  const selectedEnvironmentScopes = new Set(form.environmentScopes);
 
   return (
     <>
@@ -360,21 +397,46 @@ function McpServerForm({
       />
 
       <div>
+        <Label className="mb-1.5" htmlFor={`mcp-lifecycle-${radioPrefix}`}>
+          Lifecycle
+        </Label>
+        <select
+          id={`mcp-lifecycle-${radioPrefix}`}
+          value={form.lifecycle}
+          onChange={(event) =>
+            setForm({ ...form, lifecycle: event.target.value as McpServerLifecycle })
+          }
+          className="h-9 w-full rounded-sm border border-border bg-background px-3 text-sm text-foreground"
+        >
+          <option value="development">Development — catalogued but not installed</option>
+          <option value="approved">Approved — installed in matching sessions</option>
+          <option value="deprecated">Deprecated — retained but not installed</option>
+        </select>
+        {form.lifecycle === "approved" && form.type === "local" && (
+          <p className="mt-1 text-xs text-muted-foreground">
+            npx package names must use an exact version such as @scope/server@1.2.3.
+          </p>
+        )}
+      </div>
+
+      <div>
         <Label className="mb-1.5">Availability</Label>
         <div className="space-y-2 mb-2">
           <RadioCard
             name={`scope-mode-${radioPrefix}`}
             checked={form.scopeMode === "global"}
-            onChange={() => setForm({ ...form, scopeMode: "global", repoScopes: [] })}
-            label="All repositories"
+            onChange={() =>
+              setForm({ ...form, scopeMode: "global", repoScopes: [], environmentScopes: [] })
+            }
+            label="All sessions"
             description="Available in every agent session"
           />
           <RadioCard
             name={`scope-mode-${radioPrefix}`}
             checked={form.scopeMode === "selected"}
             onChange={() => setForm({ ...form, scopeMode: "selected" })}
-            label="Selected repositories only"
-            description="Only available in sessions for chosen repos"
+            label="Selected targets only"
+            description="Only available in sessions for chosen repositories or environments"
           />
         </div>
 
@@ -414,9 +476,38 @@ function McpServerForm({
                 })}
               </div>
             )}
-            {form.repoScopes.length === 0 && repos.length > 0 && (
-              <p className="text-xs text-warning mt-1">
-                Select a repository or switch to &quot;All repositories&quot;.
+            <p className="mt-3 mb-1 text-xs font-medium text-muted-foreground">Environments</p>
+            {loadingEnvironments ? (
+              <p className="px-3 py-2 text-sm text-muted-foreground">Loading environments...</p>
+            ) : (
+              <div className="max-h-40 overflow-y-auto rounded-sm border border-border">
+                {environments.map((environment) => {
+                  const isChecked = selectedEnvironmentScopes.has(environment.id);
+                  return (
+                    <label
+                      key={environment.id}
+                      className="flex cursor-pointer items-center gap-2 px-3 py-2 text-sm transition hover:bg-muted/50"
+                    >
+                      <Checkbox
+                        checked={isChecked}
+                        onCheckedChange={() =>
+                          setForm({
+                            ...form,
+                            environmentScopes: isChecked
+                              ? form.environmentScopes.filter((id) => id !== environment.id)
+                              : [...form.environmentScopes, environment.id],
+                          })
+                        }
+                      />
+                      <span className="text-foreground">{environment.name}</span>
+                    </label>
+                  );
+                })}
+              </div>
+            )}
+            {form.repoScopes.length === 0 && form.environmentScopes.length === 0 && (
+              <p className="mt-1 text-xs text-warning">
+                Select a repository or environment, or switch to &quot;All sessions&quot;.
               </p>
             )}
           </>
@@ -439,12 +530,26 @@ function McpServerForm({
 }
 
 export function McpServersSettings() {
+  const { canWriteCatalog } = usePlatformRole();
   const { servers, loading, mutate } = useMcpServers();
   const { repos, loading: loadingRepos } = useRepos();
+  const { environments, loading: loadingEnvironments } = useEnvironments();
+  const { status: governance, mutate: mutateGovernance } = useGovernanceCatalog();
   const [editor, setEditor] = useState<Editor | null>(null);
   const [form, setForm] = useState<FormState>(emptyForm);
   const [saving, setSaving] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<string | null>(null);
+  const gitManaged = governance?.configured === true;
+
+  async function syncGitCatalog() {
+    try {
+      await syncGovernanceCatalog();
+      await Promise.all([mutate(), mutateGovernance()]);
+      toast.success("Git governance catalog synced");
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "Failed to sync catalog");
+    }
+  }
 
   function startNew() {
     setForm(emptyForm);
@@ -482,8 +587,12 @@ export function McpServersSettings() {
       toast.error("Command is required for local servers");
       return;
     }
-    if (form.scopeMode === "selected" && form.repoScopes.length === 0) {
-      toast.error("Select at least one repository or switch to All repositories");
+    if (
+      form.scopeMode === "selected" &&
+      form.repoScopes.length === 0 &&
+      form.environmentScopes.length === 0
+    ) {
+      toast.error("Select at least one repository or environment, or switch to All sessions");
       return;
     }
 
@@ -492,11 +601,30 @@ export function McpServersSettings() {
     setSaving(true);
 
     try {
+      if (saveOwner.kind === "existing") {
+        const existing = servers.find((server) => server.id === saveOwner.id);
+        if (existing?.sourceKind === "git") {
+          const credentials = envRowsToRecord(form.envRows);
+          await updateMcpServerCredentials(existing.id, {
+            revision: saveOwner.revision,
+            ...(existing.type === "remote" ? { headers: credentials } : { env: credentials }),
+          });
+          toast.success("MCP credentials updated");
+          setEditor((current) => (current?.draftId === saveOwner.draftId ? null : current));
+          await mutate();
+          return;
+        }
+      }
       const common = {
         name: form.name.trim(),
         enabled: form.enabled,
         repoScopes:
           form.scopeMode === "selected" && form.repoScopes.length > 0 ? form.repoScopes : null,
+        environmentScopes:
+          form.scopeMode === "selected" && form.environmentScopes.length > 0
+            ? form.environmentScopes
+            : null,
+        lifecycle: form.lifecycle,
       };
 
       const envRecord = envRowsToRecord(form.envRows);
@@ -564,16 +692,35 @@ export function McpServersSettings() {
     <div>
       <div className="flex items-center justify-between mb-1">
         <h2 className="text-xl font-semibold text-foreground">MCP Servers</h2>
-        <Button onClick={startNew} variant="outline" size="sm">
-          <span className="inline-flex items-center gap-1">
-            <PlusIcon className="w-3.5 h-3.5" />
-            Add Server
-          </span>
-        </Button>
+        {canWriteCatalog && !gitManaged && (
+          <Button onClick={startNew} variant="outline" size="sm">
+            <span className="inline-flex items-center gap-1">
+              <PlusIcon className="w-3.5 h-3.5" />
+              Add Server
+            </span>
+          </Button>
+        )}
       </div>
       <p className="text-sm text-muted-foreground mb-6">
         Configure Model Context Protocol servers that are available to agent sessions.
       </p>
+      {gitManaged && (
+        <div className="mb-6 flex items-start justify-between gap-4 rounded border border-border bg-muted/30 p-3">
+          <p className="text-sm text-muted-foreground">
+            Metadata is managed from {governance.source?.owner}/{governance.source?.name} at{" "}
+            {governance.source?.ref}. Runtime package versions shown below are exact resolutions of
+            the automatic Git policy.
+            {governance.lastStatus === "failed" && governance.lastError
+              ? ` The latest sync failed; the last good catalog remains active: ${governance.lastError}`
+              : ""}
+          </p>
+          {canWriteCatalog && (
+            <Button variant="outline" size="sm" onClick={syncGitCatalog}>
+              Sync now
+            </Button>
+          )}
+        </div>
+      )}
 
       {/* New server form */}
       {editor?.kind === "new" && (
@@ -596,7 +743,9 @@ export function McpServersSettings() {
             form={form}
             setForm={setForm}
             repos={repos}
+            environments={environments}
             loadingRepos={loadingRepos}
+            loadingEnvironments={loadingEnvironments}
             radioPrefix="new"
           />
           <div className="flex gap-2 pt-2">
@@ -635,7 +784,9 @@ export function McpServersSettings() {
                   <button
                     type="button"
                     className="flex items-center gap-3 min-w-0 cursor-pointer text-left"
-                    onClick={() => startEdit(server)}
+                    onClick={() => {
+                      if (canWriteCatalog) startEdit(server);
+                    }}
                   >
                     <ChevronRightIcon
                       className={`w-3 h-3 text-muted-foreground flex-shrink-0 transition-transform ${
@@ -653,16 +804,21 @@ export function McpServersSettings() {
                       </div>
                       <div className="text-xs text-muted-foreground truncate">
                         {server.type === "remote" ? server.url : server.command?.join(" ")}
-                        {server.repoScopes?.length ? (
-                          <span className="ml-2 text-accent">
-                            •{" "}
-                            {server.repoScopes.length === 1
-                              ? server.repoScopes[0]
-                              : `${server.repoScopes.length} repos`}
-                          </span>
-                        ) : (
-                          <span className="ml-2 text-muted-foreground/60">• global</span>
-                        )}
+                        <span
+                          className={`ml-2 ${
+                            server.repoScopes?.length || server.environmentScopes?.length
+                              ? "text-accent"
+                              : "text-muted-foreground/60"
+                          }`}
+                        >
+                          • {scopeSummary(server)}
+                        </span>
+                      </div>
+                      <div className="text-xs text-muted-foreground">
+                        {server.lifecycle} · created by {server.createdBy}
+                        {server.sourceKind === "git" && server.resolvedVersion
+                          ? ` · resolved ${server.resolvedVersion}`
+                          : ""}
                       </div>
                     </div>
                   </button>
@@ -671,34 +827,58 @@ export function McpServersSettings() {
                     <Switch
                       checked={server.enabled}
                       onCheckedChange={() => handleToggle(server)}
+                      disabled={!canWriteCatalog || gitManaged}
                       aria-label={server.enabled ? "Disable" : "Enable"}
                     />
-                    <button
-                      type="button"
-                      onClick={() => setDeleteTarget(server.id)}
-                      className="px-2 py-1 text-xs text-destructive hover:text-destructive/80 transition"
-                    >
-                      Delete
-                    </button>
+                    {canWriteCatalog && !gitManaged && (
+                      <button
+                        type="button"
+                        onClick={() => setDeleteTarget(server.id)}
+                        className="px-2 py-1 text-xs text-destructive hover:text-destructive/80 transition"
+                      >
+                        Delete
+                      </button>
+                    )}
                   </div>
                 </div>
 
                 {/* Expanded edit form */}
                 {isExpanded && (
                   <div className="px-4 pb-4 pt-3 border-t border-border-muted space-y-4">
-                    <McpServerForm
-                      form={form}
-                      setForm={setForm}
-                      repos={repos}
-                      loadingRepos={loadingRepos}
-                      radioPrefix={server.id}
-                      hasExistingCredentials={
-                        server.type === form.type && (server.hasEnv || server.hasHeaders)
-                      }
-                    />
+                    {server.sourceKind === "git" ? (
+                      <>
+                        <p className="text-sm text-muted-foreground">
+                          Metadata and package policy are read-only here. Credentials stay in the
+                          platform and can be rotated without changing the Git definition or the
+                          session&apos;s pinned runtime revision.
+                        </p>
+                        <EnvRowsEditor
+                          form={form}
+                          setForm={setForm}
+                          hasExistingCredentials={server.hasEnv || server.hasHeaders}
+                        />
+                      </>
+                    ) : (
+                      <McpServerForm
+                        form={form}
+                        setForm={setForm}
+                        repos={repos}
+                        environments={environments}
+                        loadingRepos={loadingRepos}
+                        loadingEnvironments={loadingEnvironments}
+                        radioPrefix={server.id}
+                        hasExistingCredentials={
+                          server.type === form.type && (server.hasEnv || server.hasHeaders)
+                        }
+                      />
+                    )}
                     <div className="flex gap-2 pt-2">
                       <Button onClick={save} disabled={saving} size="sm">
-                        {saving ? "Saving..." : "Save Changes"}
+                        {saving
+                          ? "Saving..."
+                          : server.sourceKind === "git"
+                            ? "Save Credentials"
+                            : "Save Changes"}
                       </Button>
                       <Button onClick={cancel} variant="outline" size="sm">
                         Cancel

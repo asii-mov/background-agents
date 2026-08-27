@@ -63,3 +63,15 @@ resource "terraform_data" "sign_in_provider_gate" {
     }
   }
 }
+
+resource "terraform_data" "governance_mcp_builder_gate" {
+  lifecycle {
+    precondition {
+      condition = (
+        (trimspace(var.governance_mcp_builder_url) == "") ==
+        (trimspace(var.governance_mcp_builder_token) == "")
+      )
+      error_message = "governance_mcp_builder_url and governance_mcp_builder_token must be set together or both left empty."
+    }
+  }
+}

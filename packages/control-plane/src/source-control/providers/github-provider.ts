@@ -23,8 +23,12 @@ import type {
   GitPushSpec,
   GitPushAuthContext,
   CredentialHelperAuth,
+  RepositoryScopedCredentialConfig,
+  RepositoryTokenTarget,
   ResolvedCommit,
   RepositoryTree,
+  CheckRepositoryUserAccessConfig,
+  RepositoryUserAccessResult,
 } from "../types";
 import {
   readResponseBytesWithinLimit,
@@ -33,8 +37,8 @@ import {
 } from "../errors";
 import { classifyGitTreeEntry } from "./git-tree";
 import {
+  createScopedInstallationTokenWithExpiry,
   getCachedInstallationToken,
-  getCachedInstallationTokenWithExpiry,
   getInstallationRepository,
   listInstallationRepositories,
   listRepositoryBranches,
@@ -213,6 +217,13 @@ export interface GitHubReviewComment {
 
 export const MAX_GITHUB_AUTOFIX_REVIEW_COMMENTS = 100;
 const GITHUB_REVIEW_COMMENTS_PER_PAGE = 100;
+
+function numericGitHubRepoId(value: string | number | null | undefined): number | null {
+  if (typeof value === "number" && Number.isSafeInteger(value) && value > 0) return value;
+  if (typeof value !== "string") return null;
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : null;
+}
 
 /** Wire shape of GET /repos/{owner}/{repo}/git/trees/{sha}?recursive=1. */
 const githubTreeSchema = z.object({
@@ -429,6 +440,60 @@ export class GitHubSourceControlProvider implements SourceControlProvider {
       isPrivate: data.private,
       providerRepoId: data.id,
     };
+  }
+
+  async checkRepositoryUserAccess(
+    config: CheckRepositoryUserAccessConfig
+  ): Promise<RepositoryUserAccessResult | null> {
+    if (!this.appConfig) {
+      throw new SourceControlProviderError(
+        "GitHub App not configured - cannot authorize repository user",
+        "permanent"
+      );
+    }
+
+    let token: string;
+    try {
+      token = await getCachedInstallationToken(this.appConfig, {
+        cacheStore: this.cacheStore,
+        userAgent: this.userAgent,
+      });
+    } catch (error) {
+      throw SourceControlProviderError.fromFetchError(
+        `Failed to generate GitHub App token: ${error instanceof Error ? error.message : String(error)}`,
+        error,
+        extractHttpStatus(error)
+      );
+    }
+
+    const response = await fetchWithTimeout(
+      `${GITHUB_API_BASE}/repos/${config.owner}/${config.name}/collaborators/${encodeURIComponent(config.userLogin)}/permission`,
+      {
+        headers: {
+          Accept: "application/vnd.github+json",
+          Authorization: `Bearer ${token}`,
+          "X-GitHub-Api-Version": "2022-11-28",
+          "User-Agent": this.userAgent,
+        },
+      }
+    );
+
+    if (response.status === 404) return null;
+    if (!response.ok) {
+      const detail = await response.text();
+      throw SourceControlProviderError.fromFetchError(
+        `Failed to authorize repository user: ${response.status} ${detail}`,
+        new Error(detail),
+        response.status
+      );
+    }
+
+    const result = await parseProviderResponse(
+      response,
+      githubCollaboratorPermissionSchema,
+      "Failed to authorize repository user"
+    );
+    return result.permission === "none" ? null : { permission: result.permission };
   }
 
   /**
@@ -939,10 +1004,36 @@ export class GitHubSourceControlProvider implements SourceControlProvider {
     return data;
   }
 
+  private async resolveRepositoryIdsForToken(
+    repositories: readonly RepositoryTokenTarget[]
+  ): Promise<number[]> {
+    const ids: number[] = [];
+    for (const repository of repositories) {
+      const stored = numericGitHubRepoId(repository.providerRepoId);
+      if (stored !== null) {
+        ids.push(stored);
+        continue;
+      }
+      const access = await this.checkRepositoryAccess({
+        owner: repository.owner,
+        name: repository.name,
+      });
+      if (!access) {
+        throw new SourceControlProviderError(
+          `${repository.owner}/${repository.name} is not accessible to this GitHub App installation`,
+          "permanent",
+          404
+        );
+      }
+      ids.push(access.repoId);
+    }
+    return [...new Set(ids)];
+  }
+
   /**
    * Generate authentication for git push operations using GitHub App.
    */
-  async generatePushAuth(): Promise<GitPushAuthContext> {
+  async generatePushAuth(config: RepositoryScopedCredentialConfig): Promise<GitPushAuthContext> {
     if (!this.appConfig) {
       throw new SourceControlProviderError(
         "GitHub App not configured - cannot generate push auth",
@@ -951,10 +1042,17 @@ export class GitHubSourceControlProvider implements SourceControlProvider {
     }
 
     try {
-      const token = await getCachedInstallationToken(this.appConfig, {
-        cacheStore: this.cacheStore,
-        userAgent: this.userAgent,
-      });
+      const repositoryIds = await this.resolveRepositoryIdsForToken(config.repositories);
+      const { token } = await createScopedInstallationTokenWithExpiry(
+        this.appConfig,
+        {
+          repositoryIds,
+          permissions: { contents: "write", pull_requests: "write" },
+        },
+        {
+          userAgent: this.userAgent,
+        }
+      );
       return {
         authType: "app",
         token,
@@ -967,7 +1065,9 @@ export class GitHubSourceControlProvider implements SourceControlProvider {
     }
   }
 
-  async generateCredentialHelperAuth(): Promise<CredentialHelperAuth> {
+  async generateCredentialHelperAuth(
+    config: RepositoryScopedCredentialConfig
+  ): Promise<CredentialHelperAuth> {
     if (!this.appConfig) {
       throw new SourceControlProviderError(
         "GitHub App not configured - cannot generate credential helper auth",
@@ -976,10 +1076,14 @@ export class GitHubSourceControlProvider implements SourceControlProvider {
     }
 
     try {
-      const { token, expiresAtEpochMs } = await getCachedInstallationTokenWithExpiry(
+      const repositoryIds = await this.resolveRepositoryIdsForToken(config.repositories);
+      const { token, expiresAtEpochMs } = await createScopedInstallationTokenWithExpiry(
         this.appConfig,
         {
-          cacheStore: this.cacheStore,
+          repositoryIds,
+          permissions: { contents: "read" },
+        },
+        {
           userAgent: this.userAgent,
         }
       );

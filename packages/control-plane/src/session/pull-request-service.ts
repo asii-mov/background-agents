@@ -85,7 +85,7 @@ export type PushBranchResult = { success: true } | { success: false; error: stri
  * A PR-creation failure with a caller-facing HTTP status. Thrown by internal
  * steps; createPullRequest's boundary catch maps it into the error result.
  */
-export class PullRequestCreationError extends Error {
+class PullRequestCreationError extends Error {
   constructor(
     readonly status: number,
     message: string
@@ -237,7 +237,15 @@ export class SessionPullRequestService {
 
       let pushAuth: GitPushAuthContext;
       try {
-        pushAuth = await this.deps.sourceControlProvider.generatePushAuth();
+        pushAuth = await this.deps.sourceControlProvider.generatePushAuth({
+          repositories: [
+            {
+              owner: targetRepo.repoOwner,
+              name: targetRepo.repoName,
+              providerRepoId: memberRow?.repo_id ?? (isPrimary ? session.repo_id : null),
+            },
+          ],
+        });
         this.deps.log.info("Generated fresh push auth token");
       } catch (error) {
         this.deps.log.error("Failed to generate push auth", {
@@ -314,6 +322,18 @@ export class SessionPullRequestService {
           resolvedBaseBranch: baseBranch,
         }
       );
+
+      // A draft-required change must never be force-pushed into an already-open
+      // non-draft PR. Providers do not expose one portable "convert to draft"
+      // operation, so fail before the push and require the existing PR to be
+      // converted (or closed) explicitly.
+      if (existingOpenPr && draft && existingOpenPr.state !== "draft") {
+        return {
+          kind: "error",
+          status: 409,
+          error: `Existing pull request #${existingOpenPr.prNumber} must be converted to draft before this change can be pushed.`,
+        };
+      }
 
       const pushSpec = this.deps.sourceControlProvider.buildGitPushSpec({
         owner: targetRepo.repoOwner,

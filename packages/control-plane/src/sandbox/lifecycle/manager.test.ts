@@ -16,6 +16,7 @@ import {
   type IdGenerator,
   type SandboxLifecycleConfig,
   type McpServerLookup,
+  type SecurityPipelineLookup,
   type ImageBuildLookup,
   type SlackAgentNotifyLookup,
 } from "./manager";
@@ -38,6 +39,8 @@ import {
   type StopResult,
 } from "../provider";
 import type { SandboxRow, SessionRow } from "../../session/types";
+import { resolveSessionScopedSettings } from "../../session/integration-settings-resolution";
+import type { SqlDatabase } from "../../db/sql-database";
 import type { SandboxStatus } from "@open-inspect/shared/types/sessions";
 import { hashToken } from "../../auth/crypto";
 import type * as AuthCrypto from "../../auth/crypto";
@@ -1008,7 +1011,7 @@ describe("SandboxLifecycleManager", () => {
           prebuiltImageSha: null,
         })
       );
-      expect(mcpServerLookup.getDecryptedForSession).toHaveBeenCalledWith([]);
+      expect(mcpServerLookup.getDecryptedForSession).toHaveBeenCalledWith("session-123", [], null);
       expect(slackAgentNotifyLookup.isEnabledForRepo).toHaveBeenCalledWith(null, null);
       expect(imageBuildLookup.getLatestReady).not.toHaveBeenCalled();
     });
@@ -3014,6 +3017,7 @@ describe("SandboxLifecycleManager", () => {
       provider?: SandboxProvider;
       imageBuildLookup?: ImageBuildLookup;
       mcpServerLookup?: McpServerLookup;
+      securityPipelineLookup?: SecurityPipelineLookup;
       sandbox?: ReturnType<typeof createMockSandbox>;
       sessionRepositories?: SessionRepositoryInfo[];
     }) {
@@ -3035,7 +3039,11 @@ describe("SandboxLifecycleManager", () => {
         createMockWebSocketManager(false),
         createMockAlarmScheduler(),
         createMockIdGenerator(),
-        { ...createTestConfig(), mcpServerLookup: overrides?.mcpServerLookup },
+        {
+          ...createTestConfig(),
+          mcpServerLookup: overrides?.mcpServerLookup,
+          securityPipelineLookup: overrides?.securityPipelineLookup,
+        },
         overrides?.imageBuildLookup
       );
       return { manager, provider, storage };
@@ -3097,10 +3105,14 @@ describe("SandboxLifecycleManager", () => {
 
       await manager.spawnSandbox();
 
-      expect(mcpServerLookup.getDecryptedForSession).toHaveBeenCalledWith([
-        { repoOwner: "testowner", repoName: "testrepo" },
-        { repoOwner: "testowner", repoName: "backend" },
-      ]);
+      expect(mcpServerLookup.getDecryptedForSession).toHaveBeenCalledWith(
+        "session-123",
+        [
+          { repoOwner: "testowner", repoName: "testrepo" },
+          { repoOwner: "testowner", repoName: "backend" },
+        ],
+        null
+      );
     });
 
     it("passes storage-synthesized members to the MCP lookup on pre-list sessions", async () => {
@@ -3117,9 +3129,74 @@ describe("SandboxLifecycleManager", () => {
 
       await manager.spawnSandbox();
 
-      expect(mcpServerLookup.getDecryptedForSession).toHaveBeenCalledWith([
-        { repoOwner: "testowner", repoName: "testrepo" },
-      ]);
+      expect(mcpServerLookup.getDecryptedForSession).toHaveBeenCalledWith(
+        "session-123",
+        [{ repoOwner: "testowner", repoName: "testrepo" }],
+        null
+      );
+    });
+
+    it("resolves centrally assigned security pipelines for every member and environment", async () => {
+      const pipelines = [
+        {
+          id: "pipeline-1",
+          name: "AppSec baseline",
+          commands: [{ name: "tests", command: ["npm", "test"], timeoutSeconds: 300 }],
+          blocking: true,
+          maxRemediationAttempts: 2,
+          repoScopes: null,
+        },
+      ];
+      const securityPipelineLookup: SecurityPipelineLookup = {
+        getForSession: vi.fn(async () => pipelines),
+      };
+      const { manager, provider } = createMultiRepoManager({ securityPipelineLookup });
+
+      await manager.spawnSandbox();
+
+      expect(securityPipelineLookup.getForSession).toHaveBeenCalledWith(
+        [
+          { repoOwner: "testowner", repoName: "testrepo" },
+          { repoOwner: "testowner", repoName: "backend" },
+        ],
+        null
+      );
+      expect(provider.createSandbox).toHaveBeenCalledWith(
+        expect.objectContaining({ securityPipelines: pipelines })
+      );
+    });
+
+    it("re-resolves centrally assigned security pipelines for snapshot restores", async () => {
+      const pipelines = [
+        {
+          id: "pipeline-1",
+          name: "AppSec baseline",
+          commands: [{ name: "tests", command: ["npm", "test"], timeoutSeconds: 300 }],
+          blocking: true,
+          maxRemediationAttempts: 1,
+          repoScopes: null,
+        },
+      ];
+      const securityPipelineLookup: SecurityPipelineLookup = {
+        getForSession: vi.fn(async () => pipelines),
+      };
+      const sandbox = createMockSandbox({
+        status: "stopped",
+        snapshot_image_id: "snapshot-img-1",
+        snapshot_runtime_version: COMPATIBLE_RUNTIME_VERSION,
+        created_at: Date.now() - 60000,
+      });
+      const { manager, provider } = createMultiRepoManager({
+        sandbox,
+        securityPipelineLookup,
+      });
+
+      await manager.spawnSandbox();
+
+      expect(securityPipelineLookup.getForSession).toHaveBeenCalledTimes(1);
+      expect(provider.restoreFromSnapshot).toHaveBeenCalledWith(
+        expect.objectContaining({ securityPipelines: pipelines })
+      );
     });
 
     it("passes the member list on snapshot restores", async () => {
@@ -3328,6 +3405,204 @@ describe("SandboxLifecycleManager", () => {
 
       expect(provider.createSandbox).toHaveBeenCalledWith(
         expect.objectContaining({ timeoutSeconds: undefined })
+      );
+    });
+
+    it("passes restrictive network policy only to providers that can enforce it", async () => {
+      const session = createMockSession({
+        sandbox_settings:
+          '{"networkPolicy":{"mode":"allowlist","allowedDomains":["api.openai.com"]}}',
+      });
+      const sandbox = createMockSandbox({ status: "pending", created_at: Date.now() - 60000 });
+      const provider = createMockProvider({
+        capabilities: { supportsNetworkEgressPolicy: true },
+      });
+      const storage = createMockStorage(session, sandbox);
+      const manager = new SandboxLifecycleManager(
+        provider,
+        storage,
+        storage,
+        createMockBroadcaster(),
+        createMockWebSocketManager(false),
+        createMockAlarmScheduler(),
+        createMockIdGenerator(),
+        createTestConfig()
+      );
+
+      await manager.spawnSandbox();
+
+      expect(provider.createSandbox).toHaveBeenCalledWith(
+        expect.objectContaining({
+          sandboxSettings: {
+            networkPolicy: { mode: "allowlist", allowedDomains: ["api.openai.com"] },
+          },
+        })
+      );
+    });
+
+    it("resolves the current central network policy instead of a stale session snapshot", async () => {
+      const session = createMockSession({
+        environment_id: "env-1",
+        sandbox_settings: '{"tunnelPorts":[3000],"networkPolicy":{"mode":"unrestricted"}}',
+      });
+      const sandbox = createMockSandbox({ status: "pending", created_at: Date.now() - 60000 });
+      const repositories = [{ repoOwner: "testowner", repoName: "testrepo", baseBranch: "main" }];
+      const storage = createMockStorage(session, sandbox, undefined, repositories);
+      const provider = createMockProvider({
+        capabilities: { supportsNetworkEgressPolicy: true },
+      });
+      const getForSession = vi.fn(async () => ({ mode: "blocked" as const }));
+      const manager = new SandboxLifecycleManager(
+        provider,
+        storage,
+        storage,
+        createMockBroadcaster(),
+        createMockWebSocketManager(false),
+        createMockAlarmScheduler(),
+        createMockIdGenerator(),
+        { ...createTestConfig(), sandboxNetworkPolicyLookup: { getForSession } }
+      );
+
+      await manager.spawnSandbox();
+
+      expect(getForSession).toHaveBeenCalledWith(
+        [{ repoOwner: "testowner", repoName: "testrepo" }],
+        "env-1"
+      );
+      expect(provider.createSandbox).toHaveBeenCalledWith(
+        expect.objectContaining({
+          sandboxSettings: { tunnelPorts: [3000], networkPolicy: { mode: "blocked" } },
+        })
+      );
+    });
+
+    it("blocks egress when current central network policy resolution fails", async () => {
+      const session = createMockSession({
+        sandbox_settings: '{"networkPolicy":{"mode":"unrestricted"}}',
+      });
+      const sandbox = createMockSandbox({ status: "pending", created_at: Date.now() - 60000 });
+      const provider = createMockProvider({
+        capabilities: { supportsNetworkEgressPolicy: true },
+      });
+      const storage = createMockStorage(session, sandbox);
+      const manager = new SandboxLifecycleManager(
+        provider,
+        storage,
+        storage,
+        createMockBroadcaster(),
+        createMockWebSocketManager(false),
+        createMockAlarmScheduler(),
+        createMockIdGenerator(),
+        {
+          ...createTestConfig(),
+          sandboxNetworkPolicyLookup: {
+            getForSession: vi.fn(async () => {
+              throw new Error("D1 unavailable");
+            }),
+          },
+        }
+      );
+
+      await manager.spawnSandbox();
+
+      expect(provider.createSandbox).toHaveBeenCalledWith(
+        expect.objectContaining({ sandboxSettings: { networkPolicy: { mode: "blocked" } } })
+      );
+    });
+
+    it("blocks egress when integration settings cannot be resolved", async () => {
+      const unavailableDb = {
+        prepare() {
+          throw new Error("D1 unavailable");
+        },
+        async batch() {
+          throw new Error("D1 unavailable");
+        },
+      } satisfies SqlDatabase;
+      const session = createMockSession({
+        sandbox_settings: '{"networkPolicy":{"mode":"unrestricted"}}',
+      });
+      const sandbox = createMockSandbox({ status: "pending", created_at: Date.now() - 60000 });
+      const repositories = [{ repoOwner: "testowner", repoName: "testrepo", baseBranch: "main" }];
+      const provider = createMockProvider({
+        capabilities: { supportsNetworkEgressPolicy: true },
+      });
+      const storage = createMockStorage(session, sandbox, undefined, repositories);
+      const manager = new SandboxLifecycleManager(
+        provider,
+        storage,
+        storage,
+        createMockBroadcaster(),
+        createMockWebSocketManager(false),
+        createMockAlarmScheduler(),
+        createMockIdGenerator(),
+        {
+          ...createTestConfig(),
+          sandboxNetworkPolicyLookup: {
+            getForSession: async (members, environmentId) =>
+              (await resolveSessionScopedSettings(unavailableDb, members, environmentId))
+                .sandboxSettings.networkPolicy,
+          },
+        }
+      );
+
+      await manager.spawnSandbox();
+
+      expect(provider.createSandbox).toHaveBeenCalledWith(
+        expect.objectContaining({ sandboxSettings: { networkPolicy: { mode: "blocked" } } })
+      );
+    });
+
+    it("rejects restrictive network policy when the provider cannot enforce it", async () => {
+      const session = createMockSession({
+        sandbox_settings: '{"networkPolicy":{"mode":"blocked"}}',
+      });
+      const sandbox = createMockSandbox({ status: "pending", created_at: Date.now() - 60000 });
+      const provider = createMockProvider();
+      const broadcaster = createMockBroadcaster();
+      const storage = createMockStorage(session, sandbox);
+      const manager = new SandboxLifecycleManager(
+        provider,
+        storage,
+        storage,
+        broadcaster,
+        createMockWebSocketManager(false),
+        createMockAlarmScheduler(),
+        createMockIdGenerator(),
+        createTestConfig()
+      );
+
+      await manager.spawnSandbox();
+
+      expect(provider.createSandbox).not.toHaveBeenCalled();
+      expect(broadcaster.messages).toContainEqual({
+        type: "sandbox_error",
+        error: "mock does not support centrally managed outbound network policies",
+      });
+    });
+
+    it("fails closed when the persisted settings blob is corrupt", async () => {
+      const session = createMockSession({ sandbox_settings: "not-json" });
+      const sandbox = createMockSandbox({ status: "pending", created_at: Date.now() - 60000 });
+      const provider = createMockProvider({
+        capabilities: { supportsNetworkEgressPolicy: true },
+      });
+      const storage = createMockStorage(session, sandbox);
+      const manager = new SandboxLifecycleManager(
+        provider,
+        storage,
+        storage,
+        createMockBroadcaster(),
+        createMockWebSocketManager(false),
+        createMockAlarmScheduler(),
+        createMockIdGenerator(),
+        createTestConfig()
+      );
+
+      await manager.spawnSandbox();
+
+      expect(provider.createSandbox).toHaveBeenCalledWith(
+        expect.objectContaining({ sandboxSettings: { networkPolicy: { mode: "blocked" } } })
       );
     });
 

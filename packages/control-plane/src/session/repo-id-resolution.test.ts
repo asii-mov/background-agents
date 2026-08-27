@@ -18,6 +18,7 @@ function stubProvider(
     getRepository: () => notUsedHere("getRepository"),
     createPullRequest: () => notUsedHere("createPullRequest"),
     checkRepositoryAccess,
+    checkRepositoryUserAccess: () => notUsedHere("checkRepositoryUserAccess"),
     listRepositories: () => notUsedHere("listRepositories"),
     listBranches: () => notUsedHere("listBranches"),
     getBranchHead: () => notUsedHere("getBranchHead"),

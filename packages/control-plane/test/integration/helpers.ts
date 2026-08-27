@@ -558,3 +558,77 @@ export async function seedSandboxAuthHash(
     );
   });
 }
+
+/**
+ * Publish a complete diff and its matching immutable repository baselines.
+ * PR risk classification deliberately fails closed until both exist.
+ */
+export async function seedReadyDiff(
+  stub: DurableObjectStub,
+  repositories: Array<{ repoOwner: string; repoName: string }> = [
+    { repoOwner: "acme", repoName: "web-app" },
+  ]
+): Promise<void> {
+  const baseSha = "a".repeat(40);
+  const capturedAt = Date.now();
+  const bundle = {
+    version: 1,
+    triggerMessageId: null,
+    capturedAt,
+    repositories: repositories.map((repository, position) => ({
+      status: "ready",
+      position,
+      ...repository,
+      baseSha,
+      headSha: "b".repeat(40),
+      truncated: false,
+      omittedFileCount: 0,
+      files: [
+        {
+          id: `file-${position}`,
+          path: `src/change-${position}.ts`,
+          status: "modified",
+          additions: 1,
+          deletions: 1,
+          renderState: "renderable",
+          patch: "@@ -1 +1 @@\n-old\n+new\n",
+        },
+      ],
+    })),
+  };
+
+  await runInSessionDO(stub, (_instance: SessionDO, state) => {
+    for (const [position, repository] of repositories.entries()) {
+      state.storage.sql.exec(
+        `UPDATE session_repositories
+         SET base_sha = ?
+         WHERE position = ?
+           AND repo_owner = ? COLLATE NOCASE
+           AND repo_name = ? COLLATE NOCASE`,
+        baseSha,
+        position,
+        repository.repoOwner,
+        repository.repoName
+      );
+      if (position === 0) {
+        state.storage.sql.exec(
+          `UPDATE session SET base_sha = ?
+           WHERE repo_owner = ? COLLATE NOCASE
+             AND repo_name = ? COLLATE NOCASE`,
+          baseSha,
+          repository.repoOwner,
+          repository.repoName
+        );
+      }
+    }
+    state.storage.sql.exec(
+      `INSERT INTO session_diff
+       (singleton, revision_id, trigger_message_id, bundle_json, captured_at, updated_at)
+       VALUES (1, ?, NULL, ?, ?, ?)`,
+      "c".repeat(64),
+      JSON.stringify(bundle),
+      capturedAt,
+      capturedAt
+    );
+  });
+}

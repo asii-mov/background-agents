@@ -3,7 +3,14 @@ import { env } from "cloudflare:test";
 import type { SourceControlProvider } from "../../src/source-control";
 import type { SessionDO } from "../../src/session/durable-object";
 import { componentsOf, runInSessionDO } from "./session-do-access";
-import { initNamedSession, initSession, queryDO, seedMessage, serviceFetch } from "./helpers";
+import {
+  initNamedSession,
+  initSession,
+  queryDO,
+  seedMessage,
+  seedReadyDiff,
+  serviceFetch,
+} from "./helpers";
 
 describe("POST /internal/create-pr", () => {
   it("returns 404 when session is not initialized", async () => {
@@ -91,6 +98,7 @@ describe("POST /internal/create-pr", () => {
   });
   it("falls back to app auth when expired OAuth token cannot be refreshed", async () => {
     const { stub } = await initSession({ userId: "user-1" });
+    await seedReadyDiff(stub);
 
     const participants = await queryDO<{ id: string }>(
       stub,
@@ -179,6 +187,7 @@ describe("POST /internal/create-pr", () => {
 
   it("creates PR with app auth when prompting user has no OAuth token", async () => {
     const { stub } = await initSession({ userId: "user-1" });
+    await seedReadyDiff(stub);
 
     const participants = await queryDO<{ id: string }>(
       stub,
@@ -268,6 +277,7 @@ describe("POST /internal/create-pr", () => {
   });
 
   async function seedProcessingMessageForOwner(stub: DurableObjectStub, messageId: string) {
+    await seedReadyDiff(stub);
     const participants = await queryDO<{ id: string }>(
       stub,
       "SELECT id FROM participants WHERE user_id = ?",
@@ -418,6 +428,10 @@ describe("POST /internal/create-pr", () => {
     };
 
     async function seedProcessingMessage(stub: DurableObjectStub, messageId: string) {
+      await seedReadyDiff(stub, [
+        { repoOwner: "acme", repoName: "web-app" },
+        { repoOwner: "acme", repoName: "backend" },
+      ]);
       const participants = await queryDO<{ id: string }>(
         stub,
         "SELECT id FROM participants WHERE user_id = ?",

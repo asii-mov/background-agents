@@ -23,11 +23,16 @@ import type { SqlDatabase } from "./db/sql-database";
 import { createCloudflareBackgroundTasks } from "./cloudflare/background-tasks";
 import { Scheduler } from "./scheduler/scheduler";
 import { isAutofixQueue } from "./queue-routing";
+import {
+  GOVERNANCE_CATALOG_SYNC_CRON,
+  runGovernanceCatalogSchedule,
+} from "./governance/reconciler";
 
 const logger = createLogger("worker");
 
 // Re-export Durable Objects for Cloudflare to discover
 export { SessionDO } from "./session/durable-object";
+export { GovernanceCatalogDO } from "./governance/durable-object";
 
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
@@ -66,6 +71,10 @@ export default {
         new SessionDraftExpiryClient(env.SESSION),
         logger
       ).run(Date.now());
+      return;
+    }
+    if (event.cron === GOVERNANCE_CATALOG_SYNC_CRON) {
+      await runGovernanceCatalogSchedule(env);
       return;
     }
     if (event.cron !== "* * * * *") {

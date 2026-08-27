@@ -13,7 +13,7 @@ The control plane must include an Authorization header with a valid token.
 
 import time
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, cast
 
 from fastapi import Header, HTTPException
 from modal import fastapi_endpoint
@@ -257,8 +257,10 @@ async def api_create_sandbox(
 
     require_auth(authorization)
 
-    control_plane_url = request.get("control_plane_url")
-    require_valid_control_plane_url(control_plane_url)
+    raw_control_plane_url = request.get("control_plane_url")
+    require_valid_control_plane_url(raw_control_plane_url)
+    control_plane_url = cast("str", raw_control_plane_url or "")
+    sandbox_auth_token = cast("str", request.get("sandbox_auth_token") or "")
 
     try:
         from .sandbox.manager import (
@@ -286,7 +288,7 @@ async def api_create_sandbox(
             sandbox_id=request.get("sandbox_id"),  # Use control-plane-provided ID for auth
             session_config=session_config,
             control_plane_url=control_plane_url,
-            sandbox_auth_token=request.get("sandbox_auth_token"),
+            sandbox_auth_token=sandbox_auth_token,
             user_env_vars=request.get("user_env_vars") or None,
             repo_image_id=repo_image_id,
             repo_image_sha=request.get("repo_image_sha") or None,

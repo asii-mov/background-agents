@@ -6,6 +6,7 @@ import type { Env } from "./types";
 import { authenticate, isAuthError } from "./auth/authenticate";
 import type { Principal } from "./auth/principal";
 import { getUserAuth, getUserAuthRuntime } from "./auth/user/runtime";
+import { PlatformRoleStore } from "./db/platform-roles";
 import {
   resolveScmProviderFromEnv,
   SourceControlProviderError,
@@ -45,6 +46,12 @@ import { analyticsRoutes } from "./routes/analytics";
 import { autofixRoutes } from "./routes/autofix";
 import { skillRoutes } from "./routes/skills";
 import { keyboardShortcutRoutes } from "./routes/keyboard-shortcuts";
+import { platformUserRoutes } from "./routes/platform-users";
+import { capabilityCatalogRoutes } from "./routes/capability-catalog";
+import { securityPipelineRoutes } from "./routes/security-pipelines";
+import { repositoryRiskRoutes } from "./routes/repository-risk";
+import { approvedComponentRoutes } from "./routes/approved-components";
+import { governanceCatalogRoutes } from "./routes/governance-catalog";
 import { sessionRoutes } from "./routes/sessions";
 import { modelProviderAccountRoutes } from "./routes/model-provider-accounts";
 import { handleSlackNotify } from "./routes/slack-notify";
@@ -155,6 +162,30 @@ function enforceImplementedScmProvider(
     const response = error(errorMessage, 500);
     return withCorsAndTraceHeaders(response, ctx);
   }
+}
+
+async function enforceRoutePermission(
+  route: Route,
+  env: Env,
+  ctx: RequestContext
+): Promise<Response | null> {
+  if (!route.requiredPermission) return null;
+  if (!ctx.principal) return error("Forbidden", 403);
+  const authorization = await new PlatformRoleStore(ctx.db, {
+    adminUsers: env.PLATFORM_ADMIN_USERS,
+    editorUsers: env.PLATFORM_EDITOR_USERS,
+  }).authorize(ctx.principal, route.requiredPermission);
+  if (!authorization.allowed) {
+    logger.warn("Platform permission denied", {
+      event: "auth.authorization_denied",
+      permission: route.requiredPermission,
+      principal_kind: ctx.principal.kind,
+      request_id: ctx.request_id,
+      trace_id: ctx.trace_id,
+    });
+    return error("Forbidden", 403);
+  }
+  return null;
 }
 
 /**
@@ -311,6 +342,12 @@ export const routes: Route[] = [
   ...browserAuthRoutes,
   ...signInProviderRoutes,
 
+  ...platformUserRoutes,
+  ...capabilityCatalogRoutes,
+  ...securityPipelineRoutes,
+  ...repositoryRiskRoutes,
+  ...approvedComponentRoutes,
+
   // Session management
   ...sessionRoutes,
   // Agent-initiated Slack notification (sandbox-authenticated)
@@ -353,6 +390,7 @@ export const routes: Route[] = [
 
   // MCP servers
   ...mcpServerRoutes,
+  ...governanceCatalogRoutes,
 
   // Analytics
   ...analyticsRoutes,
@@ -498,6 +536,12 @@ export async function handleRequest(
   const providerCheck = enforceImplementedScmProvider(matchedRoute.route, path, env, ctx);
   if (providerCheck) {
     return withRouteCachePolicy(providerCheck, matchedRoute.route);
+  }
+
+  const permissionCheck = await enforceRoutePermission(matchedRoute.route, env, ctx);
+  if (permissionCheck) {
+    logRequest(permissionCheck, ctx, method, path, startTime);
+    return withCorsAndTraceHeaders(withRouteCachePolicy(permissionCheck, matchedRoute.route), ctx);
   }
 
   let response: Response;

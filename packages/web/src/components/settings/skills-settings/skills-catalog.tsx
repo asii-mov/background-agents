@@ -15,8 +15,13 @@ import { PlusIcon, SparkleIcon } from "@/components/ui/icons";
 import { SkillEditor } from "./skill-editor";
 import { SkillImport } from "./skill-import";
 import { errorMessage } from "./utils";
+import { usePlatformRole } from "@/hooks/use-platform-role";
+import { useGovernanceCatalog } from "@/hooks/use-governance-catalog";
 
 export function SkillsCatalog() {
+  const { canWriteCatalog } = usePlatformRole();
+  const { status: governance } = useGovernanceCatalog();
+  const gitManaged = governance?.configured === true;
   const [cursorHistory, setCursorHistory] = useState<string[]>([]);
   const cursor = cursorHistory.at(-1) ?? null;
   const { skills, hasMore, nextCursor, loading, error } = useSkillCatalogPage(cursor);
@@ -113,15 +118,24 @@ export function SkillsCatalog() {
             Manage reusable instructions assigned to repositories and environments.
           </p>
         </div>
-        <div className="flex shrink-0 gap-2">
-          <Button size="sm" variant="subtle" onClick={() => setImporting(true)}>
-            Import from repository
-          </Button>
-          <Button size="sm" onClick={() => setCreating(true)}>
-            <PlusIcon className="h-4 w-4" /> New skill
-          </Button>
-        </div>
+        {canWriteCatalog && !gitManaged && (
+          <div className="flex shrink-0 gap-2">
+            <Button size="sm" variant="subtle" onClick={() => setImporting(true)}>
+              Import from repository
+            </Button>
+            <Button size="sm" onClick={() => setCreating(true)}>
+              <PlusIcon className="h-4 w-4" /> New skill
+            </Button>
+          </div>
+        )}
       </div>
+      {gitManaged && (
+        <p className="mb-5 rounded border border-border bg-muted/30 p-3 text-sm text-muted-foreground">
+          Skills are read-only here because they are managed by pull request in{" "}
+          {governance.source?.owner}/{governance.source?.name}. The control plane is serving the
+          last fully validated Git revision.
+        </p>
+      )}
       {error ? (
         <p className="text-sm text-destructive">Failed to load managed skills.</p>
       ) : loading ? (
@@ -142,7 +156,9 @@ export function SkillsCatalog() {
             <div key={item.id} className="flex items-start gap-3 p-4">
               <button
                 type="button"
-                onClick={() => setSelectedId(item.id)}
+                onClick={() => {
+                  if (canWriteCatalog && !gitManaged) setSelectedId(item.id);
+                }}
                 className="min-w-0 flex-1 text-left"
               >
                 <div className="flex items-center gap-2">
@@ -160,6 +176,11 @@ export function SkillsCatalog() {
                       {item.source.repoOwner}/{item.source.repoName}
                     </span>
                   )}
+                  {item.required && (
+                    <span className="rounded bg-amber-500/10 px-1.5 py-0.5 text-[10px] text-amber-700 dark:text-amber-300">
+                      required
+                    </span>
+                  )}
                 </div>
                 <p className="mt-1 line-clamp-2 text-sm text-muted-foreground">
                   {item.description}
@@ -174,11 +195,14 @@ export function SkillsCatalog() {
               <Switch
                 checked={item.enabled}
                 onCheckedChange={(value) => toggleEnabled(item.id, value)}
+                disabled={!canWriteCatalog || gitManaged}
                 aria-label={`${item.enabled ? "Disable" : "Enable"} ${item.name}`}
               />
-              <Button variant="ghost" size="xs" onClick={() => remove(item.id, item.name)}>
-                Delete
-              </Button>
+              {canWriteCatalog && !gitManaged && (
+                <Button variant="ghost" size="xs" onClick={() => remove(item.id, item.name)}>
+                  Delete
+                </Button>
+              )}
             </div>
           ))}
         </div>

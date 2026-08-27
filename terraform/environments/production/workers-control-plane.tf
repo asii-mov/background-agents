@@ -101,6 +101,8 @@ module "control_plane_worker" {
       { name = "ALLOWED_EMAILS", value = var.allowed_emails },
       { name = "ALLOWED_GITHUB_ORGS", value = var.allowed_github_orgs },
       { name = "UNSAFE_ALLOW_ALL_USERS", value = tostring(var.unsafe_allow_all_users) },
+      { name = "PLATFORM_ADMIN_USERS", value = var.platform_admin_users },
+      { name = "PLATFORM_EDITOR_USERS", value = var.platform_editor_users },
       { name = "WORKER_URL", value = local.control_plane_url },
       { name = "DEPLOYMENT_NAME", value = var.deployment_name },
       { name = "APP_NAME", value = var.app_name },
@@ -158,6 +160,14 @@ module "control_plane_worker" {
       { name = "E2B_TEMPLATE_ID", value = var.e2b_template_id },
       { name = "E2B_SANDBOX_TIMEOUT_SECONDS", value = tostring(var.e2b_sandbox_timeout_seconds) },
       { name = "E2B_AUTO_PAUSE", value = tostring(var.e2b_auto_pause) },
+    ] : [],
+    trimspace(var.governance_repo_owner) != "" ? [
+      { name = "GOVERNANCE_REPO_OWNER", value = trimspace(var.governance_repo_owner) },
+      { name = "GOVERNANCE_REPO_NAME", value = trimspace(var.governance_repo_name) },
+      { name = "GOVERNANCE_REPO_REF", value = trimspace(var.governance_repo_ref) },
+      { name = "GOVERNANCE_REPO_PATH", value = trimspace(var.governance_repo_path) },
+      { name = "GOVERNANCE_NPM_REGISTRY_URL", value = trimspace(var.governance_npm_registry_url) },
+      { name = "GOVERNANCE_MCP_BUILDER_URL", value = trimspace(var.governance_mcp_builder_url) },
     ] : []
   )
 
@@ -209,11 +219,18 @@ module "control_plane_worker" {
     # token can authorize chat.postMessage from agent tool calls.
     length(var.slack_bot_token) > 0 ? [
       { name = "SLACK_BOT_TOKEN", value = var.slack_bot_token },
+    ] : [],
+    trimspace(var.governance_npm_registry_token) != "" ? [
+      { name = "GOVERNANCE_NPM_REGISTRY_TOKEN", value = var.governance_npm_registry_token },
+    ] : [],
+    trimspace(var.governance_mcp_builder_token) != "" ? [
+      { name = "GOVERNANCE_MCP_BUILDER_TOKEN", value = var.governance_mcp_builder_token },
     ] : []
   )
 
   durable_objects = [
     { binding_name = "SESSION", class_name = "SessionDO" },
+    { binding_name = "GOVERNANCE_CATALOG", class_name = "GovernanceCatalogDO" },
   ]
 
   enable_durable_object_bindings = var.enable_durable_object_bindings
@@ -227,7 +244,7 @@ module "control_plane_worker" {
 
   # The image-build schedule must match IMAGE_BUILD_SCHEDULER_CRON in scheduler.ts,
   # and the draft sweep ABANDONED_DRAFT_SWEEP_CRON in abandoned-draft-sweep.ts.
-  cron_triggers = ["* * * * *", "7,37 * * * *", "23 * * * *"]
+  cron_triggers = ["* * * * *", "7,37 * * * *", "11,26,41,56 * * * *", "23 * * * *"]
 
   # module.e2b_infra is deliberately absent: its template build depends on THIS
   # worker instead (see e2b.tf), so control-plane deploys land before template

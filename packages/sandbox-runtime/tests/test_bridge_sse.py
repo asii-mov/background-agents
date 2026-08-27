@@ -14,7 +14,7 @@ import json
 import time
 from collections.abc import AsyncIterator
 from typing import Any
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import httpx
 import pytest
@@ -903,6 +903,99 @@ class TestSSEStreaming:
         assert complete["messageId"] == "cp-msg-1"
         assert complete["success"] is False
         assert complete["error"] == "OpenCode completed without emitting assistant output."
+
+    @pytest.mark.asyncio
+    async def test_handle_prompt_remediates_and_reruns_managed_security_checks(
+        self, bridge: AgentBridge
+    ):
+        bridge._configure_git_identity = AsyncMock()
+        bridge._send_event = AsyncMock()
+        prompts: list[str] = []
+
+        async def fake_stream(
+            message_id: str,
+            content: str,
+            model: str | None = None,
+            reasoning_effort: str | None = None,
+            attachments: list[dict[str, Any]] | None = None,
+        ) -> AsyncIterator[dict[str, Any]]:
+            del model, reasoning_effort, attachments
+            prompts.append(content)
+            yield {"type": "token", "messageId": message_id, "content": "agent output"}
+
+        failed_report = MagicMock()
+        failed_report.failures = (object(),)
+        failed_report.blocking_failures = (object(),)
+        failed_report.remediation_prompt.return_value = "Fix the verified scanner finding"
+        passed_report = MagicMock()
+        passed_report.failures = ()
+        passed_report.blocking_failures = ()
+        runner = MagicMock()
+        runner.pipelines = (object(),)
+        runner.max_remediation_attempts = 1
+        runner.run = AsyncMock(side_effect=[failed_report, passed_report])
+        bridge.security_pipelines = runner
+        bridge._stream_opencode_response_sse = fake_stream
+
+        await bridge._handle_prompt(
+            {
+                "messageId": "cp-msg-1",
+                "content": "Build the feature",
+                "author": {"gitIdentity": {"mode": "agent-only"}},
+            }
+        )
+
+        assert prompts == ["Build the feature", "Fix the verified scanner finding"]
+        assert runner.run.await_count == 2
+        events = [call.args[0] for call in bridge._send_event.await_args_list]
+        assert [event["scope"] for event in events if event["type"] == "warning"] == [
+            "security_pipeline",
+            "security_pipeline",
+        ]
+        assert events[-1] == {
+            "type": "execution_complete",
+            "messageId": "cp-msg-1",
+            "success": True,
+        }
+
+    @pytest.mark.asyncio
+    async def test_handle_prompt_fails_when_blocking_security_check_still_fails(
+        self, bridge: AgentBridge
+    ):
+        bridge._configure_git_identity = AsyncMock()
+        bridge._send_event = AsyncMock()
+
+        async def fake_stream(*_args: Any, **_kwargs: Any) -> AsyncIterator[dict[str, Any]]:
+            yield {"type": "token", "messageId": "cp-msg-1", "content": "agent output"}
+
+        failed_report = MagicMock()
+        failed_report.failures = (object(),)
+        failed_report.blocking_failures = (object(),)
+        runner = MagicMock()
+        runner.pipelines = (object(),)
+        runner.max_remediation_attempts = 0
+        runner.run = AsyncMock(return_value=failed_report)
+        bridge.security_pipelines = runner
+        bridge._stream_opencode_response_sse = fake_stream
+
+        await bridge._handle_prompt(
+            {
+                "messageId": "cp-msg-1",
+                "content": "Build the feature",
+                "author": {"gitIdentity": {"mode": "agent-only"}},
+            }
+        )
+
+        events = [call.args[0] for call in bridge._send_event.await_args_list]
+        assert events[-1] == {
+            "type": "execution_complete",
+            "messageId": "cp-msg-1",
+            "success": False,
+            "error": (
+                "Centrally managed application-security checks still fail after "
+                "autonomous remediation."
+            ),
+        }
 
 
 class TestFetchFinalMessageState:

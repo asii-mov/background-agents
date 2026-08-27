@@ -75,6 +75,7 @@ describe("managed skill contracts", () => {
       content: { description: "Review code", body: "Review it." },
     });
     expect(skill.assignments).toEqual([]);
+    expect(skill.required).toBeUndefined();
     expect(skill.content.files).toEqual([]);
     expect(skill.content.metadata).toEqual({});
     expect(sessionSkillSelectionSchema.parse({ mode: "all" })).toEqual({ mode: "all" });
@@ -101,7 +102,7 @@ describe("managed skill contracts", () => {
     ).toBe(false);
   });
 
-  it("defaults missing import provenance for rolling response compatibility", () => {
+  it("defaults new summary fields for rolling response compatibility", () => {
     const summary = skillSummarySchema.parse({
       id: "skill-1",
       name: "acme-review",
@@ -121,6 +122,7 @@ describe("managed skill contracts", () => {
       updatedAt: 1,
     });
 
+    expect(summary.required).toBe(false);
     expect(summary.source).toBeNull();
   });
 

@@ -216,7 +216,6 @@ export async function resolveCanonicalUserId(
       provider: actor.provider,
       providerUserId: actor.providerUserId,
       displayName: display.displayName,
-      providerEmail: display.email,
       avatarUrl: display.avatarUrl,
     });
     return { userId: user.id };

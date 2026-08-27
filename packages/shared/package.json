@@ -166,6 +166,14 @@
       "import": "./dist/types/skills.js",
       "types": "./dist/types/skills.d.ts"
     },
+    "./types/security-pipelines": {
+      "import": "./dist/types/security-pipelines.js",
+      "types": "./dist/types/security-pipelines.d.ts"
+    },
+    "./types/approved-components": {
+      "import": "./dist/types/approved-components.js",
+      "types": "./dist/types/approved-components.d.ts"
+    },
     "./types/keyboard-shortcuts": {
       "import": "./dist/types/keyboard-shortcuts.js",
       "types": "./dist/types/keyboard-shortcuts.d.ts"

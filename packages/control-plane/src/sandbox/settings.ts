@@ -1,8 +1,10 @@
 import {
   findSandboxPortConflict,
   isValidSandboxTimeoutMs,
+  MAX_SANDBOX_NETWORK_ALLOWLIST_ENTRIES,
   MAX_TUNNEL_PORTS,
   type ConfiguredSandboxPort,
+  type SandboxNetworkPolicy,
   type SandboxSettings,
 } from "@open-inspect/shared/types/integrations";
 
@@ -55,6 +57,10 @@ export function normalizeSandboxSettings(
 
   const settings = input as Record<string, unknown>;
   const result: SandboxSettings = {};
+
+  if (settings.networkPolicy !== undefined) {
+    result.networkPolicy = normalizeNetworkPolicy(settings.networkPolicy, reject);
+  }
 
   if (settings.terminalEnabled !== undefined) {
     if (typeof settings.terminalEnabled !== "boolean") {
@@ -270,4 +276,133 @@ function normalizePositiveIntegerSetting(
     return undefined;
   }
   return value;
+}
+
+function normalizeNetworkPolicy(
+  value: unknown,
+  reject: (message: string) => false
+): SandboxNetworkPolicy {
+  let invalid = false;
+  const rejectPolicy = (message: string): void => {
+    invalid = true;
+    reject(message);
+  };
+
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    rejectPolicy("networkPolicy must be an object");
+    return { mode: "blocked" };
+  }
+
+  const policy = value as Record<string, unknown>;
+  if (policy.mode === "unrestricted" || policy.mode === "blocked") {
+    return { mode: policy.mode };
+  }
+  if (policy.mode !== "allowlist") {
+    rejectPolicy("networkPolicy.mode must be unrestricted, blocked, or allowlist");
+    return { mode: "blocked" };
+  }
+
+  const allowedCidrs = normalizeStringAllowlist(
+    policy.allowedCidrs,
+    "networkPolicy.allowedCidrs",
+    isValidCidr,
+    rejectPolicy
+  );
+  const allowedDomains = normalizeStringAllowlist(
+    policy.allowedDomains,
+    "networkPolicy.allowedDomains",
+    isValidAllowedDomain,
+    rejectPolicy,
+    (entry) => entry.toLowerCase()
+  );
+
+  if (allowedCidrs.length === 0 && allowedDomains.length === 0) {
+    rejectPolicy("an allowlist network policy requires at least one CIDR or domain");
+  }
+
+  // Persisted settings are decoded in omit mode. A malformed restrictive
+  // policy must fail closed instead of disappearing and restoring open egress.
+  if (invalid) return { mode: "blocked" };
+
+  return {
+    mode: "allowlist",
+    ...(allowedCidrs.length > 0 ? { allowedCidrs } : {}),
+    ...(allowedDomains.length > 0 ? { allowedDomains } : {}),
+  };
+}
+
+function normalizeStringAllowlist(
+  value: unknown,
+  name: string,
+  validate: (entry: string) => boolean,
+  reject: (message: string) => void,
+  transform: (entry: string) => string = (entry) => entry
+): string[] {
+  if (value === undefined) return [];
+  if (!Array.isArray(value)) {
+    reject(`${name} must be an array of strings`);
+    return [];
+  }
+  if (value.length > MAX_SANDBOX_NETWORK_ALLOWLIST_ENTRIES) {
+    reject(`${name} must have ${MAX_SANDBOX_NETWORK_ALLOWLIST_ENTRIES} or fewer entries`);
+  }
+
+  const entries: string[] = [];
+  for (const raw of value.slice(0, MAX_SANDBOX_NETWORK_ALLOWLIST_ENTRIES)) {
+    if (typeof raw !== "string" || !validate(raw.trim())) {
+      reject(`Invalid entry in ${name}: ${String(raw)}`);
+      continue;
+    }
+    const entry = transform(raw.trim());
+    if (!entries.includes(entry)) entries.push(entry);
+  }
+  return entries;
+}
+
+function isValidCidr(value: string): boolean {
+  const separator = value.lastIndexOf("/");
+  if (separator <= 0 || separator === value.length - 1) return false;
+  const address = value.slice(0, separator);
+  const prefixText = value.slice(separator + 1);
+  if (!/^\d+$/.test(prefixText)) return false;
+  const prefix = Number(prefixText);
+
+  if (address.includes(":")) {
+    return prefix <= 128 && isValidIpv6Address(address);
+  }
+  return prefix <= 32 && isValidIpv4Address(address);
+}
+
+function isValidIpv4Address(value: string): boolean {
+  const octets = value.split(".");
+  return (
+    octets.length === 4 &&
+    octets.every((octet) => /^\d{1,3}$/.test(octet) && Number(octet) >= 0 && Number(octet) <= 255)
+  );
+}
+
+function isValidIpv6Address(value: string): boolean {
+  if (!/^[0-9a-fA-F:]+$/.test(value)) return false;
+  const halves = value.split("::");
+  if (halves.length > 2) return false;
+  const groups = (half: string): string[] => (half === "" ? [] : half.split(":"));
+  const left = groups(halves[0]);
+  const right = groups(halves[1] ?? "");
+  const allGroups = [...left, ...right];
+  if (!allGroups.every((group) => /^[0-9a-fA-F]{1,4}$/.test(group))) return false;
+  return halves.length === 2 ? allGroups.length < 8 : allGroups.length === 8;
+}
+
+function isValidAllowedDomain(value: string): boolean {
+  const hostname = value.startsWith("*.") ? value.slice(2) : value;
+  if (hostname.length === 0 || hostname.length > 253 || hostname.endsWith(".")) return false;
+  const labels = hostname.split(".");
+  return labels.every(
+    (label) =>
+      label.length >= 1 &&
+      label.length <= 63 &&
+      /^[a-zA-Z0-9-]+$/.test(label) &&
+      !label.startsWith("-") &&
+      !label.endsWith("-")
+  );
 }

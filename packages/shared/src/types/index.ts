@@ -331,3 +331,5 @@ export type {
 export { formatGitHubNoreplyEmail, githubLoginSchema } from "./github-identity";
 
 export * from "./integrations";
+export * from "./security-pipelines";
+export * from "./approved-components";

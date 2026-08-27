@@ -24,8 +24,6 @@ def cache_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """Isolate the helper's on-disk cache to a per-test temp directory."""
     monkeypatch.setenv("OI_SCM_CRED_CACHE_DIR", str(tmp_path))
     monkeypatch.setattr(helper, "CACHE_DIR", tmp_path)
-    monkeypatch.setattr(helper, "CACHE_FILE", tmp_path / "scm-creds.json")
-    monkeypatch.setattr(helper, "LOCK_FILE", tmp_path / "scm-creds.lock")
     return tmp_path
 
 
@@ -55,6 +53,10 @@ SESSION_REPO_REQUEST = "protocol=https\nhost=github.com\npath=acme/web.git\n\n"
 DEFAULT_CREDENTIAL_TTL_SECONDS = 60 * 60
 NEAR_EXPIRY_SECONDS = 60
 CONCURRENT_REFRESH_DELAY_SECONDS = 0.1
+
+
+def _cache_file(repository: tuple[str, str] = ("acme", "web")) -> Path:
+    return helper._repository_cache_paths(repository)[0]
 
 
 class _ThreadLocalTextIO:
@@ -147,6 +149,71 @@ def test_get_returns_credentials_on_success(cache_dir: Path, env_set: None) -> N
     assert calls[0] == 1
 
 
+def test_posts_the_exact_requested_repository(cache_dir: Path, env_set: None) -> None:
+    seen: list[dict[str, Any]] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        seen.append(json.loads(request.content))
+        return httpx.Response(
+            200,
+            json={
+                "username": "x-access-token",
+                "password": "ghs_scoped",
+                "expires_at_epoch_ms": int((time.time() + DEFAULT_CREDENTIAL_TTL_SECONDS) * 1000),
+            },
+        )
+
+    calls = [0]
+    with _patch_httpx(httpx.MockTransport(respond), calls):
+        code, _out, _err = _run(SESSION_REPO_REQUEST)
+
+    assert code == 0
+    assert seen == [{"repoOwner": "acme", "repoName": "web"}]
+
+
+def test_uses_separate_cache_entries_for_each_session_repository(
+    cache_dir: Path, env_set: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(
+        "SESSION_CONFIG",
+        json.dumps(
+            {
+                "sessionId": "sess-123",
+                "repositories": [
+                    {"repo_owner": "acme", "repo_name": "web"},
+                    {"repo_owner": "acme", "repo_name": "backend"},
+                ],
+            }
+        ),
+    )
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        repository = json.loads(request.content)["repoName"]
+        return httpx.Response(
+            200,
+            json={
+                "username": "x-access-token",
+                "password": f"ghs_{repository}",
+                "expires_at_epoch_ms": int((time.time() + DEFAULT_CREDENTIAL_TTL_SECONDS) * 1000),
+            },
+        )
+
+    calls = [0]
+    with _patch_httpx(httpx.MockTransport(respond), calls):
+        web = _run(SESSION_REPO_REQUEST)
+        backend = _run("protocol=https\nhost=github.com\npath=acme/backend.git\n\n")
+
+    assert "password=ghs_web" in web[1]
+    assert "password=ghs_backend" in backend[1]
+    assert calls[0] == 2
+    web_paths = helper._repository_cache_paths(("acme", "web"))
+    backend_paths = helper._repository_cache_paths(("acme", "backend"))
+    assert web_paths[0] != backend_paths[0]
+    assert web_paths[1] != backend_paths[1]
+    assert _cache_file(("acme", "web")).exists()
+    assert _cache_file(("acme", "backend")).exists()
+
+
 def test_does_not_echo_input_username_or_password(cache_dir: Path, env_set: None) -> None:
     """Old credentialed remotes must not leak stale auth back into git."""
     transport = _mock_response(
@@ -174,23 +241,16 @@ def test_does_not_echo_input_username_or_password(cache_dir: Path, env_set: None
     assert "password=ghs_fresh" in out
 
 
-def test_allows_same_host_auxiliary_repo(cache_dir: Path, env_set: None) -> None:
-    """Setup/start hooks can clone sibling repos using installation-wide credentials."""
-    transport = _mock_response(
-        {
-            "username": "x-access-token",
-            "password": "ghs_auxiliary",
-            "expires_at_epoch_ms": int((time.time() + DEFAULT_CREDENTIAL_TTL_SECONDS) * 1000),
-            "scm_provider": "github",
-        }
-    )
+def test_refuses_same_host_sibling_repo(cache_dir: Path, env_set: None) -> None:
+    transport = _mock_response({"should": "not be called"}, status=500)
     calls = [0]
     with _patch_httpx(transport, calls):
-        code, out, _err = _run("protocol=https\nhost=github.com\npath=acme/backend.git\n\n")
+        code, out, err = _run("protocol=https\nhost=github.com\npath=acme/backend.git\n\n")
 
     assert code == 0
-    assert "password=ghs_auxiliary" in out
-    assert calls[0] == 1
+    assert "password=" not in out
+    assert "not part of this session" in err
+    assert calls[0] == 0
 
 
 def test_refuses_non_https_protocol(cache_dir: Path, env_set: None) -> None:
@@ -218,7 +278,7 @@ def test_allows_same_host_request_without_repo_path_normalization(
     )
     calls = [0]
     with _patch_httpx(transport, calls):
-        code, out, _err = _run("protocol=https\nhost=github.com\npath=/Acme/Backend\n\n")
+        code, out, _err = _run("protocol=https\nhost=github.com\npath=/Acme/Web\n\n")
 
     assert code == 0
     assert "password=ghs_ok" in out
@@ -263,11 +323,15 @@ def test_allows_same_repo_git_lfs_endpoint(cache_dir: Path, env_set: None) -> No
     assert calls[0] == 1
 
 
-def test_does_not_require_session_repo_env(
+def test_reads_scalar_repository_from_session_config(
     cache_dir: Path, env_set: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.delenv("REPO_OWNER")
     monkeypatch.delenv("REPO_NAME")
+    monkeypatch.setenv(
+        "SESSION_CONFIG",
+        json.dumps({"sessionId": "sess-123", "repo_owner": "acme", "repo_name": "web"}),
+    )
     transport = _mock_response(
         {
             "username": "x-access-token",
@@ -278,34 +342,28 @@ def test_does_not_require_session_repo_env(
     )
     calls = [0]
     with _patch_httpx(transport, calls):
-        code, out, _err = _run("protocol=https\nhost=github.com\npath=acme/backend.git\n\n")
+        code, out, _err = _run(SESSION_REPO_REQUEST)
 
     assert code == 0
     assert "password=ghs_host_scoped" in out
     assert calls[0] == 1
 
 
-def test_allows_same_host_request_without_path(cache_dir: Path, env_set: None) -> None:
-    transport = _mock_response(
-        {
-            "username": "x-access-token",
-            "password": "ghs_host_only",
-            "expires_at_epoch_ms": int((time.time() + DEFAULT_CREDENTIAL_TTL_SECONDS) * 1000),
-            "scm_provider": "github",
-        }
-    )
+def test_refuses_same_host_request_without_path(cache_dir: Path, env_set: None) -> None:
+    transport = _mock_response({"should": "not be called"}, status=500)
     calls = [0]
     with _patch_httpx(transport, calls):
-        code, out, _err = _run("protocol=https\nhost=github.com\n\n")
+        code, out, err = _run("protocol=https\nhost=github.com\n\n")
 
     assert code == 0
-    assert "password=ghs_host_only" in out
-    assert calls[0] == 1
+    assert "password=" not in out
+    assert "credential.useHttpPath=true" in err
+    assert calls[0] == 0
 
 
 def test_uses_cache_within_buffer(cache_dir: Path, env_set: None) -> None:
     """A cached entry well within its TTL should be returned without an HTTP call."""
-    helper.CACHE_FILE.write_text(
+    _cache_file().write_text(
         json.dumps(
             {
                 "username": "x-access-token",
@@ -328,7 +386,7 @@ def test_uses_cache_within_buffer(cache_dir: Path, env_set: None) -> None:
 
 def test_refreshes_when_cache_within_expiry_buffer(cache_dir: Path, env_set: None) -> None:
     """A near-expiry cache entry should trigger a refresh."""
-    helper.CACHE_FILE.write_text(
+    _cache_file().write_text(
         json.dumps(
             {
                 "username": "x-access-token",
@@ -355,13 +413,13 @@ def test_refreshes_when_cache_within_expiry_buffer(cache_dir: Path, env_set: Non
     assert "password=ghs_new" in out
     assert calls[0] == 1
 
-    persisted = json.loads(helper.CACHE_FILE.read_text())
+    persisted = json.loads(_cache_file().read_text())
     assert persisted["password"] == "ghs_new"
 
 
 def test_failure_does_not_fall_back_to_stale_cache(cache_dir: Path, env_set: None) -> None:
     """If the endpoint fails, we must NOT return stale cached credentials."""
-    helper.CACHE_FILE.write_text(
+    _cache_file().write_text(
         json.dumps(
             {
                 "username": "x-access-token",
@@ -481,7 +539,7 @@ def test_5xx_from_control_plane_exits_nonzero(cache_dir: Path, env_set: None) ->
 
 def test_malformed_cache_json_triggers_refresh(cache_dir: Path, env_set: None) -> None:
     """Garbage in the cache file should be treated as a miss, not crash the helper."""
-    helper.CACHE_FILE.write_text("{ not json")
+    _cache_file().write_text("{ not json")
 
     transport = _mock_response(
         {
@@ -502,7 +560,7 @@ def test_malformed_cache_json_triggers_refresh(cache_dir: Path, env_set: None) -
 
 def test_cache_missing_password_triggers_refresh(cache_dir: Path, env_set: None) -> None:
     """A partial cache entry (no password) should not be served — refresh instead."""
-    helper.CACHE_FILE.write_text(
+    _cache_file().write_text(
         json.dumps(
             {
                 "username": "x-access-token",
@@ -538,7 +596,7 @@ def test_control_plane_response_missing_password_is_fatal(cache_dir: Path, env_s
     assert code != 0
     assert "password=" not in out
     assert "missing username/password" in err
-    assert not helper.CACHE_FILE.exists()
+    assert not _cache_file().exists()
 
 
 def test_control_plane_response_invalid_expiry_is_fatal(cache_dir: Path, env_set: None) -> None:
@@ -553,7 +611,7 @@ def test_control_plane_response_invalid_expiry_is_fatal(cache_dir: Path, env_set
     assert code != 0
     assert "password=" not in out
     assert "invalid expires_at_epoch_ms" in err
-    assert not helper.CACHE_FILE.exists()
+    assert not _cache_file().exists()
 
 
 @pytest.mark.parametrize(
@@ -636,6 +694,36 @@ def test_gh_token_action_prints_bare_token(
     assert calls[0] == 1
 
 
+def test_gh_token_action_fails_closed_for_multi_repo_session(
+    cache_dir: Path,
+    env_set: None,
+    clean_gh_env: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(
+        "SESSION_CONFIG",
+        json.dumps(
+            {
+                "sessionId": "sess-123",
+                "repositories": [
+                    {"repo_owner": "acme", "repo_name": "web"},
+                    {"repo_owner": "acme", "repo_name": "backend"},
+                ],
+            }
+        ),
+    )
+    transport = _mock_response({"should": "not be called"}, status=500)
+    calls = [0]
+
+    with _patch_httpx(transport, calls):
+        code, out, err = _run("", action="gh-token")
+
+    assert code == 0
+    assert out == ""
+    assert "exactly one session repository" in err
+    assert calls[0] == 0
+
+
 def test_gh_token_action_prints_nothing_for_user_token(
     cache_dir: Path, env_set: None, clean_gh_env: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -671,6 +759,8 @@ def test_gh_token_action_prints_nothing_when_mint_fails(
     """A failed mint prints nothing and exits 0 so the wrapper falls through to env."""
     # Env wants a mint (nothing usable) but there's no control plane to call.
     monkeypatch.setenv("VCS_HOST", "github.com")
+    monkeypatch.setenv("REPO_OWNER", "acme")
+    monkeypatch.setenv("REPO_NAME", "web")
     code, out, err = _run("", action="gh-token")
 
     assert code == 0
@@ -752,7 +842,7 @@ def test_concurrent_invocations_share_one_refresh(cache_dir: Path, env_set: None
     assert all("password=ghs_locked" in out for _code, out, _err in results)
     assert call_count == 1
     # Cache contains the locked password.
-    assert json.loads(helper.CACHE_FILE.read_text())["password"] == "ghs_locked"
+    assert json.loads(_cache_file().read_text())["password"] == "ghs_locked"
 
 
 def test_cache_file_is_mode_0600(cache_dir: Path, env_set: None) -> None:
@@ -768,5 +858,5 @@ def test_cache_file_is_mode_0600(cache_dir: Path, env_set: None) -> None:
     with _patch_httpx(transport, calls):
         _run(SESSION_REPO_REQUEST)
 
-    mode = helper.CACHE_FILE.stat().st_mode & 0o777
+    mode = _cache_file().stat().st_mode & 0o777
     assert mode == 0o600

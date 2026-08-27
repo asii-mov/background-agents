@@ -1,0 +1,17 @@
+{
+  "name": "@open-inspect/mcp-artifact-builder",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/server.js",
+    "test": "NODE_ENV=test node --import tsx --test src/server.test.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "tsx": "^4.20.6",
+    "typescript": "^5.7.2",
+    "@types/node": "^22.10.5"
+  }
+}

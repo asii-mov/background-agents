@@ -11,8 +11,19 @@ import {
   normalizeRoutingRules,
   resolveBuildTimeoutSeconds,
   slackIntegrationSettingsRoutingResponseSchema,
+  updateMcpServerInputSchema,
   type SlackRoutingRule,
 } from "./integrations";
+
+describe("updateMcpServerInputSchema", () => {
+  it("requires a revision precondition", () => {
+    expect(updateMcpServerInputSchema.safeParse({ enabled: false }).success).toBe(false);
+    expect(updateMcpServerInputSchema.parse({ revision: 2, enabled: false })).toEqual({
+      revision: 2,
+      enabled: false,
+    });
+  });
+});
 
 describe("findSandboxPortConflict", () => {
   it.each([INTERNAL_TTYD_PORT, INTERNAL_VNC_PORT])("rejects reserved internal port %i", (port) => {

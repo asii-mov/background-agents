@@ -3,13 +3,17 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import filecmp
+import hashlib
 import json
 import os
+import posixpath
 import re
 import shutil
+import tarfile
 import time
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any
+from urllib.parse import quote
 
 import httpx
 
@@ -46,6 +50,8 @@ class OpenCodeServer:
     HEALTH_CHECK_TIMEOUT = 30.0
     MCP_PACKAGE_INSTALL_TIMEOUT_SECONDS = 180
     _NPM_PKG_RE = re.compile(r"^(@[\w.-]+/)?[\w][\w.-]*(@[\w.-]+)?$")
+    _ARTIFACT_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+    MCP_ARTIFACT_MAX_BYTES = 100 * 1024 * 1024
 
     def __init__(
         self,
@@ -382,15 +388,117 @@ class OpenCodeServer:
         except Exception as e:
             self.log.warn("managed_oauth.setup_error", exc=e)
 
-    def _resolve_mcp_servers(self) -> list[Mapping[str, Any]]:
+    def _resolve_mcp_servers(self) -> list[dict[str, Any]]:
         """Resolve MCP servers from session config."""
-        return list(self.mcp_servers)
+        return [dict(server) for server in self.mcp_servers]
 
-    async def _install_mcp_packages(self, servers: list[Mapping[str, Any]]) -> None:
+    def _artifact_directory(self, sha256: str) -> Path:
+        root = Path(os.environ.get("OI_MCP_ARTIFACT_DIR", "/opt/open-inspect/mcp-artifacts"))
+        return root / sha256
+
+    @staticmethod
+    def _validate_artifact_members(archive: tarfile.TarFile) -> None:
+        for member in archive.getmembers():
+            path = PurePosixPath(member.name)
+            if path.is_absolute() or ".." in path.parts:
+                raise RuntimeError("MCP artifact contains an unsafe path")
+            if member.issym() or member.islnk():
+                target = PurePosixPath(member.linkname)
+                combined = target if target.is_absolute() else path.parent / target
+                normalized = posixpath.normpath(str(combined))
+                if normalized == ".." or normalized.startswith("../") or normalized.startswith("/"):
+                    raise RuntimeError("MCP artifact contains an unsafe link")
+
+    async def _materialize_mcp_artifact(self, server: dict[str, Any]) -> None:
+        server_id = server.get("id")
+        revision = server.get("revision")
+        sha256 = server.get("artifactSha256")
+        executable = server.get("artifactExecutable")
+        if (
+            not isinstance(server_id, str)
+            or not isinstance(revision, int)
+            or not isinstance(sha256, str)
+            or not self._ARTIFACT_SHA256_RE.fullmatch(sha256)
+            or not isinstance(executable, str)
+            or not executable
+            or "/" in executable
+            or "\\" in executable
+        ):
+            raise RuntimeError("Managed MCP artifact metadata is invalid")
+
+        destination = self._artifact_directory(sha256)
+        executable_path = destination / "node_modules" / ".bin" / executable
+        marker = destination / "artifact.json"
+        if marker.is_file() and executable_path.exists():
+            server["command"] = [str(executable_path), *list(server.get("command", []))[1:]]
+            return
+
+        control_plane_url = os.environ.get("CONTROL_PLANE_URL", "").rstrip("/")
+        sandbox_token = os.environ.get("SANDBOX_AUTH_TOKEN", "")
+        raw_session_config = json.loads(os.environ.get("SESSION_CONFIG", "{}"))
+        session_id = (
+            raw_session_config.get("session_id") if isinstance(raw_session_config, dict) else None
+        )
+        if (
+            not control_plane_url
+            or not sandbox_token
+            or not isinstance(session_id, str)
+            or not session_id
+        ):
+            raise RuntimeError("Managed MCP artifact download is not configured")
+        url = (
+            f"{control_plane_url}/sessions/{quote(session_id, safe='')}/mcp-artifacts/"
+            f"{quote(server_id, safe='')}/{revision}"
+        )
+        archive_path = destination.parent / f".{sha256}.tar.gz"
+        staging = destination.parent / f".{sha256}.staging"
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.rmtree(staging, ignore_errors=True)
+        archive_path.unlink(missing_ok=True)
+        size = 0
+        digest = hashlib.sha256()
+        try:
+            async with (
+                httpx.AsyncClient() as client,
+                client.stream(
+                    "GET",
+                    url,
+                    headers={"Authorization": f"Bearer {sandbox_token}"},
+                    timeout=self.MCP_PACKAGE_INSTALL_TIMEOUT_SECONDS,
+                ) as response,
+            ):
+                response.raise_for_status()
+                with archive_path.open("wb") as output:
+                    async for chunk in response.aiter_bytes():
+                        size += len(chunk)
+                        if size > self.MCP_ARTIFACT_MAX_BYTES:
+                            raise RuntimeError("Managed MCP artifact exceeds the size limit")
+                        digest.update(chunk)
+                        output.write(chunk)
+            if size == 0 or digest.hexdigest() != sha256:
+                raise RuntimeError("Managed MCP artifact digest does not match the pinned revision")
+            staging.mkdir()
+            with tarfile.open(archive_path, "r:gz") as archive:
+                self._validate_artifact_members(archive)
+                archive.extractall(staging, filter="data")
+            staged_executable = staging / "node_modules" / ".bin" / executable
+            if not (staging / "artifact.json").is_file() or not staged_executable.exists():
+                raise RuntimeError("Managed MCP artifact is missing its declared executable")
+            shutil.rmtree(destination, ignore_errors=True)
+            staging.replace(destination)
+            server["command"] = [str(executable_path), *list(server.get("command", []))[1:]]
+        finally:
+            archive_path.unlink(missing_ok=True)
+            shutil.rmtree(staging, ignore_errors=True)
+
+    async def _install_mcp_packages(self, servers: list[dict[str, Any]]) -> None:
         """Pre-install npm packages for local MCP servers that use npx."""
         packages: list[str] = []
         for server in servers:
             if server.get("type") == "remote":
+                continue
+            if server.get("artifactSha256") is not None:
+                await self._materialize_mcp_artifact(server)
                 continue
             cmd = server.get("command", [])
             if not cmd:
@@ -454,7 +562,7 @@ class OpenCodeServer:
         except Exception as e:
             self.log.warn("mcp.packages_install_error", packages=packages, exc=str(e))
 
-    def _build_mcp_config(self, servers: list[Mapping[str, Any]]) -> dict[str, dict[str, Any]]:
+    def _build_mcp_config(self, servers: Sequence[Mapping[str, Any]]) -> dict[str, dict[str, Any]]:
         """Convert MCP server list to OpenCode mcp config format."""
         config: dict[str, dict[str, Any]] = {}
         for server in servers:

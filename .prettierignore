@@ -8,6 +8,9 @@ build/
 .next/
 .wrangler/
 coverage/
+.artifacts/
+.audit/
+.mypy_cache/
 
 # Python
 packages/modal-infra/

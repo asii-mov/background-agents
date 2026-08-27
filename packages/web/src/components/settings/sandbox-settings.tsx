@@ -9,6 +9,7 @@ import { Input } from "@/components/ui/input";
 import useSWR from "swr";
 import type {
   ConfiguredSandboxPort,
+  SandboxNetworkPolicy,
   SandboxSettings,
 } from "@open-inspect/shared/types/integrations";
 import { browserApiFetch, type BrowserApiPath } from "@/lib/browser-api-fetch";
@@ -94,6 +95,17 @@ function normalizePorts(input: string[]): { ports: number[]; invalid: string[] }
   }
 
   return { ports: [...ports], invalid };
+}
+
+function normalizeNetworkEntries(input: string): string[] {
+  return [
+    ...new Set(
+      input
+        .split(/[\n,]/)
+        .map((entry) => entry.trim())
+        .filter(Boolean)
+    ),
+  ];
 }
 
 const numOrUndef = (v: number | null | undefined): number | undefined =>
@@ -243,6 +255,9 @@ export function SandboxSettingsEditor({
   // override.
   const currentPorts: number[] = ownSettings?.tunnelPorts ?? baseDefaults?.tunnelPorts ?? [];
 
+  const currentNetworkPolicy: SandboxNetworkPolicy = ownSettings?.networkPolicy ??
+    baseDefaults?.networkPolicy ?? { mode: "unrestricted" };
+
   const currentTerminalEnabled: boolean =
     ownSettings?.terminalEnabled ?? baseDefaults?.terminalEnabled ?? false;
 
@@ -274,6 +289,9 @@ export function SandboxSettingsEditor({
   const currentMemoryMib = resourceDisplayValue(ownSettings, baseDefaults, "memoryMib");
 
   const [portRows, setPortRows] = useState<string[] | null>(null);
+  const [networkMode, setNetworkMode] = useState<SandboxNetworkPolicy["mode"] | null>(null);
+  const [allowedCidrs, setAllowedCidrs] = useState<string | null>(null);
+  const [allowedDomains, setAllowedDomains] = useState<string | null>(null);
   const [terminalEnabled, setTerminalEnabled] = useState<boolean | null>(null);
   const [codeServerPort, setCodeServerPort] = useState<string | null>(null);
   const [vncPort, setVncPort] = useState<string | null>(null);
@@ -290,6 +308,17 @@ export function SandboxSettingsEditor({
 
   // Resolve terminal toggle: local edit or server state
   const resolvedTerminalEnabled = terminalEnabled ?? currentTerminalEnabled;
+  const resolvedNetworkMode = networkMode ?? currentNetworkPolicy.mode;
+  const resolvedAllowedCidrs =
+    allowedCidrs ??
+    (currentNetworkPolicy.mode === "allowlist"
+      ? (currentNetworkPolicy.allowedCidrs ?? []).join("\n")
+      : "");
+  const resolvedAllowedDomains =
+    allowedDomains ??
+    (currentNetworkPolicy.mode === "allowlist"
+      ? (currentNetworkPolicy.allowedDomains ?? []).join("\n")
+      : "");
 
   // Use server state unless user is editing
   const rows = portRows ?? currentPorts.map(String);
@@ -335,6 +364,17 @@ export function SandboxSettingsEditor({
     const { ports, invalid } = normalizePorts(rows);
     if (invalid.length > 0) {
       setError(`Invalid port numbers: ${invalid.join(", ")}`);
+      return;
+    }
+
+    const normalizedAllowedCidrs = normalizeNetworkEntries(resolvedAllowedCidrs);
+    const normalizedAllowedDomains = normalizeNetworkEntries(resolvedAllowedDomains);
+    if (
+      resolvedNetworkMode === "allowlist" &&
+      normalizedAllowedCidrs.length === 0 &&
+      normalizedAllowedDomains.length === 0
+    ) {
+      setError("An allowlist policy needs at least one CIDR range or TLS domain.");
       return;
     }
 
@@ -427,6 +467,25 @@ export function SandboxSettingsEditor({
       // scope already stored it, or at global scope (where the form IS the
       // stored defaults); otherwise omit it and keep inheriting.
       const settingsPayload: SandboxSettings = {};
+      if (
+        networkMode !== null ||
+        allowedCidrs !== null ||
+        allowedDomains !== null ||
+        ownSettings?.networkPolicy !== undefined
+      ) {
+        settingsPayload.networkPolicy =
+          resolvedNetworkMode === "allowlist"
+            ? {
+                mode: "allowlist",
+                ...(normalizedAllowedCidrs.length > 0
+                  ? { allowedCidrs: normalizedAllowedCidrs }
+                  : {}),
+                ...(normalizedAllowedDomains.length > 0
+                  ? { allowedDomains: normalizedAllowedDomains }
+                  : {}),
+              }
+            : { mode: resolvedNetworkMode };
+      }
       if (isGlobal || portRows !== null || ownSettings?.tunnelPorts !== undefined) {
         settingsPayload.tunnelPorts = ports;
       }
@@ -516,6 +575,9 @@ export function SandboxSettingsEditor({
 
       await mutate();
       setPortRows(null);
+      setNetworkMode(null);
+      setAllowedCidrs(null);
+      setAllowedDomains(null);
       setTerminalEnabled(null);
       setMaxConcurrentChildSessions(null);
       setMaxTotalChildSessions(null);
@@ -538,6 +600,21 @@ export function SandboxSettingsEditor({
   const hasPortChanges =
     portRows !== null &&
     JSON.stringify(normalizePorts(portRows).ports) !== JSON.stringify(currentPorts);
+  const resolvedNetworkPolicy: SandboxNetworkPolicy =
+    resolvedNetworkMode === "allowlist"
+      ? {
+          mode: "allowlist",
+          ...(normalizeNetworkEntries(resolvedAllowedCidrs).length > 0
+            ? { allowedCidrs: normalizeNetworkEntries(resolvedAllowedCidrs) }
+            : {}),
+          ...(normalizeNetworkEntries(resolvedAllowedDomains).length > 0
+            ? { allowedDomains: normalizeNetworkEntries(resolvedAllowedDomains) }
+            : {}),
+        }
+      : { mode: resolvedNetworkMode };
+  const hasNetworkPolicyChange =
+    (networkMode !== null || allowedCidrs !== null || allowedDomains !== null) &&
+    JSON.stringify(resolvedNetworkPolicy) !== JSON.stringify(currentNetworkPolicy);
   const hasTerminalChange = terminalEnabled !== null && terminalEnabled !== currentTerminalEnabled;
   const hasConcurrentLimitChange =
     maxConcurrentChildSessions !== null &&
@@ -568,6 +645,7 @@ export function SandboxSettingsEditor({
     sandboxTimeoutMinutes !== null &&
     sandboxTimeoutMinutes.trim() !== currentSandboxTimeoutMinutesString;
   const hasChanges =
+    hasNetworkPolicyChange ||
     hasPortChanges ||
     hasTerminalChange ||
     hasConcurrentLimitChange ||
@@ -586,6 +664,75 @@ export function SandboxSettingsEditor({
 
   return (
     <div className="space-y-4">
+      <fieldset className="min-w-0">
+        <legend className="block text-sm font-medium text-foreground mb-1.5">
+          Outbound Network
+        </legend>
+        <p className="text-xs text-muted-foreground mb-2">
+          Control the destinations an autonomous agent can reach. Restrictive settings fail closed
+          when the selected sandbox provider cannot enforce them. Only platform editors and admins
+          can change this policy.
+        </p>
+        <div className="max-w-lg space-y-3">
+          <div>
+            <label
+              htmlFor="sandbox-network-mode"
+              className="block text-xs font-medium text-muted-foreground mb-1"
+            >
+              Egress policy
+            </label>
+            <select
+              id="sandbox-network-mode"
+              value={resolvedNetworkMode}
+              onChange={(event) =>
+                setNetworkMode(event.target.value as SandboxNetworkPolicy["mode"])
+              }
+              className="h-9 w-full rounded-md border border-border bg-background px-3 text-sm text-foreground"
+            >
+              <option value="unrestricted">Unrestricted</option>
+              <option value="allowlist">Allowlist only</option>
+              <option value="blocked">Block all outbound traffic</option>
+            </select>
+          </div>
+          {resolvedNetworkMode === "allowlist" && (
+            <div className="grid gap-3 sm:grid-cols-2">
+              <div>
+                <label
+                  htmlFor="sandbox-network-domains"
+                  className="block text-xs font-medium text-muted-foreground mb-1"
+                >
+                  TLS domains
+                </label>
+                <textarea
+                  id="sandbox-network-domains"
+                  rows={4}
+                  value={resolvedAllowedDomains}
+                  onChange={(event) => setAllowedDomains(event.target.value)}
+                  placeholder={"api.openai.com\n*.github.com"}
+                  className="w-full rounded-md border border-border bg-background px-3 py-2 font-mono text-sm text-foreground"
+                />
+              </div>
+              <div>
+                <label
+                  htmlFor="sandbox-network-cidrs"
+                  className="block text-xs font-medium text-muted-foreground mb-1"
+                >
+                  CIDR ranges
+                </label>
+                <textarea
+                  id="sandbox-network-cidrs"
+                  rows={4}
+                  value={resolvedAllowedCidrs}
+                  onChange={(event) => setAllowedCidrs(event.target.value)}
+                  placeholder={"10.0.0.0/8\n2001:db8::/32"}
+                  className="w-full rounded-md border border-border bg-background px-3 py-2 font-mono text-sm text-foreground"
+                />
+              </div>
+            </div>
+          )}
+        </div>
+      </fieldset>
+
       {/* Web Terminal toggle */}
       <div className="max-w-sm">
         <div className="flex items-center justify-between">

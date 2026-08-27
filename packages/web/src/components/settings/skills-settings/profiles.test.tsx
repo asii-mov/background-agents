@@ -39,6 +39,7 @@ const skill = {
   name: "review-ui",
   description: "Reviews UI changes",
   enabled: true,
+  required: false,
   currentRevisionId: "revision-1",
   revisionNumber: 1,
   revisionSha256: "a".repeat(64),

@@ -4,6 +4,20 @@ Open-Inspect is a background coding agent system that spawns sandboxed dev envir
 GitHub repositories. Single-tenant design. Stack: Cloudflare Workers (TypeScript), Modal (Python),
 Next.js (React), Terraform.
 
+## Start with the repository map
+
+Before searching the tree, query the generated [repository map](docs/REPO_MAP.md) for a user route,
+its UI, BFF, and backend owners, and its mapped tests:
+
+```bash
+npm run repo-map -- session
+npm run repo-map -- "Slack settings"
+npm run repo-map:check
+```
+
+`repo-map:check` is read-only. It fails when a mapped path or exact Playwright title disappears,
+when a user page or Settings tab has no coverage status, or when the generated map is stale.
+
 ## Architecture
 
 Three tiers connected by WebSockets:

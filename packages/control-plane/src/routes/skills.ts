@@ -25,11 +25,13 @@ import { EnvironmentStore } from "../db/environments";
 import { resolveManagedSkills, SkillResolutionError } from "../session/skill-resolution";
 import type { Env } from "../types";
 import { createLogger } from "../logger";
+import { governanceCatalogConfigFromEnv } from "../governance/reconciler";
 import {
   buildValidatedSkillRevision,
   SkillRevisionValidationError,
 } from "../skills/content-addressing";
 import { fetchSkillImport, SkillImportError, type SkillImportResult } from "../skills/git-import";
+import { skillImportSnapshotMismatch } from "../skills/import-confirmation";
 import {
   createRouteSourceControlProvider,
   error,
@@ -43,6 +45,19 @@ import {
 } from "./shared";
 
 const log = createLogger("router:skills");
+
+function rejectGitManagedWrite(env: Env): Response | null {
+  try {
+    return governanceCatalogConfigFromEnv(env)
+      ? error(
+          "Catalog metadata is managed by Git; submit a change to the governance repository",
+          409
+        )
+      : null;
+  } catch (value) {
+    return error(value instanceof Error ? value.message : "Invalid governance configuration", 500);
+  }
+}
 
 type SkillAuditEvent =
   | {
@@ -136,10 +151,12 @@ async function handleGetSkill(
 
 async function handleCreateSkill(
   request: Request,
-  _env: Env,
+  env: Env,
   _match: RegExpMatchArray,
   ctx: RequestContext
 ): Promise<Response> {
+  const managed = rejectGitManagedWrite(env);
+  if (managed) return managed;
   const userId = canonicalUserId(ctx);
   if (!userId) return error("Canonical user required", 403);
   const body = await parsedBody(request);
@@ -215,7 +232,7 @@ async function importPreviewResponse(
  * The commit pins the bytes; the digest additionally catches a mapping change
  * between preview and confirmation.
  */
-function confirmedImport(
+function confirmSkillImportSnapshot(
   result: SkillImportResult,
   expected: {
     expectedCommitSha: string;
@@ -223,19 +240,8 @@ function confirmedImport(
     expectedRevisionSha256: string;
   }
 ): Response | null {
-  if (result.source.commitSha !== expected.expectedCommitSha) {
-    return error(
-      `The source moved to commit ${result.source.commitSha} since it was previewed. Preview the import again.`,
-      409
-    );
-  }
-  if (result.source.sourceSha256 !== expected.expectedSourceSha256) {
-    return error("The source content changed since it was previewed. Preview again.", 409);
-  }
-  if (result.revisionSha256 !== expected.expectedRevisionSha256) {
-    return error("The imported skill changed since it was previewed. Preview again.", 409);
-  }
-  return null;
+  const mismatch = skillImportSnapshotMismatch(result, expected);
+  return mismatch ? error(mismatch, 409) : null;
 }
 
 async function handlePreviewSkillImport(
@@ -266,6 +272,8 @@ async function handleImportSkill(
   _match: RegExpMatchArray,
   ctx: RequestContext
 ): Promise<Response> {
+  const managed = rejectGitManagedWrite(env);
+  if (managed) return managed;
   const userId = canonicalUserId(ctx);
   if (!userId) return error("Canonical user required", 403);
   const body = await parsedBody(request);
@@ -278,7 +286,7 @@ async function handleImportSkill(
       parsed.data.source,
       parsed.data.name
     );
-    const stale = confirmedImport(result, parsed.data);
+    const stale = confirmSkillImportSnapshot(result, parsed.data);
     if (stale) return stale;
     const skill = await new SkillStore(ctx.db).create(
       { name: result.name, content: result.content, assignments: parsed.data.assignments },
@@ -357,6 +365,8 @@ async function handleReimportSkill(
   match: RegExpMatchArray,
   ctx: RequestContext
 ): Promise<Response> {
+  const managed = rejectGitManagedWrite(env);
+  if (managed) return managed;
   const id = resourceId(match);
   if (id instanceof Response) return id;
   const userId = canonicalUserId(ctx);
@@ -378,7 +388,7 @@ async function handleReimportSkill(
     const source = recordedImportSource(skill.source, parsed.data.ref, provider.name);
     if (source instanceof Response) return source;
     const result = await fetchSkillImport(provider, source, skill.name);
-    const stale = confirmedImport(result, parsed.data);
+    const stale = confirmSkillImportSnapshot(result, parsed.data);
     if (stale) return stale;
     const applied = await store.applyImportedRevision(
       id,
@@ -414,10 +424,12 @@ function sourceAuditFields(source: SkillImportResult["source"]) {
 
 async function handleSetSkillEnabled(
   request: Request,
-  _env: Env,
+  env: Env,
   match: RegExpMatchArray,
   ctx: RequestContext
 ): Promise<Response> {
+  const managed = rejectGitManagedWrite(env);
+  if (managed) return managed;
   const id = resourceId(match);
   if (id instanceof Response) return id;
   const userId = canonicalUserId(ctx);
@@ -437,10 +449,12 @@ async function handleSetSkillEnabled(
 
 async function handleReplaceSkillContentAndAssignments(
   request: Request,
-  _env: Env,
+  env: Env,
   match: RegExpMatchArray,
   ctx: RequestContext
 ): Promise<Response> {
+  const managed = rejectGitManagedWrite(env);
+  if (managed) return managed;
   const id = resourceId(match);
   if (id instanceof Response) return id;
   const userId = canonicalUserId(ctx);
@@ -472,10 +486,12 @@ async function handleReplaceSkillContentAndAssignments(
 
 async function handleDeleteSkill(
   _request: Request,
-  _env: Env,
+  env: Env,
   match: RegExpMatchArray,
   ctx: RequestContext
 ): Promise<Response> {
+  const managed = rejectGitManagedWrite(env);
+  if (managed) return managed;
   const id = resourceId(match);
   if (id instanceof Response) return id;
   const userId = canonicalUserId(ctx);
@@ -640,34 +656,54 @@ const skillReadRoutes = defineRoutes(SCM_AGNOSTIC_USER_OR_SERVICE_ROUTE, [
 ]);
 
 const skillAdministrationRoutes = defineRoutes(SCM_AGNOSTIC_HUMAN_USER_ROUTE, [
-  { method: "POST", pattern: parsePattern("/skills"), handler: handleCreateSkill },
+  {
+    method: "POST",
+    pattern: parsePattern("/skills"),
+    requiredPermission: "catalog.write",
+    handler: handleCreateSkill,
+  },
   {
     method: "POST",
     pattern: parsePattern("/skills/import/preview"),
+    requiredPermission: "catalog.write",
     handler: handlePreviewSkillImport,
   },
-  { method: "POST", pattern: parsePattern("/skills/import"), handler: handleImportSkill },
+  {
+    method: "POST",
+    pattern: parsePattern("/skills/import"),
+    requiredPermission: "catalog.write",
+    handler: handleImportSkill,
+  },
   {
     method: "POST",
     pattern: parsePattern("/skills/:id/reimport/preview"),
+    requiredPermission: "catalog.write",
     handler: handlePreviewSkillReimport,
   },
   {
     method: "POST",
     pattern: parsePattern("/skills/:id/reimport"),
+    requiredPermission: "catalog.write",
     handler: handleReimportSkill,
   },
   {
     method: "PATCH",
     pattern: parsePattern("/skills/:id"),
+    requiredPermission: "catalog.write",
     handler: handleSetSkillEnabled,
   },
   {
     method: "PUT",
     pattern: parsePattern("/skills/:id"),
+    requiredPermission: "catalog.write",
     handler: handleReplaceSkillContentAndAssignments,
   },
-  { method: "DELETE", pattern: parsePattern("/skills/:id"), handler: handleDeleteSkill },
+  {
+    method: "DELETE",
+    pattern: parsePattern("/skills/:id"),
+    requiredPermission: "catalog.write",
+    handler: handleDeleteSkill,
+  },
   { method: "GET", pattern: parsePattern("/skill-profiles"), handler: handleListProfiles },
   {
     method: "POST",

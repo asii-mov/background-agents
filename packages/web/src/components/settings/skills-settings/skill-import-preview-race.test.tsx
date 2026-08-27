@@ -91,6 +91,7 @@ const importedSkill: Skill = {
   metadata: {},
   files: [],
   enabled: true,
+  required: false,
   currentRevisionId: "revision-1",
   revisionNumber: 1,
   revisionSha256: "d".repeat(64),

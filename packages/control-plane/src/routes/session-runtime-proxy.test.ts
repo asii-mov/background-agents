@@ -88,6 +88,34 @@ describe("session runtime proxy routes", () => {
     expect(new URL(requests[0].url).search).toBe("?limit=10");
   });
 
+  it("forwards the selected repository to the SCM credential boundary", async () => {
+    const requests: Request[] = [];
+    const fetch = vi.fn(async (request: Request) => {
+      requests.push(request);
+      return Response.json({ error: "GitHub App not configured" }, { status: 500 });
+    });
+    const path = "/sessions/session-1/scm-credentials";
+    const { handler, match } = getHandler("POST", path);
+
+    const response = await handler(
+      new Request(`https://test.local${path}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ repoOwner: "acme", repoName: "web-app" }),
+      }),
+      createEnv(fetch),
+      match,
+      createCtx()
+    );
+
+    expect(response.status).toBe(500);
+    expect(new URL(requests[0].url).pathname).toBe(SessionInternalPaths.scmCredentials);
+    await expect(requests[0].json()).resolves.toEqual({
+      repoOwner: "acme",
+      repoName: "web-app",
+    });
+  });
+
   it("returns deduplicated canonical participant profiles with safe fields only", async () => {
     const fetch = vi.fn(async () =>
       Response.json({

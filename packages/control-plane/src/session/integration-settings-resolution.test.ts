@@ -9,6 +9,7 @@ const mockState = vi.hoisted(() => ({
     { enabledRepos: string[] | null; settings: Record<string, unknown> }
   >,
   global: {} as Record<string, { defaults: Record<string, unknown> }>,
+  globalFailures: new Set<string>(),
 }));
 
 vi.mock("../db/integration-settings", () => ({
@@ -19,6 +20,7 @@ vi.mock("../db/integration-settings", () => ({
     }
     async getGlobal(id: string) {
       mockState.globalCalls.push(id);
+      if (mockState.globalFailures.has(id)) throw new Error("D1 unavailable");
       return mockState.global[id] ?? null;
     }
   },
@@ -32,6 +34,7 @@ describe("resolveSessionScopedSettings", () => {
     mockState.globalCalls = [];
     mockState.resolved = {};
     mockState.global = {};
+    mockState.globalFailures.clear();
   });
 
   it("resolves both settings from the primary (position 0) member", async () => {
@@ -87,6 +90,22 @@ describe("resolveSessionScopedSettings", () => {
     ]);
   });
 
+  it("keeps network policy when the repository is outside the general settings allowlist", async () => {
+    mockState.resolved["sandbox"] = {
+      enabledRepos: ["acme/other"],
+      settings: {
+        tunnelPorts: [3000],
+        networkPolicy: { mode: "allowlist", allowedDomains: ["api.openai.com"] },
+      },
+    };
+
+    const result = await resolveSessionScopedSettings(DB, [{ repoOwner: "acme", repoName: "web" }]);
+
+    expect(result.sandboxSettings).toEqual({
+      networkPolicy: { mode: "allowlist", allowedDomains: ["api.openai.com"] },
+    });
+  });
+
   it("falls back to global sandbox defaults and disabled code-server for a repo-less session", async () => {
     mockState.global["sandbox"] = { defaults: { tunnelPorts: [3000] } };
 
@@ -98,5 +117,13 @@ describe("resolveSessionScopedSettings", () => {
     // No per-repo resolution happens without a primary member.
     expect(mockState.resolvedCalls).toEqual([]);
     expect(mockState.globalCalls).toContain("sandbox");
+  });
+
+  it("blocks network egress when global sandbox settings cannot be resolved", async () => {
+    mockState.globalFailures.add("sandbox");
+
+    const result = await resolveSessionScopedSettings(DB, []);
+
+    expect(result.sandboxSettings).toEqual({ networkPolicy: { mode: "blocked" } });
   });
 });

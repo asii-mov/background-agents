@@ -89,6 +89,61 @@ describe("managed skills persistence and resolution", () => {
     ).rejects.toMatchObject({ status: 404 });
   });
 
+  it("always selects required applicable skills even when the user selects none", async () => {
+    const skills = new SkillStore(env.DB);
+    const required = await skills.create(
+      {
+        name: "required-review",
+        content,
+        assignments: [{ type: "global" }],
+        required: true,
+      },
+      "user_1"
+    );
+    await skills.create(
+      { name: "optional-review", content, assignments: [{ type: "global" }] },
+      "user_1"
+    );
+
+    const manifest = await resolveManagedSkills(
+      env.DB,
+      { repositories: [], environmentId: null },
+      { mode: "none" },
+      "user_1"
+    );
+
+    expect(manifest.resolverVersion).toBe(2);
+    expect(manifest.skills).toEqual([
+      expect.objectContaining({ skillId: required.id, required: true }),
+    ]);
+
+    const base = {
+      title: null,
+      repoOwner: null,
+      repoName: null,
+      model: "anthropic/claude-haiku-4-5",
+      reasoningEffort: null,
+      baseBranch: null,
+      status: "created" as const,
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+    };
+    const sessions = new SessionIndexStore(env.DB);
+    await sessions.create({ ...base, id: "required-parent", skillManifest: manifest });
+    await sessions.create({
+      ...base,
+      id: "required-child",
+      parentSessionId: "required-parent",
+      skillManifestSourceSessionId: "required-parent",
+    });
+    const installation = await new SessionSkillStore(env.DB).getSandboxInstallation(
+      "required-child"
+    );
+    expect(installation?.skills).toEqual([
+      expect.objectContaining({ name: "required-review", required: true }),
+    ]);
+  });
+
   it("reports concurrent same-name creation as a conflict", async () => {
     const skills = new SkillStore(env.DB);
     const results = await Promise.allSettled([
@@ -142,7 +197,12 @@ describe("managed skills persistence and resolution", () => {
 
     const sandboxInstallation = await store.getSandboxInstallation("child");
     expect(sandboxInstallation).not.toHaveProperty("selection");
-    expect(Object.keys(sandboxInstallation?.skills[0] ?? {}).sort()).toEqual(["files", "name"]);
+    expect(Object.keys(sandboxInstallation?.skills[0] ?? {}).sort()).toEqual([
+      "files",
+      "name",
+      "required",
+    ]);
+    expect(sandboxInstallation?.skills[0].required).toBe(false);
     expect(sandboxInstallation?.skills[0].files.map((file) => file.path)).toEqual([
       "SKILL.md",
       "scripts/deploy.sh",
@@ -159,13 +219,13 @@ describe("managed skills persistence and resolution", () => {
         .run()
     ).rejects.toThrow(/foreign key/i);
     await env.DB.prepare(
-      "UPDATE session_skill_manifests SET resolver_version = 2 WHERE session_id = 'child'"
+      "UPDATE session_skill_manifests SET resolver_version = 3 WHERE session_id = 'child'"
     ).run();
     await expect(store.getSessionSkillsView("child")).rejects.toThrow(
-      "Unsupported managed skill resolver version: 2"
+      "Unsupported managed skill resolver version: 3"
     );
     await env.DB.prepare(
-      "UPDATE session_skill_manifests SET resolver_version = 1 WHERE session_id = 'child'"
+      "UPDATE session_skill_manifests SET resolver_version = 2 WHERE session_id = 'child'"
     ).run();
 
     const { stub } = await initNamedSessionDO("child");

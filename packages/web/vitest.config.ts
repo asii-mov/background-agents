@@ -9,7 +9,7 @@ export default defineConfig({
   },
   test: {
     environment: "node",
-    include: ["src/**/*.test.{ts,tsx}"],
+    include: ["src/**/*.test.{ts,tsx}", "e2e/support/**/*.test.ts"],
     coverage: {
       provider: "v8",
       reporter: ["text", "json"],
