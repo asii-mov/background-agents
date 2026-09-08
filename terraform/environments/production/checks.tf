@@ -1,17 +1,3 @@
-# Verify the Vercel production URL matches our hardcoded pattern. If Vercel
-# assigns a different domain (e.g., due to naming conflicts), browser-auth
-# redirects and cross-service references will silently break.
-check "vercel_url_matches" {
-  assert {
-    condition = (
-      var.web_platform != "vercel" ||
-      length(module.web_app) == 0 ||
-      module.web_app[0].production_url == local.web_app_url
-    )
-    error_message = "Vercel assigned URL '${var.web_platform == "vercel" && length(module.web_app) > 0 ? module.web_app[0].production_url : "n/a"}' but local.web_app_url is '${local.web_app_url}'. Update locals or set a custom domain."
-  }
-}
-
 # Fail the plan when a custom domain is set but cannot take effect — wrong web
 # platform or missing zone ID. Hostname shape is validated on the variable
 # itself; this gate owns the cross-input policy, expressed via the normalized
@@ -21,6 +7,20 @@ resource "terraform_data" "cloudflare_custom_domain_gate" {
     precondition {
       condition     = local.web_custom_domain == "" || local.web_custom_domain_enabled
       error_message = "cloudflare_custom_domain is set but would be silently ignored: it requires web_platform = \"cloudflare\" and a non-empty cloudflare_zone_id."
+    }
+  }
+}
+
+resource "terraform_data" "vercel_custom_domain_gate" {
+  lifecycle {
+    precondition {
+      condition     = var.web_platform != "vercel" || local.vercel_custom_domain_enabled
+      error_message = "vercel_custom_domain is required when web_platform = \"vercel\" so Cloudflare Access can protect the canonical browser origin."
+    }
+
+    precondition {
+      condition     = local.vercel_custom_domain == "" || local.vercel_custom_domain_enabled
+      error_message = "vercel_custom_domain is set but would be ignored because web_platform is not \"vercel\"."
     }
   }
 }

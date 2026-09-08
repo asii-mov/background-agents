@@ -56,6 +56,7 @@ bash .openinspect/setup.sh
 
 What this does:
 
+- creates `.env` from `.env.example` without overwriting an existing file
 - installs JS dependencies
 - builds `@open-inspect/shared`
 - installs git hooks
@@ -69,13 +70,15 @@ cannot authenticate a localhost web process.
 
 ### 1. Create local env file
 
+The bootstrap command creates this file for you. If you skipped it, run:
+
 ```bash
-cp packages/web/.env.example packages/web/.env.local
+cp .env.example .env
 ```
 
 ### 2. Fill required variables
 
-Edit `packages/web/.env.local`:
+Edit `.env`:
 
 ```bash
 # Development control-plane endpoints
@@ -123,7 +126,7 @@ If you enabled Google login, also add this redirect URI to your Google OAuth cli
 ### 4. Run the app
 
 ```bash
-npm run dev -w @open-inspect/web
+npm run dev
 ```
 
 Open `http://localhost:3000`.
@@ -202,6 +205,30 @@ accounts; defaults affect only sessions created afterward.
 For full infrastructure setup, use:
 
 - [docs/GETTING_STARTED.md](./GETTING_STARTED.md)
+- [Configure workforce SSO with Cloudflare Access](./IDP_AND_ACCESS_SETUP.md)
+
+The root `.env` is only for the local web process. Full deployments use
+`terraform/environments/production/terraform.tfvars`, which keeps provider credentials out of the
+web app. Start from the checked-in `terraform.tfvars.example`. The credential groups are:
+
+- Every deployment: Cloudflare API token and account details, R2 backend credentials, GitHub App
+  ID/private key/installation ID, Anthropic API key, and generated encryption secrets.
+- Sign-in: one complete GitHub or Google OAuth client pair.
+- Web hosting: Vercel token and team ID when using Vercel; no extra provider key when the web app
+  runs on Cloudflare.
+- Sandbox: credentials for exactly one provider: Modal, Daytona, Vercel Sandbox, OpenComputer, or
+  E2B.
+- Optional integrations: Slack, Linear, and GitHub webhook credentials only when those bots are
+  enabled.
+
+Do not put workforce IdP secrets in the root `.env`. Configure the IdP connection in Cloudflare Zero
+Trust. Set the required `cf_access_team_domain` and `cf_access_aud` Terraform inputs for the
+OpenInspect web service. Both hosting platforms receive `CF_ACCESS_TEAM_DOMAIN` and `CF_ACCESS_AUD`;
+the web middleware denies requests without a valid human Access assertion. Existing local `.env`
+files need `AUTH_DEV_BYPASS=1` for loopback `next dev`, or the two Access variables. Production
+refuses the bypass. Vercel deployments also require `vercel_custom_domain`, routed through a
+Cloudflare-proxied DNS record. See [IdP and Access setup](IDP_AND_ACCESS_SETUP.md) for hostname
+protection and the separate authentication used by control-plane callers.
 
 Critical notes before deploy:
 
@@ -250,6 +277,7 @@ configured/deployed.
 - Debugging and observability: [docs/DEBUGGING_PLAYBOOK.md](./DEBUGGING_PLAYBOOK.md)
 - Available models: [docs/AVAILABLE_MODELS.md](./AVAILABLE_MODELS.md)
 - Managed skills: [docs/MANAGED_SKILLS.md](./MANAGED_SKILLS.md)
+- Workforce SSO and edge access: [docs/IDP_AND_ACCESS_SETUP.md](./IDP_AND_ACCESS_SETUP.md)
 - OpenAI model setup: [docs/OPENAI_MODELS.md](./OPENAI_MODELS.md)
 - SuperGrok model setup: [docs/GROK_MODELS.md](./GROK_MODELS.md)
 - Contribution workflow: [CONTRIBUTING.md](../CONTRIBUTING.md)

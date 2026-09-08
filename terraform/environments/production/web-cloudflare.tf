@@ -65,6 +65,8 @@ resource "local_file" "web_app_wrangler_production" {
     workers_dev = ${local.web_custom_domain_enabled ? "false" : "true"}
 
     [vars]
+    CF_ACCESS_TEAM_DOMAIN = ${jsonencode(var.cf_access_team_domain)}
+    CF_ACCESS_AUD = ${jsonencode(var.cf_access_aud)}
     CONTROL_PLANE_URL = "${local.control_plane_url}"
     NEXT_PUBLIC_WS_URL = "${local.ws_url}"
     NEXT_PUBLIC_SANDBOX_PROVIDER = "${var.sandbox_provider}"

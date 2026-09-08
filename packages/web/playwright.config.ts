@@ -95,6 +95,7 @@ export default defineConfig({
       env: {
         ...process.env,
         CONTROL_PLANE_URL: gatewayUrl.origin,
+        AUTH_DEV_BYPASS: "1",
         SERVICE_AUTH_SECRET: "openinspect-browser-verification-only",
         NEXT_PUBLIC_WS_URL: `ws://${gatewayUrl.host}`,
         NEXT_PUBLIC_SANDBOX_PROVIDER: "modal",

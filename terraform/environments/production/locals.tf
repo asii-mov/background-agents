@@ -34,12 +34,17 @@ locals {
   # the default for both variables.
   web_custom_domain         = var.cloudflare_custom_domain == null ? "" : trimspace(var.cloudflare_custom_domain)
   web_custom_domain_zone_id = var.cloudflare_zone_id == null ? "" : trimspace(var.cloudflare_zone_id)
+  vercel_custom_domain      = var.vercel_custom_domain == null ? "" : trimspace(var.vercel_custom_domain)
 
   # Whether a custom domain is configured for the Cloudflare web Worker
   web_custom_domain_enabled = (
     var.web_platform == "cloudflare" &&
     local.web_custom_domain != "" &&
     local.web_custom_domain_zone_id != ""
+  )
+  vercel_custom_domain_enabled = (
+    var.web_platform == "vercel" &&
+    local.vercel_custom_domain != ""
   )
 
   # Host the Cloudflare web Worker is served from: custom domain when configured,
@@ -52,11 +57,12 @@ locals {
   # Web app URL depends on deployment platform
   web_app_url = (var.web_platform == "cloudflare"
     ? "https://${local.web_cloudflare_host}"
-    : "https://open-inspect-${local.name_suffix}.vercel.app"
+    : (local.vercel_custom_domain_enabled
+      ? "https://${local.vercel_custom_domain}"
+      : "https://open-inspect-${local.name_suffix}.vercel.app"
+    )
   )
-  effective_web_app_url = (
-    var.web_platform == "vercel" ? module.web_app[0].production_url : local.web_app_url
-  )
+  effective_web_app_url = local.web_app_url
 
   # Worker script paths (deterministic output locations)
   control_plane_script_path = "${var.project_root}/packages/control-plane/dist/index.js"

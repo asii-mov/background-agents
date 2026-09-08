@@ -52,6 +52,21 @@ variable "vercel_team_id" {
   default     = "unused"
 }
 
+variable "vercel_custom_domain" {
+  description = "Cloudflare-proxied custom hostname attached to the Vercel web project. Required when web_platform = 'vercel'."
+  type        = string
+  default     = null
+
+  validation {
+    condition = (
+      var.vercel_custom_domain == null ||
+      trimspace(var.vercel_custom_domain) == "" ||
+      can(regex("(?i)^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$", var.vercel_custom_domain))
+    )
+    error_message = "vercel_custom_domain must be a bare hostname such as 'inspect.example.com', without a scheme, port, path, trailing dot, or whitespace."
+  }
+}
+
 variable "modal_token_id" {
   description = "Modal API token ID"
   type        = string
@@ -566,6 +581,30 @@ variable "web_platform" {
   validation {
     condition     = contains(["vercel", "cloudflare"], var.web_platform)
     error_message = "web_platform must be 'vercel' or 'cloudflare'."
+  }
+}
+
+variable "cf_access_team_domain" {
+  description = "Cloudflare Access team HTTPS origin used to verify human requests to the web app."
+  type        = string
+  default     = ""
+  nullable    = false
+
+  validation {
+    condition     = can(regex("^https://[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\\.cloudflareaccess\\.com/?$", var.cf_access_team_domain))
+    error_message = "cf_access_team_domain is required and must be a Cloudflare team HTTPS origin, such as https://your-team.cloudflareaccess.com, without a port, path, query, or fragment."
+  }
+}
+
+variable "cf_access_aud" {
+  description = "Cloudflare Access application audience tag for the OpenInspect web hostname."
+  type        = string
+  default     = ""
+  nullable    = false
+
+  validation {
+    condition     = can(regex("^[A-Za-z0-9_-]+$", var.cf_access_aud))
+    error_message = "cf_access_aud is required and must contain one Access application audience tag without whitespace."
   }
 }
 

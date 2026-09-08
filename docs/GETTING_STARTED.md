@@ -25,6 +25,10 @@ Open-Inspect uses Terraform to automate deployment across multiple cloud provide
 > `"cloudflare"`. The Cloudflare option deploys the Next.js app as a Cloudflare Worker using
 > [OpenNext](https://opennext.js.org/cloudflare), so you don't need a Vercel account.
 
+The web app requires Cloudflare Access on its browser hostname. Complete the
+[workforce SSO setup](./IDP_AND_ACCESS_SETUP.md) before you deploy. OpenInspect still uses GitHub or
+Google sign-in for repository access and user attribution after Access admits the workforce user.
+
 **Your job**: Create accounts, gather credentials, and configure one file (`terraform.tfvars`).
 **Terraform's job**: Create all infrastructure and configure services.
 
@@ -36,19 +40,19 @@ Open-Inspect uses Terraform to automate deployment across multiple cloud provide
 
 Create accounts on these services before continuing:
 
-| Service                                                   | Purpose                                                         |
-| --------------------------------------------------------- | --------------------------------------------------------------- |
-| [Cloudflare](https://dash.cloudflare.com)                 | Control plane hosting (+ web app if using Cloudflare platform)  |
-| [Vercel](https://vercel.com) _(optional)_                 | Web application hosting (only if `web_platform = "vercel"`)     |
-| [Modal](https://modal.com) _(optional)_                   | Sandbox infrastructure when `sandbox_provider = "modal"`        |
-| [Daytona](https://app.daytona.io) _(optional)_            | Sandbox infrastructure when `sandbox_provider = "daytona"`      |
-| [Vercel Sandboxes](https://vercel.com) _(optional)_       | Sandbox infrastructure when `sandbox_provider = "vercel"`       |
-| [OpenComputer](https://app.opencomputer.dev) _(optional)_ | Sandbox infrastructure when `sandbox_provider = "opencomputer"` |
-| [E2B](https://e2b.dev) _(optional)_                       | Sandbox infrastructure when `sandbox_provider = "e2b"`          |
-| [GitHub](https://github.com/settings/developers)          | OAuth + repository access                                       |
-| [Anthropic](https://console.anthropic.com)                | Claude API                                                      |
-| [Slack](https://api.slack.com/apps) _(optional)_          | Slack bot integration                                           |
-| GitHub App Webhooks _(optional)_                          | GitHub bot (PR reviews)                                         |
+| Service                                                   | Purpose                                                            |
+| --------------------------------------------------------- | ------------------------------------------------------------------ |
+| [Cloudflare](https://dash.cloudflare.com)                 | Control plane hosting, Zero Trust Access, and optional web hosting |
+| [Vercel](https://vercel.com) _(optional)_                 | Web application hosting (only if `web_platform = "vercel"`)        |
+| [Modal](https://modal.com) _(optional)_                   | Sandbox infrastructure when `sandbox_provider = "modal"`           |
+| [Daytona](https://app.daytona.io) _(optional)_            | Sandbox infrastructure when `sandbox_provider = "daytona"`         |
+| [Vercel Sandboxes](https://vercel.com) _(optional)_       | Sandbox infrastructure when `sandbox_provider = "vercel"`          |
+| [OpenComputer](https://app.opencomputer.dev) _(optional)_ | Sandbox infrastructure when `sandbox_provider = "opencomputer"`    |
+| [E2B](https://e2b.dev) _(optional)_                       | Sandbox infrastructure when `sandbox_provider = "e2b"`             |
+| [GitHub](https://github.com/settings/developers)          | OAuth + repository access                                          |
+| [Anthropic](https://console.anthropic.com)                | Claude API                                                         |
+| [Slack](https://api.slack.com/apps) _(optional)_          | Slack bot integration                                              |
+| GitHub App Webhooks _(optional)_                          | GitHub bot (PR reviews)                                            |
 
 ### Required Tools
 
@@ -113,6 +117,17 @@ cd packages/modal-infra && uv sync --frozen && cd -
    - Set "Zone Resources" to include all zones from your account
    - Click "Continue to summary" and "Update token"
 5. **Enable R2**: Must add payment info, but first 10 GB/month is free
+
+### Cloudflare Access
+
+1. Connect your workforce identity provider in Cloudflare Zero Trust.
+2. Create a self-hosted Access application for the final web hostname.
+3. Add an Allow policy for the workforce group that can use OpenInspect.
+4. Copy the team domain and the application's audience tag into `terraform.tfvars`.
+5. Keep the identity-provider client secret in Cloudflare Zero Trust.
+
+Use the [workforce SSO guide](./IDP_AND_ACCESS_SETUP.md) for the complete policy, origin, and
+service caller setup.
 
 ### Cloudflare R2 (Terraform State Backend)
 
@@ -493,6 +508,10 @@ cloudflare_worker_subdomain = "your-subdomain"  # e.g., "twilight-unit-b2cf" (wi
 # Web platform: "vercel" (default) or "cloudflare" (OpenNext)
 web_platform                = "vercel"
 
+# Cloudflare Access application token verification (required for both web platforms)
+cf_access_team_domain       = "https://your-team.cloudflareaccess.com"
+cf_access_aud               = "your-openinspect-application-audience"
+
 # Optional custom domain for the web app (only when web_platform = "cloudflare")
 # cloudflare_zone_id       = "your-zone-id"
 # cloudflare_custom_domain = "app.example.com"
@@ -501,6 +520,7 @@ web_platform                = "vercel"
 # If using Cloudflare, do NOT set these — leave them out so the dummy defaults are used.
 vercel_api_token            = "your-vercel-token"
 vercel_team_id              = "team_xxxxx"       # Your Vercel ID (even personal accounts have one)
+vercel_custom_domain        = "inspect.example.com" # Must be proxied through Cloudflare
 modal_token_id              = "your-modal-token-id"
 modal_token_secret          = "your-modal-token-secret"
 modal_workspace             = "your-modal-workspace"
@@ -830,6 +850,9 @@ For configuration and troubleshooting, see [Linear Integration](./integrations/L
 Terraform handles the full build and deploy automatically — the web app is built with OpenNext and
 deployed as a Cloudflare Worker during `terraform apply`. No manual step needed.
 
+Create the Access application for the exact Worker or custom-domain hostname before opening the app.
+A request that reaches the Worker without a valid Access assertion receives `403 Forbidden`.
+
 #### Optional: serve the web app on a custom domain
 
 By default the web app is served from
@@ -854,7 +877,18 @@ Cloudflare provisions the DNS record and edge certificate automatically. Notes:
 ### If using Vercel (`web_platform = "vercel"`)
 
 Terraform creates the Vercel project and configures environment variables, but does **not** deploy
-the code. You have two options:
+the code. `vercel_custom_domain` is required because Cloudflare Access cannot protect the provider's
+`vercel.app` hostname.
+
+Before you sign in:
+
+1. Add `vercel_custom_domain` to a Cloudflare DNS zone that you control.
+2. Create the DNS record that Vercel shows for the custom domain.
+3. Keep the DNS record proxied through Cloudflare.
+4. Create the Access application for that hostname.
+5. Register the same hostname in the GitHub and Google OAuth callback URLs.
+
+You have two deployment options:
 
 #### Option A: Deploy via CLI (Recommended for First Deploy)
 
@@ -905,16 +939,21 @@ MODAL_WORKSPACE_SLUG="YOUR-WORKSPACE" # or "YOUR-WORKSPACE-YOUR-MODAL-WEB-SUFFIX
 curl https://${MODAL_WORKSPACE_SLUG}--open-inspect-api-health.modal.run
 # Daytona and Vercel use their provider APIs directly, so there is no Open-Inspect shim health URL.
 
-# 3. Web app (should return 200)
+# 3. Web app (an unauthenticated request must not return application data)
 curl -I "$(terraform output -raw web_app_url)"
 ```
 
+Cloudflare Access usually redirects the unauthenticated request to sign-in. A direct request to the
+origin receives `403 Forbidden` from the OpenInspect middleware.
+
 ### Test the Full Flow
 
-1. Visit your web app URL
-2. Sign in with each configured provider
-3. Create a new session with a repository
-4. Send a prompt and verify the sandbox starts
+1. Visit the web app as a user allowed by the Access policy.
+2. Complete the Cloudflare Access sign-in.
+3. Sign in with each configured GitHub or Google provider.
+4. Create a new session with a repository.
+5. Send a prompt and verify that the sandbox starts.
+6. Repeat the first request as a user denied by Access and confirm that no OpenInspect page loads.
 
 ---
 

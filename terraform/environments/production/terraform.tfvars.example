@@ -55,6 +55,10 @@ cloudflare_worker_subdomain = ""
 # Even personal accounts have an ID (usually starts with "team_")
 # vercel_team_id = ""  # e.g., "team_xxxxxxxxxxxxxxxxxxxx"
 
+# Required when web_platform = "vercel". Add this hostname to Vercel, proxy its
+# DNS record through Cloudflare, and create the Access application for it.
+# vercel_custom_domain = "inspect.example.com"
+
 # Modal API token
 # Only required when sandbox_provider = "modal"
 # Create at: https://modal.com/settings
@@ -262,6 +266,12 @@ sandbox_provider = "modal"
 # - "vercel": deploy the Next.js app to Vercel (requires vercel_api_token + vercel_team_id)
 # - "cloudflare": deploy the web app to Cloudflare Workers via OpenNext (no Vercel credentials needed)
 web_platform = "vercel"
+
+# Required for human admission to the web app on either hosting platform.
+# Create an Access application for the web hostname and copy its audience tag.
+# See docs/IDP_AND_ACCESS_SETUP.md. Never set AUTH_DEV_BYPASS in deployment environments.
+cf_access_team_domain = "https://your-team.cloudflareaccess.com"
+cf_access_aud         = ""
 
 # Unique deployment name (used in resource names and URLs)
 # IMPORTANT: This must be globally unique for Vercel URLs.
