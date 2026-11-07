@@ -453,6 +453,12 @@ describe("route admission sentinel", { timeout: MATRIX_TIMEOUT_MS }, () => {
     await seedSandboxAuth(stub, { authToken: SANDBOX_TOKEN, sandboxId: "sb-sentinel" });
     fixtures.sandboxSessionId = sessionName;
     fixtures.automationId = await createAutomation();
+    // App routes name the app in `:name`, so the owner's app exists under the default value.
+    await env.DB.prepare(
+      "INSERT INTO apps (name, owner_user_id, status, created_at, updated_at) VALUES (?, ?, 'pending', 1, 1)"
+    )
+      .bind(PARAMETER_VALUES.name, BROWSER_USER_ID)
+      .run();
     fixtures.teamId = (
       await new TeamStore(env.DB).create({
         slug: "sentinel-team",

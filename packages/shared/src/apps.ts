@@ -16,6 +16,7 @@ import {
   APP_DATA_BLOCK_STATUS,
   APP_DATA_LIMITS,
   APP_DATA_MANIFEST_FILE,
+  DEFAULT_MIGRATIONS_DIR,
   MIGRATION_FILE_PATTERN,
   bindingNameSchema,
   type DataAdvisory,
@@ -284,6 +285,10 @@ export const appTakedownRequestSchema = z.strictObject({
 
 // ---- Tool contract (generated into the sandbox) -----------------------------------------------
 
+/** What the tool tells the agent when it cannot reach the control plane or gets no usable answer. */
+const APP_DEPLOY_BRIDGE_ERROR_GUIDANCE =
+  "deploy-app could not reach the publishing service. Call deploy-app once more; if it fails again, tell the user that publishing is unavailable right now.";
+
 export const APP_DEPLOY_CONTRACT = {
   tool: {
     name: "deploy-app",
@@ -294,7 +299,7 @@ export const APP_DEPLOY_CONTRACT = {
       "Publish a built web app at https://<name>.<company apps domain>. Every visitor signs in through " +
       "Cloudflare Access with company SSO; the platform configures that and verifies it in front of your code. " +
       `If the app stores data, declare it in ${APP_DATA_MANIFEST_FILE} (data, secrets) and put schema files in ` +
-      "migrations/; the platform provisions and binds them. Build first, then pass the build output directory " +
+      `${DEFAULT_MIGRATIONS_DIR}/; the platform provisions and binds them. Build first, then pass the build output directory ` +
       "and, if the app has server code, one bundled ES-module Worker file. Calling again with the same name updates the app.",
     inputSchema: {
       type: "object",
@@ -321,10 +326,14 @@ export const APP_DEPLOY_CONTRACT = {
     },
   },
   appManifestFile: APP_DATA_MANIFEST_FILE,
+  /** A D1 declaration without `migrations` reads its files from here. */
+  defaultMigrationsDir: DEFAULT_MIGRATIONS_DIR,
   migrationFilePattern: MIGRATION_FILE_PATTERN.source,
   parts: APP_DEPLOY_PARTS,
   limits: APP_BUNDLE_LIMITS,
   reasons: APP_DEPLOY_REASON_GUIDANCE,
+  /** The tool's own `bridge_error`: no usable answer from the control plane. */
+  bridgeErrorGuidance: APP_DEPLOY_BRIDGE_ERROR_GUIDANCE,
   /** The reason to assume when a response carries none. */
   statusFallback: {
     400: "invalid_bundle",

@@ -1,3 +1,4 @@
+import { AppStore } from "../apps";
 import { getUserAuth, getUserAuthRuntime } from "../auth/user/runtime";
 import { createRequestMetrics, instrumentSqlDatabase } from "../db/instrumented-sql-database";
 import type { SqlDatabase } from "../db/sql-database";
@@ -14,12 +15,14 @@ export function createRequestContext(input: {
 }): RequestContext {
   const { request, env, database, executionCtx } = input;
   const metrics = createRequestMetrics();
+  const db = instrumentSqlDatabase(database, metrics);
 
   return {
     trace_id: request.headers.get("x-trace-id") || crypto.randomUUID(),
     request_id: crypto.randomUUID().slice(0, 8),
     metrics,
-    db: instrumentSqlDatabase(database, metrics),
+    db,
+    appOwners: new AppStore(db),
     // The stable uninstrumented binding remains the Better Auth cache key.
     getUserAuth: () => getUserAuth(env, database),
     getUserAuthRuntime: () => getUserAuthRuntime(env, database),

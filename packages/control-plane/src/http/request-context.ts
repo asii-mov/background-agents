@@ -12,6 +12,7 @@ import type { SessionEntry } from "../db/session-index";
 import type { RequestMetrics } from "../db/instrumented-sql-database";
 import type { BackgroundTasks } from "../platform-ports";
 import type { TeamsEnforcementMode } from "../authorization/teams-enforcement";
+import type { AppOwnerLookup } from "../routing/app-admission";
 
 /** Automation resource admitted for the current mutation. */
 export interface AutomationRouteAdmission {
@@ -34,6 +35,8 @@ export type RequestContext = AuthenticationRequestServices & {
   automationAdmission?: AutomationRouteAdmission;
   /** Written only by route admission; read via `admittedEnvironment`. */
   environmentAdmission?: EnvironmentAdmission;
+  /** Who owns an app, for `{ kind: "app" }` route requirements. Absent fails those closed. */
+  appOwners?: AppOwnerLookup;
   teamAdmission?: { team: Team; access: TeamCapabilities };
   sessionAdmission?: { row: SessionEntry & SessionAccessRow; viewer: SessionViewer };
   childSessionAdmission?: { row: SessionEntry & SessionAccessRow; viewer: SessionViewer };
