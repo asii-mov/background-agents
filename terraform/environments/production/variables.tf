@@ -920,6 +920,20 @@ variable "platform_editor_users" {
   default     = ""
 }
 
+variable "identity_link_email_domains" {
+  description = "Comma-separated exact email domains (e.g., 'corp.example') in which a Slack- or Linear-reported email may link a first-contact bot actor to the existing user who proved that email at web sign-in. A linked actor inherits that user's roles. Empty never links: bot actors stay standalone users with the workspace default role."
+  type        = string
+  default     = ""
+
+  validation {
+    condition = alltrue([
+      for domain in split(",", var.identity_link_email_domains) :
+      trimspace(domain) == "" || can(regex("(?i)^[a-z0-9-]+(\\.[a-z0-9-]+)+$", trimspace(domain)))
+    ])
+    error_message = "identity_link_email_domains entries must be domain names without '@', such as corp.example."
+  }
+}
+
 # =============================================================================
 
 # Git-backed Skills and MCP governance (optional)

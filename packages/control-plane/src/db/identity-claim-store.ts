@@ -5,7 +5,7 @@ import type { SqlDatabase } from "./sql-database";
  * the canonical-registry reads and guarded writes the claim performs around
  * Better Auth's own queries. Kept apart from `UserStore` because every write
  * here is proof-carrying — it mints `email_verified` from a completed OAuth
- * sign-in, which bot ingress may only do for attesting providers.
+ * sign-in, which bot ingress never does.
  *
  * All email parameters must arrive pre-normalized (`normalizeEmail`); the
  * `lower(trim(...))` comparisons here exist to match legacy stored forms

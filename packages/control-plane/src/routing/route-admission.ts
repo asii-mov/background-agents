@@ -14,7 +14,7 @@ import { evaluateSessionAdmission } from "../authorization/session-admission";
 import { legacyPermissionForAction } from "../authorization/teams-enforcement";
 import { TeamChannelBindingStore } from "../db/team-channel-bindings";
 import { SessionIndexStore } from "../db/session-index";
-import { UserStore } from "../db/user-store";
+import { parseEmailLinkPolicy, UserStore } from "../db/user-store";
 import type { RequestContext } from "../http/request-context";
 import { error, json } from "../http/responses";
 import { createLogger } from "../logger";
@@ -411,14 +411,28 @@ async function finalizeServiceActor(
     if (prepared?.kind === "rejected") return { response: prepared.response };
     const claims = prepared?.claims;
     const actor = principal.actor;
-    const user = await new UserStore(ctx.db).resolveOrCreateUser({
-      provider: actor.provider,
-      providerUserId: actor.providerUserId,
-      displayName: claims?.displayName,
-      providerEmail:
-        actor.provider === "slack" || actor.provider === "linear" ? claims?.email : undefined,
-      avatarUrl: claims?.avatarUrl,
-    });
+    const user = await new UserStore(ctx.db).resolveOrCreateUser(
+      {
+        provider: actor.provider,
+        providerUserId: actor.providerUserId,
+        displayName: claims?.displayName,
+        providerEmail:
+          actor.provider === "slack" || actor.provider === "linear" ? claims?.email : undefined,
+        avatarUrl: claims?.avatarUrl,
+      },
+      parseEmailLinkPolicy(env.IDENTITY_LINK_EMAIL_DOMAINS)
+    );
+    if (user.linkedByEmailDomain !== null) {
+      logger.info("Linked service actor to an existing user by email", {
+        event: "auth.identity_linked_by_email",
+        provider: actor.provider,
+        actor: actor.participantUserId,
+        email_domain: user.linkedByEmailDomain,
+        user_id: user.id,
+        request_id: ctx.request_id,
+        trace_id: ctx.trace_id,
+      });
+    }
     ctx.principal = {
       ...principal,
       actor: { ...actor, canonicalUserId: user.id },
