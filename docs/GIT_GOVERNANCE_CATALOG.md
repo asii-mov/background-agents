@@ -1,9 +1,11 @@
 # Git-backed Skills and MCP governance
 
 Git can be the canonical desired-state source for the centrally approved Skills and MCP servers used
-by Open-Inspect. The control plane remains the runtime catalogue: it reads Git with the deployment's
-SCM credentials, validates the complete snapshot, resolves automatic package updates, and atomically
-activates a last-good copy in D1. Agents never clone the governance repository.
+by Open-Inspect, and optionally for the technology catalogue behind the
+[stack policy](STACK_POLICY.md). The control plane remains the runtime catalogue: it reads Git with
+the deployment's SCM credentials, validates the complete snapshot, resolves automatic package
+updates, and atomically activates a last-good copy in D1. Agents never clone the governance
+repository.
 
 ```text
 reviewed Git change
@@ -73,6 +75,63 @@ Follow the approved authentication workflow and component documentation.
 
 Supporting files are non-executable unless their relative path is listed in `executableFiles`;
 executable entries must be below `scripts/`.
+
+## Technology categories and components
+
+`catalog.yaml` can also own the technology catalogue that the stack policy compiles from. Declare
+`categories` and `components` together. A catalogue with only one of the two keys fails validation.
+
+```yaml
+schemaVersion: 1
+categories:
+  - id: web-frontend
+    name: Web frontend
+    description: Anything rendered in a browser.
+    enforcement: block
+components:
+  - path: components/svelte.yaml
+  - path: components/react.yaml
+```
+
+Each component file is the `POST /approved-components` body plus `schemaVersion`:
+
+```yaml
+schemaVersion: 1
+name: React
+kind: library
+categoryId: web-frontend
+stance: denied
+lifecycle: approved
+owner: platform-engineering
+locator: https://react.dev
+documentationUrl: https://react.dev
+description: UI library.
+usage: Not supported on the platform. Build browser UI with SvelteKit.
+signals:
+  - { kind: package, ecosystem: npm, name: react }
+  - { kind: package, ecosystem: npm, name: react-dom }
+```
+
+`enforcement` defaults to `advise` and applies to denied components only. `stance` is `preferred`,
+`allowed`, or `denied`. `usage` becomes the guidance the agent reads when it must remove a denied
+component. Reconciliation rejects the whole catalogue, and keeps the last good one, when any of
+these is true:
+
+- A component names a category that the catalogue does not declare.
+- Two categories share an ID or a name, or two components share a name.
+- Two components declare the same signal.
+- A category has more than one preferred, enabled, approved component.
+
+The two keys decide who owns the catalogue:
+
+| `catalog.yaml` declares            | Result                                                                                 |
+| ---------------------------------- | -------------------------------------------------------------------------------------- |
+| Both `categories` and `components` | Git owns the catalogue. Every app-managed component is disabled.                       |
+| Neither key                        | App-managed categories and components stay as they are. Skills and MCP still sync.     |
+| Both keys, then neither            | The next sync hands the Git rows back to the app, where editors can change them again. |
+
+While Git owns the catalogue, API writes to a Git-owned category or component return `409`. A new
+component created in the app is disabled at the next sync.
 
 ## MCP automatic updates
 
@@ -148,10 +207,11 @@ Durable Object migration before enabling Git governance in an existing deploymen
 Terraform configuration carries the binding and migration tag.
 
 The SCM App/PAT configured for Open-Inspect must have read access to the governance repository. The
-catalogue reconciles every 15 minutes. Editors can inspect `GET /governance/catalog`, trigger
-`POST /governance/catalog/sync`, and use **Sync now** in Settings. When Git governance is
-configured, direct Skill/MCP metadata writes return `409`; profiles and MCP credential rotation
-remain mutable in the application.
+catalogue reconciles every 15 minutes. Holders of `governance.read` can inspect
+`GET /governance/catalog`. Holders of `governance.manage` can trigger
+`POST /governance/catalog/sync` and use **Sync now** in Settings. When Git governance is configured,
+direct Skill/MCP metadata writes return `409`; profiles and MCP credential rotation remain mutable
+in the application.
 
 On the first successful sync, an existing app-managed Skill or MCP with the same name is adopted so
 its stable ID, history, and MCP credentials are retained. Other app-managed Skills and MCPs that are
@@ -176,7 +236,8 @@ npm run test:integration -w @open-inspect/control-plane -- --run \
 Then test a staging deployment:
 
 1. Create a governance repository with one harmless global Skill and one test MCP definition.
-2. Configure the staging control plane and invoke `POST /governance/catalog/sync` as an editor.
+2. Configure the staging control plane and invoke `POST /governance/catalog/sync` as a user that
+   holds `governance.manage`.
 3. Check that the status reports `succeeded` and the expected `activeCommitSha`.
 4. Confirm Settings shows Git-managed metadata as read-only and the MCP's exact resolved version.
 5. Start session A and record its MCP revision and artifact digest from the session manifest.

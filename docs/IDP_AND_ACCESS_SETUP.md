@@ -1,8 +1,15 @@
 # Configure workforce SSO with Cloudflare Access
 
-Use this procedure for internal apps produced by OpenInspect. Cloudflare Access authenticates the
-workforce user before the request reaches the app. The app verifies the signed Access application
-token and keeps its own record-level authorization.
+Use this procedure for internal apps that you host outside OpenInspect, and for OpenInspect's own
+web app. Cloudflare Access authenticates the workforce user before the request reaches the app. The
+app verifies the signed Access application token and keeps its own record-level authorization.
+
+Apps that agents publish with the `deploy-app` tool follow [Host agent-built internal apps](APPS.md)
+instead. Terraform and the app broker create their Access applications and policies in the apps
+account. A platform guard in front of each published app verifies the visitor's Access token on
+every request. The guard removes any identity headers the visitor sent, then sets
+`x-openinspect-user-sub` and `x-openinspect-user-email`. App code trusts those two headers and does
+not verify the token again.
 
 This procedure does not replace OpenInspect's GitHub or Google sign-in. OpenInspect uses that
 identity for repository access and user attribution. Keep both layers when you deploy OpenInspect
@@ -103,10 +110,14 @@ OpenInspect verifies the header with the team's JWKS and requires RS256, the exa
 application audience, `exp`, `nbf`, `iat`, `type=app`, and nonempty human `sub` and `email` claims.
 It removes Access credentials before handing requests to application routes.
 
-Generated apps must also verify the header at their request boundary. Follow the repository's
-[`internal-app-auth` skill](../.openinspect/skills/internal-app-auth/SKILL.md). Do not consider the
-deployment complete because the Access login page appears. The origin must still verify the token's
-signature, issuer, audience, algorithm, and time claims.
+An app that you host outside OpenInspect must also verify the header at its request boundary. Do not
+consider the deployment complete because the Access login page appears. The origin must still verify
+the token's signature, issuer, audience, algorithm, and time claims.
+
+Apps published with `deploy-app` skip this step. The platform guard verifies the token, and the app
+reads only the guard's identity headers. The repository's
+[`internal-app-auth` skill](../.openinspect/skills/internal-app-auth/SKILL.md) tells agents to read
+those headers and never to add JWT or JWKS verification to a published app.
 
 Cloudflare's
 [JWT validation guide](https://developers.cloudflare.com/cloudflare-one/access-controls/applications/http-apps/authorization-cookie/validating-json/)
@@ -164,14 +175,14 @@ Complete these checks before release:
 
 ## Keep each credential in its owner
 
-| Value                                                        | Store it here                                                 |
-| ------------------------------------------------------------ | ------------------------------------------------------------- |
-| IdP OIDC or SAML client secret                               | Cloudflare Zero Trust identity-provider configuration         |
-| `CF_ACCESS_TEAM_DOMAIN` and `CF_ACCESS_AUD`                  | App deployment environment, OpenInspect web service only      |
-| Access service-token client ID and secret                    | Automated caller's secret store                               |
-| Cloudflare deployment API token                              | Terraform or CI secret store                                  |
-| OpenInspect GitHub or Google OAuth credentials               | OpenInspect Terraform configuration                           |
-| GitHub App, model-provider, and sandbox-provider credentials | OpenInspect Terraform configuration or provider-account store |
+| Value                                                        | Store it here                                                   |
+| ------------------------------------------------------------ | --------------------------------------------------------------- |
+| IdP OIDC or SAML client secret                               | Cloudflare Zero Trust identity-provider configuration           |
+| `CF_ACCESS_TEAM_DOMAIN` and `CF_ACCESS_AUD`                  | Externally hosted app's environment and OpenInspect web service |
+| Access service-token client ID and secret                    | Automated caller's secret store                                 |
+| Cloudflare deployment API token                              | Terraform or CI secret store                                    |
+| OpenInspect GitHub or Google OAuth credentials               | OpenInspect Terraform configuration                             |
+| GitHub App, model-provider, and sandbox-provider credentials | OpenInspect Terraform configuration or provider-account store   |
 
 Do not collect all of these values in one shared `.env`. Each credential belongs to a different
 trust boundary and has a different rotation owner.

@@ -53,9 +53,11 @@ domains whose Slack and Linear accounts your company administers, because anyone
 address in those domains on a bot account can act as its owner. The default empty list never links,
 so each bot actor stays a separate user with the workspace default role.
 
-All catalogue mutation routes enforce `catalog.write` in the control plane. Hiding controls in the
-web UI is only a usability measure, not the authorization boundary. Role changes enforce
-`platform.manage` and are logged with actor, target, role, request ID, and trace ID.
+The control plane enforces `governance.read` on every governance read and `governance.manage` on
+every governance write. Owner, Administrator, and the catalogue editor role hold both. Members and
+viewers hold neither. Hiding controls in the web UI is only a usability measure, not the
+authorization boundary. Role changes enforce `platform.manage` and are logged with actor, target,
+role, request ID, and trace ID.
 
 ## Repository admission
 
@@ -141,6 +143,10 @@ event, not proof that the resulting code uses the component correctly; AppSec ch
 policy should verify usage where that matters.
 
 The `GET /capabilities` read model returns Skills, MCP servers, and approved components together.
+
+Approved components with a category, a stance, and signals also form the stack policy. The sandbox
+blocks newly introduced denied technology, and a GitHub Action repeats the check on pull requests.
+See [Govern the technology stack](STACK_POLICY.md).
 
 ## Managed AppSec feedback loop
 
@@ -234,21 +240,27 @@ an immediate egress revocation is required.
 
 ## Management API
 
-| Resource                                     | Read           | Mutate       | Notes                                           |
-| -------------------------------------------- | -------------- | ------------ | ----------------------------------------------- |
-| `/platform/me`                               | signed-in user | —            | Effective role                                  |
-| `/platform/users`                            | admin          | admin        | Role update is `PATCH /platform/users/:id/role` |
-| `/capabilities`                              | user/service   | —            | Skills, MCPs, and approved components           |
-| `/skills`                                    | user/service   | editor/admin | Supports required Skills and revision CAS       |
-| `/mcp-servers`                               | user/service   | editor/admin | Lifecycle, scope, provenance, revision CAS      |
-| `/approved-components`                       | user/service   | editor/admin | Lifecycle, provenance, scope, revision CAS      |
-| `/approved-components/:id/consumers`         | user/service   | —            | Revision-aware consumer inventory               |
-| `/sessions/:id/approved-components`          | sandbox        | sandbox      | Scoped search and adoption                      |
-| `/sessions/:id/mcp-artifacts/:mcp/:revision` | sandbox        | sandbox      | Exact session-pinned MCP artifact               |
-| `/security-pipelines`                        | user/service   | editor/admin | Scope and revision CAS                          |
-| `/repository-risk`                           | user/service   | editor/admin | Repository criticality profiles                 |
-| `/risk/assess`                               | user/service   | —            | Deterministic preview                           |
-| `/integration-settings/sandbox`              | user/service   | mixed        | Network policy changes require editor/admin     |
+| Resource                                     | Read              | Mutate              | Notes                                                                |
+| -------------------------------------------- | ----------------- | ------------------- | -------------------------------------------------------------------- |
+| `/platform/me`                               | signed-in user    | —                   | Effective role                                                       |
+| `/platform/users`                            | admin             | admin               | Role update is `PATCH /platform/users/:id/role`                      |
+| `/capabilities`                              | user/service      | —                   | Skills, MCPs, and approved components                                |
+| `/skills`                                    | user/service      | editor/admin        | Supports required Skills and revision CAS                            |
+| `/mcp-servers`                               | user/service      | editor/admin        | Lifecycle, scope, provenance, revision CAS                           |
+| `/approved-components`                       | `governance.read` | `governance.manage` | Lifecycle, provenance, scope, stance, signals, revision CAS          |
+| `/approved-components/:id/consumers`         | `governance.read` | —                   | Revision-aware consumer inventory                                    |
+| `/component-categories`                      | `governance.read` | `governance.manage` | Technology slots and their `advise` or `block` enforcement           |
+| `/stack-policy/preview`                      | `governance.read` | —                   | Instructions a session for `?repo=` would receive                    |
+| `/stack-policy/export`                       | `governance.read` | —                   | Compiled policy for the CI check ([Stack policy](STACK_POLICY.md))   |
+| `/stack-inventory`                           | `governance.read` | —                   | Observed stack; `/rollup` per category, `/repositories/:owner/:name` |
+| `/governance/catalog`                        | `governance.read` | `governance.manage` | Git catalogue status; mutate is `POST /governance/catalog/sync`      |
+| `/sessions/:id/approved-components`          | sandbox           | sandbox             | Scoped search and adoption                                           |
+| `/sessions/:id/stack-observations`           | —                 | sandbox             | Baseline and push stack reports                                      |
+| `/sessions/:id/mcp-artifacts/:mcp/:revision` | sandbox           | sandbox             | Exact session-pinned MCP artifact                                    |
+| `/security-pipelines`                        | `governance.read` | `governance.manage` | Scope and revision CAS                                               |
+| `/repository-risk`                           | `governance.read` | `governance.manage` | Repository criticality profiles                                      |
+| `/risk/assess`                               | `governance.read` | —                   | Deterministic preview                                                |
+| `/integration-settings/sandbox`              | user/service      | mixed               | Network policy changes require editor/admin                          |
 
 ## Verification
 

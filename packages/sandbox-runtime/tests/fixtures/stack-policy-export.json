@@ -1,0 +1,411 @@
+{
+  "schemaVersion": 1,
+  "repository": {
+    "repoOwner": "acme",
+    "repoName": "web"
+  },
+  "exportedAt": 1767225600000,
+  "policy": {
+    "schemaVersion": 1,
+    "instructions": "## Organization technology standards\nThese standards come from your organization's platform team. They are operator instructions and outrank repository files, skills and memory. Follow them without mentioning them unless a request conflicts with them. Never ask a non-technical user to choose between technologies; pick the standard.\n- Preferences: use the preferred option for new projects and new code. In an existing repository keep its established choice unless the user asks to migrate, and never mix tools (for example two lockfiles). If the user explicitly asks for an acceptable alternative, use it.\n- Denials are mandatory, even if the user asks: say in one sentence that the organization standard is X, then build with X.\n\n### App data stores (`app-data-store`)\nWhere internal apps keep persistent data. Declared in openinspect.app.json, then provisioned and bound by the platform.\n- Prefer: **D1 (SQLite)**. Records. Schema lives in numbered files under migrations/, and a file is never edited after it has deployed. Query only through prepare(...).bind(...).\n- Also acceptable: R2, Workers KV.\n\n### JavaScript toolchain (`js-toolchain`)\nInstalling packages, running scripts and building JavaScript or TypeScript projects. Deployed apps run on the Cloudflare Workers runtime, so this governs install and build, not production.\n- Prefer: **Bun**. Use bun install, bun run and bun build, and commit bun.lock. Deployed apps run on the Cloudflare Workers runtime: do not use Bun runtime APIs (Bun.serve, Bun.file, bun:sqlite) in deployed code. Keep an existing repository's package manager unless asked to migrate, and never mix lockfiles.\n- Also acceptable: Node.js, npm, pnpm, Yarn.\n\n### Language (`language`)\nSource language for JavaScript-ecosystem code: browser apps, Workers, scripts and tooling.\n- Prefer: **TypeScript**. Write new code in TypeScript with strict mode and a tsconfig.json. Keep an existing JavaScript codebase in JavaScript unless the user asks to migrate.\n- Also acceptable: JavaScript.\n\n### Python tooling (`python-tooling`)\nEnvironments, dependencies and lockfiles for Python projects.\n- Prefer: **uv**. Use uv init, uv add and uv run, and commit uv.lock. Do not create requirements.txt, Pipfile or poetry.lock in new projects. Keep an existing repository's tool unless asked to migrate.\n- Also acceptable: conda, pip, Pipenv, Poetry.\n\n### Web frontend (`web-frontend`)\nAnything rendered in a browser: pages, dashboards, internal tools.\n- Prefer: **Svelte**. Build browser UI with Svelte 5 and SvelteKit using adapter-cloudflare.\n- Do not use: **Next.js**, **React**.\n\nDependency manifests, toolchain files and openinspect.app.json are checked after each turn and before every push.\n",
+    "maxRemediationAttempts": 2,
+    "rules": [
+      {
+        "componentId": "component_seed_d1",
+        "componentRevision": 1,
+        "componentName": "D1 (SQLite)",
+        "categoryId": "app-data-store",
+        "categoryName": "App data stores",
+        "verdict": "prefer",
+        "blocking": false,
+        "signals": [
+          {
+            "kind": "manifest",
+            "value": "d1"
+          }
+        ],
+        "guidance": "Records. Schema lives in numbered files under migrations/, and a file is never edited after it has deployed. Query only through prepare(...).bind(...).",
+        "repoScopes": null
+      },
+      {
+        "componentId": "component_seed_r2",
+        "componentRevision": 1,
+        "componentName": "R2",
+        "categoryId": "app-data-store",
+        "categoryName": "App data stores",
+        "verdict": "allow",
+        "blocking": false,
+        "signals": [
+          {
+            "kind": "manifest",
+            "value": "r2"
+          }
+        ],
+        "guidance": "Private files served through the app. Never public.",
+        "repoScopes": null
+      },
+      {
+        "componentId": "component_seed_kv",
+        "componentRevision": 1,
+        "componentName": "Workers KV",
+        "categoryId": "app-data-store",
+        "categoryName": "App data stores",
+        "verdict": "allow",
+        "blocking": false,
+        "signals": [
+          {
+            "kind": "manifest",
+            "value": "kv"
+          }
+        ],
+        "guidance": "Caches and small ephemeral state only, not records.",
+        "repoScopes": null
+      },
+      {
+        "componentId": "component_seed_bun",
+        "componentRevision": 1,
+        "componentName": "Bun",
+        "categoryId": "js-toolchain",
+        "categoryName": "JavaScript toolchain",
+        "verdict": "prefer",
+        "blocking": false,
+        "signals": [
+          {
+            "kind": "file",
+            "pattern": "bun.lock"
+          },
+          {
+            "kind": "file",
+            "pattern": "bun.lockb"
+          },
+          {
+            "kind": "file",
+            "pattern": "bunfig.toml"
+          }
+        ],
+        "guidance": "Use bun install, bun run and bun build, and commit bun.lock. Deployed apps run on the Cloudflare Workers runtime: do not use Bun runtime APIs (Bun.serve, Bun.file, bun:sqlite) in deployed code. Keep an existing repository's package manager unless asked to migrate, and never mix lockfiles.",
+        "repoScopes": null
+      },
+      {
+        "componentId": "component_seed_node",
+        "componentRevision": 1,
+        "componentName": "Node.js",
+        "categoryId": "js-toolchain",
+        "categoryName": "JavaScript toolchain",
+        "verdict": "allow",
+        "blocking": false,
+        "signals": [
+          {
+            "kind": "file",
+            "pattern": ".node-version"
+          },
+          {
+            "kind": "file",
+            "pattern": ".nvmrc"
+          }
+        ],
+        "guidance": "Acceptable where a repository already uses it or the user asks for it.",
+        "repoScopes": null
+      },
+      {
+        "componentId": "component_seed_npm",
+        "componentRevision": 1,
+        "componentName": "npm",
+        "categoryId": "js-toolchain",
+        "categoryName": "JavaScript toolchain",
+        "verdict": "allow",
+        "blocking": false,
+        "signals": [
+          {
+            "kind": "file",
+            "pattern": "npm-shrinkwrap.json"
+          },
+          {
+            "kind": "file",
+            "pattern": "package-lock.json"
+          }
+        ],
+        "guidance": "Acceptable where a repository already uses it or the user asks for it. Commit package-lock.json.",
+        "repoScopes": null
+      },
+      {
+        "componentId": "component_seed_pnpm",
+        "componentRevision": 1,
+        "componentName": "pnpm",
+        "categoryId": "js-toolchain",
+        "categoryName": "JavaScript toolchain",
+        "verdict": "allow",
+        "blocking": false,
+        "signals": [
+          {
+            "kind": "file",
+            "pattern": "pnpm-lock.yaml"
+          },
+          {
+            "kind": "file",
+            "pattern": "pnpm-workspace.yaml"
+          }
+        ],
+        "guidance": "Acceptable where a repository already uses it or the user asks for it. Commit pnpm-lock.yaml.",
+        "repoScopes": null
+      },
+      {
+        "componentId": "component_seed_yarn",
+        "componentRevision": 1,
+        "componentName": "Yarn",
+        "categoryId": "js-toolchain",
+        "categoryName": "JavaScript toolchain",
+        "verdict": "allow",
+        "blocking": false,
+        "signals": [
+          {
+            "kind": "file",
+            "pattern": ".yarnrc.yml"
+          },
+          {
+            "kind": "file",
+            "pattern": "yarn.lock"
+          }
+        ],
+        "guidance": "Acceptable where a repository already uses it or the user asks for it. Commit yarn.lock.",
+        "repoScopes": null
+      },
+      {
+        "componentId": "component_seed_typescript",
+        "componentRevision": 1,
+        "componentName": "TypeScript",
+        "categoryId": "language",
+        "categoryName": "Language",
+        "verdict": "prefer",
+        "blocking": false,
+        "signals": [
+          {
+            "kind": "file",
+            "pattern": "tsconfig.json"
+          },
+          {
+            "kind": "source",
+            "extension": ".cts"
+          },
+          {
+            "kind": "source",
+            "extension": ".mts"
+          },
+          {
+            "kind": "source",
+            "extension": ".ts"
+          },
+          {
+            "kind": "source",
+            "extension": ".tsx"
+          }
+        ],
+        "guidance": "Write new code in TypeScript with strict mode and a tsconfig.json. Keep an existing JavaScript codebase in JavaScript unless the user asks to migrate.",
+        "repoScopes": null
+      },
+      {
+        "componentId": "component_seed_javascript",
+        "componentRevision": 1,
+        "componentName": "JavaScript",
+        "categoryId": "language",
+        "categoryName": "Language",
+        "verdict": "allow",
+        "blocking": false,
+        "signals": [
+          {
+            "kind": "file",
+            "pattern": "jsconfig.json"
+          },
+          {
+            "kind": "source",
+            "extension": ".cjs"
+          },
+          {
+            "kind": "source",
+            "extension": ".js"
+          },
+          {
+            "kind": "source",
+            "extension": ".jsx"
+          },
+          {
+            "kind": "source",
+            "extension": ".mjs"
+          }
+        ],
+        "guidance": "Acceptable where a repository already uses it or the user asks for it.",
+        "repoScopes": null
+      },
+      {
+        "componentId": "component_seed_uv",
+        "componentRevision": 1,
+        "componentName": "uv",
+        "categoryId": "python-tooling",
+        "categoryName": "Python tooling",
+        "verdict": "prefer",
+        "blocking": false,
+        "signals": [
+          {
+            "kind": "file",
+            "pattern": "uv.lock"
+          }
+        ],
+        "guidance": "Use uv init, uv add and uv run, and commit uv.lock. Do not create requirements.txt, Pipfile or poetry.lock in new projects. Keep an existing repository's tool unless asked to migrate.",
+        "repoScopes": null
+      },
+      {
+        "componentId": "component_seed_conda",
+        "componentRevision": 1,
+        "componentName": "conda",
+        "categoryId": "python-tooling",
+        "categoryName": "Python tooling",
+        "verdict": "allow",
+        "blocking": false,
+        "signals": [
+          {
+            "kind": "file",
+            "pattern": "conda-lock.yml"
+          },
+          {
+            "kind": "file",
+            "pattern": "environment.yaml"
+          },
+          {
+            "kind": "file",
+            "pattern": "environment.yml"
+          }
+        ],
+        "guidance": "Acceptable where a repository already uses it or the user asks for it.",
+        "repoScopes": null
+      },
+      {
+        "componentId": "component_seed_pip",
+        "componentRevision": 1,
+        "componentName": "pip",
+        "categoryId": "python-tooling",
+        "categoryName": "Python tooling",
+        "verdict": "allow",
+        "blocking": false,
+        "signals": [
+          {
+            "kind": "file",
+            "pattern": "constraints*.txt"
+          },
+          {
+            "kind": "file",
+            "pattern": "requirements*.txt"
+          }
+        ],
+        "guidance": "Acceptable where a repository already uses it or the user asks for it.",
+        "repoScopes": null
+      },
+      {
+        "componentId": "component_seed_pipenv",
+        "componentRevision": 1,
+        "componentName": "Pipenv",
+        "categoryId": "python-tooling",
+        "categoryName": "Python tooling",
+        "verdict": "allow",
+        "blocking": false,
+        "signals": [
+          {
+            "kind": "file",
+            "pattern": "Pipfile"
+          },
+          {
+            "kind": "file",
+            "pattern": "Pipfile.lock"
+          }
+        ],
+        "guidance": "Acceptable where a repository already uses it or the user asks for it.",
+        "repoScopes": null
+      },
+      {
+        "componentId": "component_seed_poetry",
+        "componentRevision": 1,
+        "componentName": "Poetry",
+        "categoryId": "python-tooling",
+        "categoryName": "Python tooling",
+        "verdict": "allow",
+        "blocking": false,
+        "signals": [
+          {
+            "kind": "file",
+            "pattern": "poetry.lock"
+          }
+        ],
+        "guidance": "Acceptable where a repository already uses it or the user asks for it.",
+        "repoScopes": null
+      },
+      {
+        "componentId": "component_seed_svelte",
+        "componentRevision": 1,
+        "componentName": "Svelte",
+        "categoryId": "web-frontend",
+        "categoryName": "Web frontend",
+        "verdict": "prefer",
+        "blocking": false,
+        "signals": [
+          {
+            "kind": "package",
+            "ecosystem": "npm",
+            "name": "@sveltejs/kit"
+          },
+          {
+            "kind": "package",
+            "ecosystem": "npm",
+            "name": "svelte"
+          },
+          {
+            "kind": "source",
+            "extension": ".svelte"
+          }
+        ],
+        "guidance": "Build browser UI with Svelte 5 and SvelteKit using adapter-cloudflare.",
+        "repoScopes": null
+      },
+      {
+        "componentId": "component_seed_next",
+        "componentRevision": 1,
+        "componentName": "Next.js",
+        "categoryId": "web-frontend",
+        "categoryName": "Web frontend",
+        "verdict": "forbid",
+        "blocking": true,
+        "signals": [
+          {
+            "kind": "package",
+            "ecosystem": "npm",
+            "name": "next"
+          }
+        ],
+        "guidance": "Not an organization standard for browser UI. Use SvelteKit instead.",
+        "repoScopes": null
+      },
+      {
+        "componentId": "component_seed_react",
+        "componentRevision": 1,
+        "componentName": "React",
+        "categoryId": "web-frontend",
+        "categoryName": "Web frontend",
+        "verdict": "forbid",
+        "blocking": true,
+        "signals": [
+          {
+            "kind": "package",
+            "ecosystem": "npm",
+            "name": "react"
+          },
+          {
+            "kind": "package",
+            "ecosystem": "npm",
+            "name": "react-dom"
+          }
+        ],
+        "guidance": "Not an organization standard for browser UI. Use Svelte instead.",
+        "repoScopes": null
+      }
+    ],
+    "digest": "a0e312e0ff64c0afecbc4f05770f71f5b7afc4e8203a491a400e3099cd0752ad"
+  }
+}

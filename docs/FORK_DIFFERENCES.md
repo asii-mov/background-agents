@@ -74,6 +74,7 @@ The fork keeps the core Open-Inspect product:
 | Git governance         | Lets a reviewed Git repository own the desired state for shared Skills and MCP entries. Reconciliation validates one commit and activates a complete last-good catalogue.                                                                                            |
 | MCP catalogue          | Adds approval lifecycle, governed scope and provenance, exact npm resolution, content-addressed artifacts, and session pins to upstream configuration and credential storage.                                                                                        |
 | Approved components    | Adds an owned catalogue of approved libraries, services, templates, and snippets. Agents can search and record adoption, and owners can inspect consumers.                                                                                                           |
+| Stack policy           | Grades each technology `preferred`, `allowed`, or `denied` within a category. Agents must remove newly introduced denials, and a `block` category also stops the push. A GitHub Action runs the same check on pull requests.                                         |
 | AppSec checks          | Adds centrally assigned, argument-vector security pipelines. Checks run after generation and before the managed push path. Failures return to the agent for a bounded number of repair attempts.                                                                     |
 | Pull-request risk      | Combines repository criticality with changed-path criticality. High-risk changes become draft pull requests with a security-review note.                                                                                                                             |
 | Sandbox network policy | Adds global, repository, and environment egress settings. Modal enforces blocked, domain allowlist, and CIDR allowlist policies. Unsupported providers reject restrictive policies.                                                                                  |
@@ -92,6 +93,11 @@ The fork keeps the core Open-Inspect product:
 - New sessions pin the exact Skill and MCP revisions that they receive.
 - A restrictive network policy fails closed when the selected sandbox provider cannot enforce it.
 - Blocking AppSec findings stop the managed push and pull-request path.
+- Agents build with the organization's preferred technology. A newly introduced denied technology,
+  such as React with the default policy, stops the turn and the push after the agent fails to remove
+  it. Technology already in the repository at the session's base commit never blocks.
+- Members no longer see governance settings or catalogue data. Reads need `governance.read` and
+  writes need `governance.manage`.
 - A pull request with a risk score of at least `8` must remain a draft.
 - With `apps_enabled`, an agent can deploy an internal app that opens at
   `https://<name>.<apps_domain>` for users that the apps visitor Access policy admits.
@@ -103,6 +109,10 @@ The fork keeps the core Open-Inspect product:
 The fork adds D1 migrations for platform roles, required Skills, governed MCP entries, security
 pipelines, repository risk, approved components, and Git catalogue state. It also adds the
 `@open-inspect/mcp-artifact-builder` service for verified local MCP dependency artifacts.
+
+The stack policy adds component categories, component stances and signals, and the stack inventory
+tables that hold observed repository facts. It also adds the `stack-policy-check` GitHub Action and
+the `sandbox_runtime.stack_policy_cli` checker it runs.
 
 Internal app hosting adds the `@open-inspect/app-broker` Worker in a dedicated apps Cloudflare
 account, with that account's Access organization and, optionally, a Workers for Platforms dispatch
@@ -129,6 +139,7 @@ control plane receives the broker URL, an Access service token, and a request-si
 - [Git-backed Skills and MCP governance](GIT_GOVERNANCE_CATALOG.md) defines the Git catalogue format
   and reconciliation behavior.
 - [Managed Skills](MANAGED_SKILLS.md) describes Skill authoring, assignment, and runtime delivery.
+- [Govern the technology stack](STACK_POLICY.md) explains the stack policy and its CI check.
 - [Host agent-built internal apps](APPS.md) sets up the apps account, the broker, and Access.
 - [OpenInspect repository map](REPO_MAP.md) maps user-visible capabilities to their source owners
   and verification.
