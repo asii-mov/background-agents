@@ -4,7 +4,7 @@ import type { BrokerConfig } from "./env";
 import { BrokerRefusal } from "./errors";
 
 export type ScriptName = string & { readonly __brand: "ScriptName" };
-export type AppHostname = string & { readonly __brand: "AppHostname" };
+type AppHostname = string & { readonly __brand: "AppHostname" };
 
 /**
  * Every Cloudflare object an app owns, derived from its name and nothing else. No request field

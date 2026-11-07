@@ -25,7 +25,7 @@ export interface BrokerEnv {
   SERVICE_AUTH_SECRET_CONTROL_PLANE?: string;
 }
 
-export type HostingConfig =
+type HostingConfig =
   | { readonly kind: Extract<HostingBackendKind, "workers"> }
   | {
       readonly kind: Extract<HostingBackendKind, "dispatch-namespace">;

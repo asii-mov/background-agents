@@ -27,7 +27,7 @@ const globalScope = globalThis;
 const JWKS_REFETCH_INTERVAL_MS = 60_000;
 const RS256 = { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" } as const;
 
-export interface AccessIdentity {
+interface AccessIdentity {
   readonly sub: string;
   readonly email: string;
 }

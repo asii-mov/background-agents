@@ -16,7 +16,7 @@ export const CLOUDFLARE_API_BASE_URL = "https://api.cloudflare.com/client/v4";
 export const CLOUDFLARE_API_MAX_ATTEMPTS = 3;
 const CLOUDFLARE_API_BACKOFF_BASE_MS = 250;
 /** The longest Retry-After the broker waits out inside one request. */
-export const CLOUDFLARE_MAX_RETRY_AFTER_WAIT_MS = 5_000;
+const CLOUDFLARE_MAX_RETRY_AFTER_WAIT_MS = 5_000;
 const LIST_PAGE_SIZE = 100;
 
 export type FetchLike = (request: Request) => Promise<Response>;
@@ -45,7 +45,7 @@ export function hasStatus(error: unknown, ...statuses: number[]): error is Cloud
   );
 }
 
-export interface CallOptions {
+interface CallOptions {
   readonly signal: AbortSignal;
   /** Sent as JSON, or as multipart when it is FormData. */
   readonly body?: unknown;

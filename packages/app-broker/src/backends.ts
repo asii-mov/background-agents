@@ -40,7 +40,7 @@ export type WireBinding = Readonly<Record<string, string>> & {
   readonly name: string;
 };
 
-export interface ScriptSpec {
+interface ScriptSpec {
   readonly script: ScriptName;
   readonly deploymentId: string;
   /** The first module is the main module. */
