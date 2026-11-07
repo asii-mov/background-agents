@@ -29,6 +29,7 @@ import { SessionInternalPaths } from "../session/contracts";
 import { createSessionRuntimeClient } from "../session/runtime-client";
 import { resolveScmProviderFromEnv, SourceControlProviderError } from "../source-control";
 import type { Env } from "../types";
+import { enforceAppRequirement } from "./app-admission";
 import { logPrincipal } from "./request-lifecycle";
 import { enforceTeamRequirement } from "./team-admission";
 import {
@@ -749,6 +750,9 @@ async function enforceRouteAuthorization(
           break;
         case "team":
           failure = await enforceTeamRequirement(requirement, params, ctx, evidence);
+          break;
+        case "app":
+          failure = await enforceAppRequirement(requirement, params, ctx, evidence);
           break;
         case "session":
           failure = await enforceSessionRequirement(

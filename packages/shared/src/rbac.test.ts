@@ -62,7 +62,7 @@ describe("RBAC registry", () => {
   });
 
   it("contains unique, sorted permission identifiers", () => {
-    expect(PERMISSION_IDS).toHaveLength(46);
+    expect(PERMISSION_IDS).toHaveLength(52);
     expect(new Set(PERMISSION_IDS).size).toBe(PERMISSION_IDS.length);
     expect(PERMISSION_IDS).toEqual([...PERMISSION_IDS].sort());
   });
@@ -142,6 +142,41 @@ describe("RBAC registry", () => {
     expect(permissionsForBuiltInRole("member")).not.toContain("sessions.export");
     expect(permissionsForBuiltInRole("viewer")).not.toContain("sessions.export");
     expect(isCustomRolePermission("sessions.export")).toBe(true);
+  });
+
+  it("lets Members deploy and manage their own apps but never see governance", () => {
+    const appsAndGovernance = [
+      "apps.deploy",
+      "apps.manage.any",
+      "apps.manage.own",
+      "apps.read",
+      "governance.manage",
+      "governance.read",
+    ] as const;
+    const member = permissionsForBuiltInRole("member");
+    expect(member).toEqual(expect.arrayContaining(["apps.read", "apps.deploy", "apps.manage.own"]));
+    for (const permission of ["governance.read", "governance.manage", "apps.manage.any"] as const) {
+      expect(member).not.toContain(permission);
+    }
+    const viewer = permissionsForBuiltInRole("viewer");
+    expect(appsAndGovernance.filter((permission) => viewer.includes(permission))).toEqual([]);
+    expect(permissionsForBuiltInRole("administrator")).toEqual(
+      expect.arrayContaining([...appsAndGovernance])
+    );
+    expect(appsAndGovernance.every(isCustomRolePermission)).toBe(true);
+  });
+
+  it("scopes app management to owned apps or every app", () => {
+    expect(SCOPED_PERMISSION_PAIRS["apps.manage"]).toEqual({
+      any: "apps.manage.any",
+      own: "apps.manage.own",
+    });
+    expect(resolveScopedPermission("apps.manage", permissionsForBuiltInRole("member"))).toBe("own");
+    expect(resolveScopedPermission("apps.manage", permissionsForBuiltInRole("administrator"))).toBe(
+      "any"
+    );
+    expect(resolveScopedPermission("apps.manage", permissionsForBuiltInRole("viewer"))).toBeNull();
+    expect(hasScopedPermission("apps.manage", ["apps.manage.own"], false)).toBe(false);
   });
 
   it("makes Member a superset of Viewer", () => {

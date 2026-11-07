@@ -13,6 +13,9 @@ import { repositoryRiskRoutes } from "./repository-risk";
 import { securityPipelineRoutes } from "./security-pipelines";
 import { approvedComponentRoutes } from "./approved-components";
 import { governanceCatalogRoutes } from "./governance-catalog";
+import { stackPolicyRoutes } from "./stack-policy";
+import { appRoutes } from "./apps";
+import { appDataRoutes } from "./app-data";
 import { analyticsRoutes } from "./analytics";
 import { auditEventRoutes } from "./audit-events";
 import { autofixRoutes } from "./autofix";
@@ -64,6 +67,11 @@ export const catalog: readonly RouteModule[] = [
   securityPipelineRoutes,
   approvedComponentRoutes,
   governanceCatalogRoutes,
+  stackPolicyRoutes,
+
+  // Agent-deployed internal apps and their data, ahead of the /sessions/:id routes
+  appRoutes,
+  appDataRoutes,
 
   // Session management, then the agent-initiated Slack notification
   sessionRoutes,

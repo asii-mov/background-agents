@@ -25,8 +25,16 @@ export const SIG1_PREFIX = "sig1";
  */
 export const SERVICE_REQUEST_MAX_BODY_BYTES = 16 * 1024 * 1024;
 
+/** Services that call the control plane: the only names it authenticates. */
 export const SERVICE_NAMES = ["web", "slack-bot", "github-bot", "linear-bot"] as const;
 export type ServiceName = (typeof SERVICE_NAMES)[number];
+
+/**
+ * Every sig1 signer. The control plane signs its calls to the app broker as `control-plane`. That
+ * name is deliberately not a {@link ServiceName}, so the control plane can never admit a request
+ * signed with the broker's shared secret.
+ */
+export type SigningServiceName = ServiceName | "control-plane";
 
 export function isServiceName(value: string): value is ServiceName {
   return (SERVICE_NAMES as readonly string[]).includes(value);
@@ -96,7 +104,7 @@ export function canonicalizeQuery(search: string): string {
  * `actor` is the empty string when no actor header is sent.
  */
 export function buildCanonicalRequestString(p: {
-  service: ServiceName;
+  service: SigningServiceName;
   timestampMs: number;
   nonce: string;
   method: string;
@@ -119,7 +127,7 @@ function generateNonce(): string {
 }
 
 async function signCanonicalRequest(p: {
-  service: ServiceName;
+  service: SigningServiceName;
   secret: string;
   timestampMs: number;
   nonce: string;
@@ -151,7 +159,7 @@ async function signCanonicalRequest(p: {
  * headers, and must send exactly the body bytes that were signed.
  */
 export async function buildServiceAuthHeaders(p: {
-  service: ServiceName;
+  service: SigningServiceName;
   secret: string;
   method: string;
   url: string;
@@ -227,7 +235,7 @@ export function parseServiceSignatureHeader(header: string): ServiceSignatureHea
  */
 export async function verifyServiceSignature(p: {
   signatureHeader: string;
-  service: ServiceName;
+  service: SigningServiceName;
   secret: string;
   method: string;
   url: string;
@@ -256,7 +264,7 @@ export async function verifyServiceSignature(p: {
 
 /** A sender's outbound credential: sig1 with the sender's own secret. */
 export interface OutboundServiceCredential {
-  service: ServiceName;
+  service: SigningServiceName;
   secret: string;
 }
 

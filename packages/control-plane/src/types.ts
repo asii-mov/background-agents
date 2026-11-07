@@ -38,6 +38,9 @@ export interface EnvConfig {
   SERVICE_AUTH_SECRET_SLACK_BOT?: string;
   SERVICE_AUTH_SECRET_GITHUB_BOT?: string;
   SERVICE_AUTH_SECRET_LINEAR_BOT?: string;
+  // sig1 key the control plane signs app-broker calls with (the broker's SERVICE_AUTH_SECRET_CONTROL_PLANE)
+  SERVICE_AUTH_SECRET_APP_BROKER?: string;
+  APP_BROKER_ACCESS_CLIENT_SECRET?: string; // Cloudflare Access service token secret for the broker hostname
   SLACK_BOT_TOKEN?: string; // Slack bot token for agent-initiated chat.postMessage calls
 
   // GitHub App secrets (for git operations)
@@ -73,6 +76,14 @@ export interface EnvConfig {
   GOVERNANCE_REPO_PATH?: string;
   GOVERNANCE_NPM_REGISTRY_URL?: string;
   GOVERNANCE_MCP_BUILDER_URL?: string;
+  // Agent-deployed internal apps. Hosting is off unless the broker URL, apps domain and credentials are all set.
+  APP_BROKER_URL?: string; // https://deployer.<apps domain>
+  APPS_DOMAIN?: string; // App <name> is served at https://<name>.<apps domain>
+  APP_BROKER_ACCESS_CLIENT_ID?: string; // Cloudflare Access service token id for the broker hostname
+  APP_DATA_JURISDICTION?: string; // D1/R2 jurisdiction for app data; unset for none
+  SANDBOX_TUNNELS_POLICY?: string; // "public" (default) | "disabled": rejects sandbox preview tunnels
+  /** Comma-separated email domains in which a bot-reported email may link to an existing verified user; unset never links. */
+  IDENTITY_LINK_EMAIL_DOMAINS?: string;
   CF_ACCOUNT_ID?: string; // Cloudflare account ID
   SANDBOX_PROVIDER?: string; // "modal" (default), "daytona", "vercel", "opencomputer", or "e2b"
   MODAL_WORKSPACE?: string; // Modal workspace name

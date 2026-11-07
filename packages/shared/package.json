@@ -62,6 +62,14 @@
       "import": "./dist/rbac.js",
       "types": "./dist/rbac.d.ts"
     },
+    "./apps": {
+      "import": "./dist/apps.js",
+      "types": "./dist/apps.d.ts"
+    },
+    "./app-broker": {
+      "import": "./dist/app-broker.js",
+      "types": "./dist/app-broker.d.ts"
+    },
     "./browser-auth-routes": {
       "import": "./dist/browser-auth-routes.js",
       "types": "./dist/browser-auth-routes.d.ts"
@@ -214,6 +222,14 @@
       "import": "./dist/types/approved-components.js",
       "types": "./dist/types/approved-components.d.ts"
     },
+    "./types/stack-policy": {
+      "import": "./dist/types/stack-policy.js",
+      "types": "./dist/types/stack-policy.d.ts"
+    },
+    "./types/app-data": {
+      "import": "./dist/types/app-data.js",
+      "types": "./dist/types/app-data.d.ts"
+    },
     "./types/keyboard-shortcuts": {
       "import": "./dist/types/keyboard-shortcuts.js",
       "types": "./dist/types/keyboard-shortcuts.d.ts"
@@ -247,7 +263,10 @@
     "test:coverage": "vitest run --coverage",
     "lint": "eslint src/",
     "lint:fix": "eslint src/ --fix",
-    "generate:memory-contract": "UPDATE_MEMORY_CONTRACT=1 vitest run src/memory-tools.test.ts"
+    "generate:memory-contract": "UPDATE_MEMORY_CONTRACT=1 vitest run src/memory-tools.test.ts",
+    "generate:stack-contract": "UPDATE_STACK_CONTRACT=1 vitest run src/types/stack-policy.test.ts",
+    "generate:app-deploy-contract": "UPDATE_APP_DEPLOY_CONTRACT=1 vitest run src/apps.test.ts",
+    "generate:app-data-contract": "UPDATE_APP_DATA_CONTRACT=1 vitest run src/types/app-data.test.ts"
   },
   "devDependencies": {
     "@vitest/coverage-v8": "^4.1.11",
