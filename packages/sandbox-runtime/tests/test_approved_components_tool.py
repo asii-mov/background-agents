@@ -87,3 +87,55 @@ def test_search_calls_the_session_scoped_catalogue(tmp_path: Path) -> None:
         "authorization": "Bearer test-token",
     }
     assert json.loads(result)["components"][0]["id"] == "component-1"
+
+
+def test_search_leads_each_component_with_its_stance_and_category(tmp_path: Path) -> None:
+    script = """
+      globalThis.fetch = async () => new Response(JSON.stringify([
+        {id:'react', name:'React', stance:'denied', categoryId:'web-frontend'},
+        {id:'auth', name:'Authentication'},
+      ]), {status: 200});
+      const { default: componentTool } = await import(process.argv[1]);
+      process.stdout.write(await componentTool.execute({action:'search', query:'ui'}));
+    """
+
+    result = json.loads(_run(tmp_path, script))
+
+    assert [(c["stance"], c["category"], c["id"]) for c in result["components"]] == [
+        ("denied", "web-frontend", "react"),
+        ("allowed", None, "auth"),
+    ]
+    assert "never use it" in result["stances"]["denied"]
+
+
+def test_adopting_a_detected_component_explains_that_detection_is_automatic(
+    tmp_path: Path,
+) -> None:
+    module = _tool_module(tmp_path)
+    manifest = tmp_path / "repo-manifest.json"
+    manifest.write_text(json.dumps({"repositories": [{"owner": "acme", "name": "web"}]}))
+    # The tool reads the live session manifest; this copy reads a per-test one instead.
+    module.write_text(module.read_text().replace("/tmp/oi-repo-manifest.json", str(manifest)))
+    script = """
+      globalThis.fetch = async () => new Response(
+        JSON.stringify({error: 'Component is detected automatically'}), {status: 409});
+      const { default: componentTool } = await import(process.argv[1]);
+      process.stdout.write(await componentTool.execute({action:'adopt', componentId:'bun'}));
+    """
+
+    result = subprocess.run(
+        [NODE_BINARY, "--input-type=module", "-e", script, module.as_uri()],
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=10,
+        env={
+            **os.environ,
+            "SANDBOX_AUTH_TOKEN": "test-token",
+            "SESSION_CONFIG": '{"sessionId":"session-1"}',
+            "CONTROL_PLANE_URL": "https://control.example.com",
+        },
+    ).stdout
+
+    assert result.startswith("Adoption not recorded: Component is detected automatically.")
+    assert "recorded automatically from the repository's manifests" in result

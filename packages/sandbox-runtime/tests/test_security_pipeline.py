@@ -12,6 +12,7 @@ import sandbox_runtime.security_pipeline as security_pipeline
 from sandbox_runtime.security_pipeline import (
     MAX_OUTPUT_BYTES,
     MAX_REMEDIATION_PROMPT_BYTES,
+    CheckTarget,
     SecurityPipelineConfigError,
     SecurityPipelineRunner,
     parse_security_pipelines,
@@ -124,8 +125,8 @@ async def test_runner_executes_only_scoped_pipeline_from_target_checkout(tmp_pat
     )
     runner = SecurityPipelineRunner(pipelines, frontend, MagicMock())
 
-    skipped = await runner.run(workdir=frontend, repo_full_name="acme/frontend")
-    report = await runner.run(workdir=backend, repo_full_name="ACME/BACKEND")
+    skipped = await runner.run(CheckTarget(frontend, "acme", "frontend"))
+    report = await runner.run(CheckTarget(backend, "ACME", "BACKEND"))
 
     assert skipped.results == ()
     assert report.passed

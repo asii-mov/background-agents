@@ -334,6 +334,24 @@ class TestInstallTools:
         assert (tool_dest / "slack-notify.js").exists()
         assert (tool_dest / "spawn-child.js").exists()
 
+    def test_deploy_app_installed_only_when_hosting_enabled(self, tmp_path, monkeypatch):
+        tools_dir = tmp_path / "app" / "sandbox" / "tools"
+        tools_dir.mkdir(parents=True)
+        (tools_dir / "deploy-app.js").write_text("// deploy-app")
+        installed = {}
+        for enabled in (False, True):
+            if enabled:
+                monkeypatch.setenv("AGENT_APP_DEPLOY_ENABLED", "true")
+            else:
+                monkeypatch.delenv("AGENT_APP_DEPLOY_ENABLED", raising=False)
+            workdir = tmp_path / f"workspace-{enabled}"
+            workdir.mkdir()
+            with _patch_paths(legacy=tmp_path / "no-legacy", tools=tools_dir):
+                _make_opencode_server()._install_tools(workdir)
+            installed[enabled] = (workdir / ".opencode" / "tool" / "deploy-app.js").exists()
+
+        assert installed == {False: False, True: True}
+
 
 class TestInstallBinScripts:
     """Cases for install_bin_scripts(): standalone CLIs both harnesses share."""

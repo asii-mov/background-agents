@@ -28,14 +28,6 @@ def memory_text(config_dir: Path) -> str | None:
     return path.read_text(encoding="utf-8") if path.is_file() else None
 
 
-def append_memory(guidance: str | None, config_dir: Path) -> str | None:
-    """Append pinned context for Claude, preserving existing guidance when memory is empty."""
-    text = memory_text(config_dir)
-    if not text:
-        return guidance
-    return f"{guidance}\n\n{text}" if guidance else text
-
-
 @dataclass(frozen=True)
 class RenderedSessionMemory:
     """A session's pinned memory, rendered by the control plane for its harness."""

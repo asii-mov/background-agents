@@ -14,10 +14,10 @@ from sandbox_runtime.memories import (
     MemoryMaterializer,
     RenderedSessionMemory,
     SessionMemoryClient,
-    append_memory,
     memory_text,
 )
 from sandbox_runtime.memory_contract import MEMORY_TOOL_SPECS, RENDERED_MEMORY_MAX_CHARS
+from sandbox_runtime.platform_context import claude_system_prompt_append
 
 MANIFEST_SHA256 = "a" * 64
 
@@ -57,7 +57,10 @@ async def test_authenticated_fetch_replaces_stale_memory(tmp_path: Path) -> None
     await materializer(tmp_path, handler).materialize()
     assert memory_text(tmp_path) == "exact rendered text\n"
     assert (tmp_path / "oi-memory.md").stat().st_mode & 0o777 == 0o600
-    assert append_memory("guidance", tmp_path) == "guidance\n\nexact rendered text\n"
+    assert (
+        claude_system_prompt_append(None, "guidance", tmp_path)
+        == "guidance\n\nexact rendered text\n"
+    )
 
 
 async def test_empty_memory_removes_restored_memory_and_staging(tmp_path: Path) -> None:
@@ -68,8 +71,8 @@ async def test_empty_memory_removes_restored_memory_and_staging(tmp_path: Path) 
     ).materialize()
     assert not (tmp_path / "oi-memory.md").exists()
     assert not list(tmp_path.glob("*.tmp"))
-    assert append_memory(None, tmp_path) is None
-    assert append_memory("guidance", tmp_path) == "guidance"
+    assert claude_system_prompt_append(None, None, tmp_path) is None
+    assert claude_system_prompt_append(None, "guidance", tmp_path) == "guidance"
 
 
 @pytest.mark.parametrize(

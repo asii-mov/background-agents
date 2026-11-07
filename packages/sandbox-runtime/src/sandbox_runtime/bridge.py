@@ -69,15 +69,18 @@ from .prompt_budgets import resolve_prompt_limits
 from .push_operation import PushOperation, PushRejected, PushRequest
 from .repo_config import load_repo_manifest
 from .security_pipeline import (
+    CheckTarget,
     SecurityPipelineReport,
     SecurityPipelineRunner,
     parse_security_pipelines,
 )
 from .shutdown_preparation import ShutdownPreparationCoordinator
+from .stack_observations import StackObservationReporter
+from .stack_policy import StackConformanceStage
 from .types import GitUser
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Coroutine, Iterable
 
     from .attachment_processor import HydratedSessionAttachment
 
@@ -187,11 +190,28 @@ class AgentBridge:
         self.session_id_file = temp_dir / "agent-session-id"
         self.legacy_session_id_file = temp_dir / "opencode-session-id"
         self.repo_path = Path("/workspace")
+        session_config_json = os.environ.get("SESSION_CONFIG", "{}")
+        # The bridge parses its own environment, so an agent editing the materialized
+        # policy file changes nothing about enforcement.
+        stack_stage = StackConformanceStage.from_session_config(session_config_json, self.log)
         self.security_pipelines = SecurityPipelineRunner(
-            parse_security_pipelines(os.environ.get("SESSION_CONFIG", "{}")),
+            parse_security_pipelines(session_config_json),
             self.repo_path,
             self.log,
+            stack=stack_stage,
         )
+        self.stack_observations = (
+            StackObservationReporter(
+                stack_stage,
+                control_plane_url=control_plane_url,
+                session_id=session_id,
+                auth_token=auth_token,
+                log=self.log,
+            )
+            if stack_stage is not None
+            else None
+        )
+        self._observation_tasks: set[asyncio.Task[None]] = set()
         # Supervisor-written canonical repo manifest; push targeting resolves
         # member checkout paths through it rather than joining spec-supplied
         # names into the filesystem.
@@ -293,6 +313,17 @@ class AgentBridge:
     def _build_ready_event(self) -> dict[str, Any]:
         harness = self._require_harness()
         repositories = load_repo_manifest(self.repo_manifest_path)
+        # Ready means the repositories are synced: record each one's baseline stack once.
+        if self.stack_observations is not None:
+            self._spawn_observations(
+                self.stack_observations.report_baseline(
+                    CheckTarget(
+                        repository.path, repository.owner, repository.name, repository.base_sha
+                    ),
+                    repository.branch,
+                )
+                for repository in repositories
+            )
         # The image bakes SANDBOX_VERSION; reporting it lets the control plane
         # stamp snapshots with the runtime that produced them and retire the
         # ones a later compatibility floor rules out.
@@ -835,36 +866,34 @@ class AgentBridge:
                     reasoning_effort=reasoning_effort,
                 )
 
-            if not had_error and self.security_pipelines.pipelines:
+            if not had_error and self.security_pipelines.has_checks:
                 phase = "security_pipeline"
-                for attempt in range(self.security_pipelines.max_remediation_attempts + 1):
+                runner = self.security_pipelines
+                attempt = 0
+                nudged = False
+                while True:
                     report = await self._run_security_pipelines_for_workspace()
-                    if not report.failures:
-                        await self._send_event(
-                            {
-                                "type": "warning",
-                                "scope": "security_pipeline",
-                                "message": "Centrally managed application-security checks passed.",
-                            }
-                        )
-                        break
-                    await self._send_event(
-                        {
-                            "type": "warning",
-                            "scope": "security_pipeline",
-                            "message": f"{len(report.failures)} application-security check(s) failed.",
-                        }
+                    await self._announce_command_checks(report)
+                    fix = report.remediation_prompt() if report.failures else None
+                    # One advisory round per turn for preference deviations; never blocks.
+                    nudge = (
+                        runner.stack.pending_nudge(report.stack_results)
+                        if runner.stack is not None and not nudged
+                        else None
                     )
-                    if attempt >= self.security_pipelines.max_remediation_attempts:
+                    if fix is None and nudge is None:
+                        break
+                    if fix is not None and attempt >= runner.max_remediation_attempts:
                         if report.blocking_failures:
                             had_error = True
-                            error_category = "security_pipeline_failed"
-                            error_message = "Centrally managed application-security checks still fail after remediation."
+                            error_category, error_message = report.turn_error()
                         break
                     remediation = await harness.run_prompt(
                         HarnessPrompt(
                             message_id=message_id,
-                            text=report.remediation_prompt(),
+                            text="\n\n".join(
+                                text for text in (fix, nudge.text if nudge else None) if text
+                            ),
                             model=model,
                             reasoning_effort=reasoning_effort,
                             attachments=(),
@@ -880,6 +909,11 @@ class AgentBridge:
                         message_cost_usd = (message_cost_usd or 0) + remediation.message_cost_usd
                     if remediation.cancelled:
                         raise asyncio.CancelledError
+                    if nudge is not None and runner.stack is not None:
+                        runner.stack.acknowledge(nudge)
+                        nudged = True
+                    if fix is not None:
+                        attempt += 1
                     if not remediation.success:
                         had_error = True
                         error_category = "security_remediation_failed"
@@ -1100,18 +1134,42 @@ class AgentBridge:
 
         self.activity.start_push(cmd, execute)
 
+    async def _announce_command_checks(self, report: SecurityPipelineReport) -> None:
+        """Only command pipelines surface in the session. Stack-policy passes, preference
+        findings and nudges stay silent, so members never see governance at work."""
+        if not report.results:
+            return
+        if report.command_failures:
+            message = f"{len(report.command_failures)} application-security check(s) failed."
+        elif not report.failures:
+            message = "Centrally managed application-security checks passed."
+        else:
+            return
+        await self._send_event(
+            {"type": "warning", "scope": "security_pipeline", "message": message}
+        )
+
     async def _run_security_pipelines_for_workspace(self) -> SecurityPipelineReport:
         repositories = load_repo_manifest(self.repo_manifest_path)
         if not repositories:
-            return await self.security_pipelines.run(workdir=self.repo_path)
+            return await self.security_pipelines.run(CheckTarget(self.repo_path))
         return SecurityPipelineReport.combine(
             [
                 await self.security_pipelines.run(
-                    workdir=repository.path, repo_full_name=f"{repository.owner}/{repository.name}"
+                    CheckTarget(
+                        repository.path, repository.owner, repository.name, repository.base_sha
+                    )
                 )
                 for repository in repositories
             ]
         )
+
+    def _spawn_observations(self, reports: Iterable[Coroutine[Any, Any, None]]) -> None:
+        """Observation reporting is best-effort and must never delay a turn or a push."""
+        for report in reports:
+            task = asyncio.create_task(report)
+            self._observation_tasks.add(task)
+            task.add_done_callback(self._observation_tasks.discard)
 
     async def _handle_push(self, cmd: dict[str, Any]) -> dict[str, Any]:
         """Execute a local push and return its timestamped result candidate."""
@@ -1121,6 +1179,12 @@ class AgentBridge:
             logger=self.log,
             security_pipelines=self.security_pipelines,
         ).execute(cmd.get("pushSpec"))
+        if result.error is None and result.report is not None and self.stack_observations:
+            reporter = self.stack_observations
+            self._spawn_observations(
+                reporter.report_push(stack_result, result.request.branch_name)
+                for stack_result in result.report.stack_results
+            )
         return {
             "type": "push_error" if result.error is not None else "push_complete",
             **({"error": result.error} if result.error is not None else {}),

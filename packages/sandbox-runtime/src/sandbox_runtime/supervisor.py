@@ -18,8 +18,10 @@ from .constants import (
 )
 from .docker_control import DockerControl
 from .harness.base import DETERMINISTIC_FAILURE_EXIT_CODE
+from .platform_context import materialize_stack_policy
 from .repo_image_callback import RepoImageBuildCallback
 from .runtime_config import BootMode, RuntimeConfig
+from .stack_policy import parse_stack_policy
 
 if TYPE_CHECKING:
     import signal
@@ -74,10 +76,12 @@ class SandboxSupervisor:
         log: Any,
         *,
         memory: MemoryMaterializer | None = None,
+        policy_dir: Path | None = None,
         boot_events: BootEventLog | None = None,
         docker_service: DockerService | None = None,
     ) -> None:
         self.config = config
+        self.policy_dir = policy_dir
         self.repository_boot = repository_boot
         # Present only for Docker-enabled sandboxes: started before repository
         # hooks, watched for the whole session, stopped last.
@@ -624,6 +628,13 @@ class SandboxSupervisor:
         """
         # Materialization is sandbox-boot work; OpenCode process restarts
         # reuse this tree and must not depend on control-plane availability.
+        # The policy comes first and has no boot phase of its own: members never
+        # see governance at work. A malformed policy fails the boot (fail closed).
+        if self.policy_dir is not None:
+            materialize_stack_policy(
+                parse_stack_policy(self.config.session_config), self.policy_dir
+            )
+
         if self.managed_skills is not None:
             with self.boot_events.phase_scope("skills"):
                 await self.managed_skills.materialize(boot_result.repositories, boot_result.workdir)
