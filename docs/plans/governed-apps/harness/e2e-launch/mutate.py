@@ -45,7 +45,7 @@ MUTATIONS = [
      "cd packages/control-plane && npx vitest run --config vitest.integration.config.ts test/integration/stack-policy-launch.test.ts"),
     ("composition root ignores hosting config",
      "packages/control-plane/src/session/components.ts",
-     "agentAppDeployEnabled: isAppHostingConfigured(env),", "agentAppDeployEnabled: false,",
+     "agentAppDeployEnabled: parseAppsConfig(env).kind === \"available\",", "agentAppDeployEnabled: false,",
      "cd packages/control-plane && npx vitest run --config vitest.integration.config.ts test/integration/stack-policy-launch.test.ts"),
     ("runtime still refuses Claude with pipelines",
      "packages/sandbox-runtime/src/sandbox_runtime/runtime_config.py",
