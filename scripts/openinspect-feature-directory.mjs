@@ -1112,7 +1112,7 @@ export const openInspectFeatureDirectory = {
             ui: [
               "packages/web/src/components/settings/appsec-governance-settings.tsx",
               "packages/web/src/components/settings/approved-components-settings.tsx",
-              "packages/web/src/hooks/use-platform-role.ts",
+              "packages/web/src/components/settings/governance-api.ts",
             ],
             bff: [
               "packages/web/src/app/api/security-pipelines/route.ts",
@@ -1148,16 +1148,102 @@ export const openInspectFeatureDirectory = {
         },
         {
           id: "settings.appsec-member-visibility",
-          title: "Hide AppSec catalog writes and platform ownership from members",
+          title: "Hide the AppSec tab and every governance read from members",
+          sources: {
+            ui: ["packages/web/src/components/settings/settings-registry.ts"],
+          },
           coverage: {
             kind: "browser-covered",
             test: {
               file: "packages/web/e2e/settings-governance.spec.ts",
-              title: "hides AppSec catalogue writes from members",
+              title: "gives members no AppSec entry and no governance data from a direct link",
             },
             proofs: [
-              "packages/control-plane/src/router.policy.test.ts",
-              "packages/control-plane/src/db/platform-roles.test.ts",
+              "packages/web/src/components/settings/settings-registry.test.ts",
+              "packages/control-plane/test/integration/governance-routes.test.ts",
+            ],
+          },
+        },
+        {
+          id: "settings.appsec-stack-policy",
+          title:
+            "Grade technologies per category, switch advise or block, and preview what agents are told",
+          sources: {
+            ui: [
+              "packages/web/src/components/settings/approved-components-settings.tsx",
+              "packages/web/src/components/settings/approved-components-model.ts",
+            ],
+            bff: [
+              "packages/web/src/app/api/component-categories/route.ts",
+              "packages/web/src/app/api/component-categories/[id]/route.ts",
+              "packages/web/src/app/api/stack-policy/preview/route.ts",
+              "packages/web/src/app/api/stack-policy/export/route.ts",
+            ],
+            backend: [
+              "packages/control-plane/src/routes/approved-components.ts",
+              "packages/control-plane/src/routes/stack-policy.ts",
+              "packages/control-plane/src/stack-policy/compile.ts",
+            ],
+          },
+          coverage: {
+            kind: "browser-covered",
+            test: {
+              file: "packages/web/e2e/settings-stack-policy.spec.ts",
+              title:
+                "lets an administrator flip web frontend to block and see what agents are told change",
+            },
+            proofs: [
+              "packages/web/src/components/settings/approved-components-settings.test.tsx",
+              "packages/web/src/components/settings/approved-components-model.test.ts",
+              "packages/web/src/app/api/stack-policy/routes.test.ts",
+              "packages/control-plane/test/integration/governance-routes.test.ts",
+            ],
+          },
+        },
+        {
+          id: "settings.appsec-stack-adoption",
+          title: "Track stack adoption per category and repository, and inventory app data",
+          sources: {
+            ui: ["packages/web/src/components/settings/stack-adoption-settings.tsx"],
+            bff: [
+              "packages/web/src/app/api/stack-inventory/route.ts",
+              "packages/web/src/app/api/stack-inventory/rollup/route.ts",
+              "packages/web/src/app/api/app-data/inventory/route.ts",
+            ],
+            backend: [
+              "packages/control-plane/src/routes/stack-policy.ts",
+              "packages/control-plane/src/routes/app-data.ts",
+            ],
+          },
+          coverage: {
+            kind: "browser-covered",
+            test: {
+              file: "packages/web/e2e/settings-stack-policy.spec.ts",
+              title: "shows an administrator how repositories follow the standards",
+            },
+            proofs: ["packages/web/src/components/settings/stack-adoption-settings.test.tsx"],
+          },
+        },
+        {
+          id: "sessions.required-skills-hidden",
+          title: "Keep required governance skills out of the composer, selector and sidebar",
+          sources: {
+            ui: [
+              "packages/web/src/components/prompt-skill-autocomplete.tsx",
+              "packages/web/src/components/session-skill-selector.tsx",
+              "packages/web/src/components/sidebar/managed-skills-section.tsx",
+            ],
+          },
+          coverage: {
+            kind: "browser-covered",
+            test: {
+              file: "packages/web/e2e/settings-stack-policy.spec.ts",
+              title: "keeps required governance skills out of a member's composer and sidebar",
+            },
+            proofs: [
+              "packages/web/src/components/prompt-skill-autocomplete.test.tsx",
+              "packages/web/src/components/session-skill-selector.test.tsx",
+              "packages/web/src/components/sidebar/managed-skills-section.test.tsx",
             ],
           },
         },
@@ -1219,7 +1305,7 @@ export const openInspectFeatureDirectory = {
           coverage: {
             kind: "backend-only",
             reason:
-              "Component, control-plane, and agent-tool tests exist, but Playwright receives an empty approved-component catalog.",
+              "Playwright renders the seeded catalogue, but creating and editing components is covered only by component and control-plane tests.",
             proofs: [
               "packages/web/src/components/settings/approved-components-settings.test.tsx",
               "packages/control-plane/test/integration/approved-components.test.ts",

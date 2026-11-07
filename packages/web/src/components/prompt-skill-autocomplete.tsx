@@ -67,7 +67,11 @@ export const PromptSkillTextarea = forwardRef<HTMLTextAreaElement, PromptSkillTe
     const instanceId = useId();
     const listboxId = `${instanceId}-skill-listbox`;
     const optionId = (skillId: string) => `${instanceId}-skill-option-${skillId}`;
-    const skills = suggestionSource.status === "ready" ? suggestionSource.skills : [];
+    // Required skills load in every session; offering them to pick is governance noise.
+    const skills =
+      suggestionSource.status === "ready"
+        ? suggestionSource.skills.filter((skill) => !skill.required)
+        : [];
     const completion = cursor ? findActiveSkillCompletion(value, cursor.start, cursor.end) : null;
     const matchingSkills = filterSkillSuggestions(skills, completion);
     const activeSkill =
