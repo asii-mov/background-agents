@@ -18,6 +18,7 @@ import {
  * it needs no leader election.
  */
 
+import { appsFromEnv } from "./apps";
 import { checkAutofixQueueHealth } from "./autofix/queue-health";
 import { ApprovedComponentStore } from "./db/approved-components";
 import { SessionIndexStore } from "./db/session-index";
@@ -37,6 +38,9 @@ import type { Env } from "./types";
 
 /** Every minute: the automation scheduler's tick and the autofix queue health check. */
 export const SCHEDULER_TICK_CRON = "* * * * *";
+
+/** Retired app data resources deleted per hourly sweep; the rest wait for the next slot. */
+export const APP_DATA_PURGE_BATCH_SIZE = 50;
 
 /** What one run of a scheduled job is given. The host builds it per run. */
 export interface ScheduledJobDeps {
@@ -87,7 +91,7 @@ export const SCHEDULED_JOBS: readonly ScheduledJob[] = [
   {
     name: "abandoned_draft_sweep",
     cron: ABANDONED_DRAFT_SWEEP_CRON,
-    async run({ db, sessions, backgroundTasks, log }, nowMs) {
+    async run({ env, db, sessions, backgroundTasks, log }, nowMs) {
       backgroundTasks.submit(
         async () => {
           const observations = await new StackInventoryStore(
@@ -100,6 +104,15 @@ export const SCHEDULED_JOBS: readonly ScheduledJob[] = [
           });
         },
         { name: "stack_observation_prune" }
+      );
+      backgroundTasks.submit(
+        async () => {
+          const apps = appsFromEnv(env, db);
+          if (!apps.ok) return;
+          const purge = await apps.data.purgeDue(APP_DATA_PURGE_BATCH_SIZE);
+          log.info("Purged retired app data", { event: "app_data.purge_sweep", ...purge });
+        },
+        { name: "app_data_purge" }
       );
       await new AbandonedDraftSweep(
         new SessionIndexStore(db),

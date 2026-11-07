@@ -1,9 +1,10 @@
 import { env } from "cloudflare:test";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { CompiledStackPolicy } from "@open-inspect/shared/types/stack-policy";
 import { ApprovedComponentStore } from "../../src/db/approved-components";
 import type { Env } from "../../src/types";
 import { cleanD1Tables } from "./cleanup";
-import { initNamedSession } from "./helpers";
+import { initNamedSession, serviceFetch } from "./helpers";
 import { runInSessionDO, type SessionDOInternals } from "./session-do-access";
 
 const REPOSITORY = { repoOwner: "acme/platform", repoName: "web" };
@@ -77,14 +78,25 @@ afterEach(async () => {
 });
 
 describe("stack policy at launch", () => {
-  it("delivers exactly the policy the preview compiles for the session's repositories", async () => {
+  it("delivers byte for byte the policy the preview route shows, data rules included", async () => {
     const launch = await launchSession();
+    vi.restoreAllMocks();
 
-    const preview = await new ApprovedComponentStore(env.DB).compileForSession([REPOSITORY], null);
-    expect(preview?.instructions).toContain("React");
+    const url = `https://test.local/stack-policy/preview?repo=${REPOSITORY.repoOwner}/${REPOSITORY.repoName}`;
+    const response = await serviceFetch(url, {
+      as: { userId: "ad".repeat(16), role: "administrator" },
+    });
+    expect(response.status).toBe(200);
+    const { policy: preview } = (await response.json()) as { policy: CompiledStackPolicy };
+
+    expect(preview.rules.some((rule) => rule.signals.some((s) => s.kind === "manifest"))).toBe(
+      true
+    );
+    expect(preview.instructions).toContain("### Data for internal apps");
+    expect(preview.instructions).toContain("React");
     expect(launch.stack_policy).toEqual(preview);
     expect((launch.stack_policy as { instructions: string }).instructions).toBe(
-      preview!.instructions
+      preview.instructions
     );
   });
 

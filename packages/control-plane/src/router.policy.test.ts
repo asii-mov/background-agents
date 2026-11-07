@@ -39,11 +39,11 @@ describe("route policy table", () => {
   });
 
   it("publishes the complete canonical route catalog", () => {
-    expect(routes).toHaveLength(269);
+    expect(routes).toHaveLength(277);
 
     const paths = routes.map((route) => route.path);
-    expect(new Set(paths).size).toBe(206);
-    expect(new Set(routes.map((route) => `${route.method}:${route.path}`)).size).toBe(269);
+    expect(new Set(paths).size).toBe(214);
+    expect(new Set(routes.map((route) => `${route.method}:${route.path}`)).size).toBe(277);
     expect(routeFor("POST", "/sessions/session-1/sandbox-memory/search")).toMatchObject({
       authentication: { kind: "sandbox" },
       supportedScmProviders: "all",
@@ -67,6 +67,30 @@ describe("route policy table", () => {
         auditAllowed: true,
       });
     }
+  });
+
+  it("admits app data management by app ownership and the inventory by governance.read", () => {
+    for (const [method, path] of [
+      ["GET", "/apps/notes/data"],
+      ["GET", "/apps/notes/data/operations"],
+      ["POST", "/apps/notes/data/secrets"],
+      ["DELETE", "/apps/notes/data/secrets/API_KEY"],
+      ["POST", "/apps/notes/data/migrations/approve"],
+      ["POST", "/apps/notes/data/restore"],
+      ["PUT", "/apps/notes/data/classification"],
+    ] as const) {
+      expect(routeFor(method, path)).toMatchObject({
+        cacheControl: "private, no-store",
+        authorization: {
+          kind: "active-user",
+          allOf: [{ kind: "app", operation: "manage", appParam: "name" }],
+          service: { kind: "deny" },
+        },
+      });
+    }
+    expect(routeFor("GET", "/app-data/inventory")?.authorization).toMatchObject({
+      allOf: [{ kind: "permission", permission: "governance.read" }],
+    });
   });
 
   it("gates run analytics with analytics.read", () => {

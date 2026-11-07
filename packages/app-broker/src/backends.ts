@@ -10,10 +10,10 @@
 
 import type { BrokerBinding, BrokerDeployRequest } from "@open-inspect/shared/app-broker";
 import type { HostingBackendKind } from "@open-inspect/shared/apps";
-import { APP_PLATFORM_BINDINGS } from "@open-inspect/shared/types/app-data";
+import { APP_PLATFORM_BINDINGS, type DataJurisdiction } from "@open-inspect/shared/types/app-data";
 import { z } from "zod";
 import { findOrCreate, hasStatus, type CloudflareApi } from "./cloudflare-api";
-import type { BrokerConfig, DataJurisdiction } from "./env";
+import type { BrokerConfig } from "./env";
 import type { AccessGrant } from "./edge";
 import { BrokerRefusal } from "./errors";
 import type { ScriptName } from "./names";

@@ -3,7 +3,7 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ApprovedComponent } from "@open-inspect/shared/types/approved-components";
 import type { ComponentCategory, StackSignal } from "@open-inspect/shared/types/stack-policy";
-import { describe, expect, it, vi } from "vitest";
+import { describe, expect, it } from "vitest";
 import { ApprovedComponentStore } from "../db/approved-components";
 import { SecurityPipelineStore } from "../db/security-pipelines";
 import { applyMigrations } from "../node/migrate";
@@ -263,10 +263,9 @@ describe("compileStackPolicy", () => {
         environmentId: "env-1",
       });
       const fromPipelines = Object.fromEntries(
-        (await pipelines.getForSession(SESSION_REPOSITORIES, "env-1")).map((pipeline) => [
-          pipeline.name,
-          pipeline.repoScopes,
-        ])
+        (await pipelines.getForSession(SESSION_REPOSITORIES, "env-1"))
+          .filter((pipeline) => cases.some((scope) => scope.name === pipeline.name))
+          .map((pipeline) => [pipeline.name, pipeline.repoScopes])
       );
       expect(
         Object.fromEntries(policy!.rules.map((rule) => [rule.componentName, rule.repoScopes]))
@@ -315,6 +314,17 @@ Anything rendered in a browser: pages, dashboards, internal tools.
 - Prefer: **Svelte**. Build browser UI with Svelte 5 and SvelteKit using adapter-cloudflare.
 - Do not use: **Next.js**, **React**.
 
+### Data for internal apps
+Declare what an app stores in \`openinspect.app.json\` under \`data\`, keyed by an UPPER_SNAKE_CASE binding name; the platform provisions a dedicated resource and binds it as \`env.<NAME>\`. Never create, name or reference a database, bucket, namespace, connection string or Cloudflare credential, and never write a wrangler config.
+- \`{"kind":"d1"}\`: records in SQLite. Schema changes are numbered files such as \`migrations/0001_create-notes.sql\`; never edit or delete a file after it has deployed. A change that drops or rewrites existing data waits until the user approves it on the app's page.
+- \`{"kind":"kv"}\`: caches and small ephemeral state, never records.
+- \`{"kind":"r2"}\`: private files, served only through the app.
+- SQL goes only through \`prepare(sql).bind(...)\` with a constant SQL string. Never build SQL from strings or template literals.
+- The signed-in user is the \`x-openinspect-user-sub\` request header (email: \`x-openinspect-user-email\`), set by the platform after it verifies sign-in. Never read \`cf-access-authenticated-user-email\`, \`x-forwarded-email\`, \`x-forwarded-user\` or \`x-auth-user\` as identity. Tables that hold a person's data have \`owner_sub TEXT NOT NULL\`, and every query on them filters by it.
+- Secrets are names under \`secrets\` in the manifest; a person enters each value on the app's page. Never ask for a secret value in chat.
+- Set \`classification\` to \`internal\`, \`confidential\` or \`restricted\`, and store only what the feature needs.
+- To run the app locally with every binding, run \`python -m sandbox_runtime.conformance app-dev --entry <worker file>\` and follow its output.
+
 Dependency manifests, toolchain files and openinspect.app.json are checked after each turn and before every push.
 `;
 
@@ -336,24 +346,14 @@ describe("the shipped default policy", () => {
     }
   });
 
-  it("appends the injected data instructions after the categories", async () => {
-    const db = migratedDatabase();
-    try {
-      const renderDataInstructions = vi.fn(
-        () => "### Data for internal apps\nDeclare data in the manifest."
-      );
-      const policy = await new ApprovedComponentStore(db, {
-        renderDataInstructions,
-      }).compileForSession([{ repoOwner: "acme", repoName: "web" }], null);
-      expect(renderDataInstructions).toHaveBeenCalledWith(
-        expect.objectContaining({ stances: { d1: "preferred", kv: "allowed", r2: "allowed" } })
-      );
-      expect(policy?.instructions).toContain(
-        "- Do not use: **Next.js**, **React**.\n\n### Data for internal apps\nDeclare data in the manifest.\n\nDependency manifests"
-      );
-    } finally {
-      db.close();
-    }
+  it("leaves out the data block when no rule grades a data store", async () => {
+    const policy = await compileStackPolicy({
+      categories: [category("toolchain")],
+      components: [component("bun", { stance: "preferred" })],
+      repositories: SESSION_REPOSITORIES,
+      environmentId: null,
+    });
+    expect(policy!.instructions).not.toContain("### Data for internal apps");
   });
 
   it("grades data stores D1 preferred, KV and R2 allowed", async () => {

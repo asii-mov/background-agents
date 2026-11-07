@@ -21,6 +21,7 @@ import {
   type StackSignalKind,
 } from "@open-inspect/shared/types/stack-policy";
 import { sha256Hex } from "@open-inspect/shared/service-auth";
+import { renderDataInstructions } from "../app-data/model";
 import { resolveGovernanceScope } from "../db/governance-scope";
 
 export const STACK_POLICY_MAX_REMEDIATION_ATTEMPTS = 2;
@@ -53,15 +54,11 @@ export function stackRuleVerdict(component: ApprovedComponent): StackRuleVerdict
   }
 }
 
-/** Renders the data-store block (owned by the app-data module) from the compiled data stances. */
-export type RenderDataInstructions = (policy: DataStorePolicy) => string;
-
 export interface StackPolicyCompileInput {
   categories: readonly ComponentCategory[];
   components: readonly ApprovedComponent[];
   repositories: readonly RepositoryPair[];
   environmentId: string | null;
-  renderDataInstructions?: RenderDataInstructions;
 }
 
 /**
@@ -99,9 +96,7 @@ export async function compileStackPolicy(
       ];
     })
     .sort(compareRules);
-  const instructions = renderStackInstructions(categories, rules, {
-    renderDataInstructions: input.renderDataInstructions,
-  });
+  const instructions = renderStackInstructions(categories, rules);
   const body = {
     schemaVersion: STACK_POLICY_SCHEMA_VERSION,
     instructions,
@@ -135,18 +130,18 @@ export function dataStorePolicyFromRules(rules: readonly CompiledStackRule[]): D
  * Agent-facing operator text: deterministic and bounded. Preferences yield to the user and to the
  * repository's established choice; denials yield to nobody. Rule lines are never dropped. Only the
  * preferred entry carries guidance, and over the byte budget every guidance excerpt is capped at
- * the longest length that fits, so the longest are trimmed first.
+ * the longest length that fits, so the longest are trimmed first. When data stores are governed,
+ * the app-data block follows the categories, so launch, preview and export carry the same text.
  */
 export function renderStackInstructions(
   categories: ReadonlyMap<string, ComponentCategory>,
-  rules: readonly CompiledStackRule[],
-  options: { renderDataInstructions?: RenderDataInstructions } = {}
+  rules: readonly CompiledStackRule[]
 ): string {
   if (rules.length === 0) return "";
   const dataSection = rules.some((rule) =>
     rule.signals.some((signal) => signal.kind === "manifest")
   )
-    ? options.renderDataInstructions?.(dataStorePolicyFromRules(rules)).trim()
+    ? renderDataInstructions(dataStorePolicyFromRules(rules))
     : undefined;
   const render = (guidanceChars: number) =>
     renderWithGuidance(categories, rules, guidanceChars, dataSection);

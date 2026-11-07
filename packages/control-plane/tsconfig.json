@@ -21,5 +21,11 @@
     }
   },
   "include": ["src/**/*.ts"],
-  "exclude": ["node_modules", "src/**/*.test.ts", "src/**/test-helpers.ts", "src/node/**/*.ts"]
+  "exclude": [
+    "node_modules",
+    "src/**/*.test.ts",
+    "src/**/*.test-support.ts",
+    "src/**/test-helpers.ts",
+    "src/node/**/*.ts"
+  ]
 }

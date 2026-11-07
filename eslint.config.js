@@ -5,11 +5,13 @@ import reactHooksPlugin from "eslint-plugin-react-hooks";
 import eslintConfigPrettier from "eslint-config-prettier";
 import globals from "globals";
 
-// App hosting's internals (broker client, store, bundle parser) stay behind apps/index.
+// App hosting's internals (broker client, store, bundle parser) stay behind apps/index. Its ports
+// (apps/host) are public, so app-data/ can use them without importing the composition root.
 const appsInternalImports = [
   {
-    regex: "^(?:\\.\\.?/(?:.*/)?|@/)apps/(?!index(?:\\.[cm]?[jt]sx?)?$)",
-    message: "Import app hosting from apps/index; its modules are internal.",
+    regex: "^(?:\\.\\.?/(?:.*/)?|@/)apps/(?!(?:index|host)(?:\\.[cm]?[jt]sx?)?$)",
+    message:
+      "Import app hosting from apps/index (or its ports from apps/host); its modules are internal.",
   },
 ];
 
