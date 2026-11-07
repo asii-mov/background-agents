@@ -15,5 +15,5 @@
   },
   "include": ["**/*.ts", "../../src/**/*.ts"],
   // The Node host's adapters (src/node/**) belong to tsconfig.node.json.
-  "exclude": ["../../src/**/*.test.ts", "../../src/node/**/*.ts"]
+  "exclude": ["../../src/**/*.test.ts", "../../src/**/*.test-support.ts", "../../src/node/**/*.ts"]
 }

@@ -1,5 +1,6 @@
 import { APP_RESOURCE_PREFIX } from "@open-inspect/shared/app-broker";
 import type { HostingBackendKind } from "@open-inspect/shared/apps";
+import { DATA_JURISDICTIONS, type DataJurisdiction } from "@open-inspect/shared/types/app-data";
 
 /** The broker Worker's bindings, as Terraform sets them in the apps account. */
 export interface BrokerEnv {
@@ -31,10 +32,6 @@ export type HostingConfig =
       readonly namespace: string;
       readonly dispatcherService: string;
     };
-
-/** Cloudflare's data jurisdictions for D1 and R2. */
-export const DATA_JURISDICTIONS = ["eu", "fedramp"] as const;
-export type DataJurisdiction = (typeof DATA_JURISDICTIONS)[number];
 
 export interface BrokerConfig {
   readonly accountId: string;

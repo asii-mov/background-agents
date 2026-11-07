@@ -3,6 +3,7 @@ import { readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { appsFromEnv } from "./apps";
 import { checkAutofixQueueHealth } from "./autofix/queue-health";
 import { ApprovedComponentStore } from "./db/approved-components";
 import { SessionIndexStore } from "./db/session-index";
@@ -21,6 +22,7 @@ import {
 } from "./session/abandoned-draft-sweep";
 import type { SessionRuntimeClient } from "./session/runtime-client";
 import {
+  APP_DATA_PURGE_BATCH_SIZE,
   SCHEDULED_JOBS,
   SCHEDULER_TICK_CRON,
   findScheduledJob,
@@ -40,6 +42,7 @@ vi.mock("./scheduler/scheduler", () => ({
     return { tick: schedulerTick };
   }),
 }));
+vi.mock("./apps", () => ({ appsFromEnv: vi.fn() }));
 vi.mock("./db/stack-inventory", () => ({
   StackInventoryStore: vi.fn(function () {
     return { prune: inventoryPrune };
@@ -156,12 +159,47 @@ describe("SCHEDULED_JOBS", () => {
       findScheduledJob(ABANDONED_DRAFT_SWEEP_CRON)!.run(deps, 1_234_567)
     ).rejects.toThrow("sweep failed");
 
-    expect(deps.submitted.map((entry) => entry.name)).toEqual(["stack_observation_prune"]);
+    expect(deps.submitted.map((entry) => entry.name)).toEqual([
+      "stack_observation_prune",
+      "app_data_purge",
+    ]);
     expect(inventoryPrune).not.toHaveBeenCalled();
     await deps.submitted[0]!.task();
     const [db, catalogue] = vi.mocked(StackInventoryStore).mock.calls[0]!;
     expect(db).toBe(deps.db);
     expect(catalogue).toBeInstanceOf(ApprovedComponentStore);
     expect(inventoryPrune).toHaveBeenCalledWith(1_234_567);
+  });
+
+  it("purges retired app data in the background on the same slot, when hosting is configured", async () => {
+    const purgeDue = vi.fn(async () => ({ purged: 2, emptying: 1, failed: 0 }));
+    const deps = fakeDeps();
+    vi.mocked(appsFromEnv).mockReturnValueOnce({
+      ok: false,
+      failure: {
+        ok: false,
+        reason: "feature_unavailable",
+        message: "App hosting is not configured.",
+      },
+    });
+
+    await findScheduledJob(ABANDONED_DRAFT_SWEEP_CRON)!.run(deps, 1_234_567);
+    const purge = deps.submitted.find((entry) => entry.name === "app_data_purge")!;
+    await purge.task();
+    expect(appsFromEnv).toHaveBeenCalledWith(deps.env, deps.db);
+
+    vi.mocked(appsFromEnv).mockReturnValueOnce({
+      ok: true,
+      data: { purgeDue },
+    } as unknown as ReturnType<typeof appsFromEnv>);
+    await purge.task();
+    expect(purgeDue).toHaveBeenCalledOnce();
+    expect(purgeDue).toHaveBeenCalledWith(APP_DATA_PURGE_BATCH_SIZE);
+    expect(deps.log.info).toHaveBeenCalledWith("Purged retired app data", {
+      event: "app_data.purge_sweep",
+      purged: 2,
+      emptying: 1,
+      failed: 0,
+    });
   });
 });

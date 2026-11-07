@@ -39,6 +39,13 @@ export type AppStage = (typeof APP_STAGES)[number];
 /** D1 Time Travel window the platform restores within. */
 export const D1_POINT_IN_TIME_RECOVERY_DAYS = 30;
 
+/**
+ * Cloudflare's data jurisdictions for D1 and R2. The broker pins every create to the configured
+ * one, and the control plane keeps confidential and restricted data out of KV when one is set.
+ */
+export const DATA_JURISDICTIONS = ["eu", "fedramp"] as const;
+export type DataJurisdiction = (typeof DATA_JURISDICTIONS)[number];
+
 // ---- Names ------------------------------------------------------------------------------------
 
 /** A validated `env.<NAME>` key. Data bindings and secrets share this namespace. */
@@ -361,7 +368,11 @@ export interface AppDataResourceView {
   createdAt: number;
 }
 
-export type MigrationStatus = "blocked" | "approved" | "applied" | "failed";
+/**
+ * `applying` is written, with the bookmark, before a file is sent to D1, so a lost response is
+ * recognized and finished on the next deploy instead of running the file twice.
+ */
+export type MigrationStatus = "blocked" | "approved" | "applying" | "applied" | "failed";
 
 export interface AppDataMigrationView {
   binding: BindingName;

@@ -22,12 +22,7 @@ import {
   type UpdateComponentCategoryInput,
 } from "@open-inspect/shared/types/stack-policy";
 import { generateId } from "../auth/crypto";
-import {
-  compareText,
-  compileStackPolicy,
-  dataStorePolicyFromRules,
-  type RenderDataInstructions,
-} from "../stack-policy/compile";
+import { compareText, compileStackPolicy, dataStorePolicyFromRules } from "../stack-policy/compile";
 import { isUniqueConstraintError } from "./errors";
 import {
   findSessionRepository,
@@ -220,17 +215,9 @@ const COMPONENT_COLUMNS = `id, revision, name, kind, description, owner, locator
   source_url, documentation_url, usage, lifecycle, repo_scope, environment_scope, enabled,
   category_id, stance, source_kind, created_by, updated_by, created_at, updated_at`;
 
-export interface ApprovedComponentStoreOptions {
-  /** Appends the app-data block to the compiled instructions when data stores are governed. */
-  renderDataInstructions?: RenderDataInstructions;
-}
-
 /** The catalogue: categories, components and their detection signals, with one owner. */
 export class ApprovedComponentStore {
-  constructor(
-    private readonly db: SqlDatabase,
-    private readonly options: ApprovedComponentStoreOptions = {}
-  ) {}
+  constructor(private readonly db: SqlDatabase) {}
 
   async list(): Promise<ApprovedComponent[]> {
     const [components, signals] = await Promise.all([
@@ -510,7 +497,6 @@ export class ApprovedComponentStore {
       components,
       repositories,
       environmentId,
-      renderDataInstructions: this.options.renderDataInstructions,
     });
   }
 

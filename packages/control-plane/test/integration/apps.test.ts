@@ -291,24 +291,6 @@ describe("apps", () => {
       });
       expect(list.status).toBe(503);
     });
-
-    it("refuses declared data until app data is enabled", async () => {
-      await seedActiveUser(ALICE);
-      const { sessionName, token } = await sandboxSession(ALICE);
-      const broker = fakeBroker();
-
-      const response = await call(
-        deployRequest(sessionName, token, {
-          schemaVersion: 1,
-          name: "notes",
-          data: { DB: { kind: "d1" } },
-        })
-      );
-
-      expect(response.status).toBe(502);
-      await expect(response.json()).resolves.toMatchObject({ reason: "data_unavailable" });
-      expect(broker.fetchMock).not.toHaveBeenCalled();
-    });
   });
 
   describe("GET /apps", () => {

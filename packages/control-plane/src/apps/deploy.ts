@@ -26,6 +26,7 @@ import type {
   DataAdvisory,
   MigrationFile,
 } from "@open-inspect/shared/types/app-data";
+import { createAppDataService, type AppDataService } from "../app-data";
 import { AuthorizationError, AuthorizationService } from "../authorization/service";
 import { SessionIndexStore } from "../db/session-index";
 import type { SqlDatabase } from "../db/sql-database";
@@ -53,7 +54,7 @@ const RELAYED_MESSAGE_MAX_LENGTH = 2_000;
 
 export type DataActor = { kind: "user"; userId: string } | { kind: "system"; job: string };
 
-/** The app-data seam. Injected, so apps/ never imports app-data/. */
+/** The app-data seam. Deploy code depends only on this; the composition root wires the service. */
 export interface AppDataSeam {
   prepare(input: {
     app: {
@@ -500,63 +501,44 @@ export async function getApp(
   };
 }
 
-/**
- * Until app data is wired in, an app that declares data or secrets is refused rather than
- * deployed without the bindings its code expects.
- */
-const APP_DATA_NOT_ENABLED: AppDataSeam = {
-  async prepare({ app, manifest, migrations }) {
-    const declares =
-      manifest !== null && (Object.keys(manifest.data).length > 0 || manifest.secrets.length > 0);
-    if (declares || migrations.size > 0) {
-      return {
-        kind: "blocked",
-        reason: "data_unavailable",
-        message:
-          "App data and secrets are not enabled on this platform yet. Deploy without them, or tell the user.",
-      };
-    }
-    return {
-      kind: "ready",
-      bindings: {
-        appName: app.name,
-        stage: "production",
-        classification: manifest?.classification ?? "internal",
-        bindings: [],
-        dataDigest: "",
-      },
-      advisories: [],
-    };
-  },
-  async retire() {},
-};
-
 const globalFetch: FetchClient = { fetch: (input, init) => fetch(input, init) };
 
-/** The composition root routes use: hosting configuration, the broker client and the data seam. */
+/**
+ * The composition root routes and the purge sweep use: hosting configuration, the broker client,
+ * and app data on the same client. `data` is the full service; `deps.appData` is the same object
+ * seen through the deploy seam.
+ */
 export function appsFromEnv(
   env: EnvConfig,
   db: SqlDatabase,
   fetcher: FetchClient = globalFetch
-): { ok: true; deps: AppsDeps } | { ok: false; failure: AppDeployFailure } {
+): { ok: true; deps: AppsDeps; data: AppDataService } | { ok: false; failure: AppDeployFailure } {
   const availability = parseAppsConfig(env);
-  if (availability.kind === "available") {
-    const { config } = availability;
-    return {
-      ok: true,
-      deps: {
-        db,
-        appsDomain: config.appsDomain,
-        host: createBrokerClient({ config, fetch: fetcher }),
-        appData: APP_DATA_NOT_ENABLED,
-      },
-    };
-  }
+  const unavailable = {
+    ok: false,
+    failure: refusal("feature_unavailable", "App hosting is not configured."),
+  } as const;
+  if (availability.kind === "not_configured") return unavailable;
   if (availability.kind === "invalid") {
     log.error("App hosting is misconfigured", {
       event: "apps.misconfigured",
       problems: availability.problems,
     });
+    return unavailable;
   }
-  return { ok: false, failure: refusal("feature_unavailable", "App hosting is not configured.") };
+  const { config } = availability;
+  const host = createBrokerClient({ config, fetch: fetcher });
+  const data = createAppDataService({ db, host, env });
+  if (!data.ok) {
+    log.error("App hosting is misconfigured", {
+      event: "apps.misconfigured",
+      problems: data.problems,
+    });
+    return unavailable;
+  }
+  return {
+    ok: true,
+    deps: { db, appsDomain: config.appsDomain, host, appData: data.service },
+    data: data.service,
+  };
 }
