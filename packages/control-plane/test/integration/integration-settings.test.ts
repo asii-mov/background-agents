@@ -1,12 +1,12 @@
 import { describe, it, expect, beforeEach } from "vitest";
-import { SELF, env } from "cloudflare:test";
+import { SELF, createExecutionContext, env } from "cloudflare:test";
 import {
   DEFAULT_MAX_CONCURRENT_CHILD_SESSIONS,
   DEFAULT_MAX_TOTAL_CHILD_SESSIONS,
 } from "@open-inspect/shared/types/integrations";
 import { EnvironmentStore } from "../../src/db/environments";
 import { cleanD1Tables } from "./cleanup";
-import { serviceFetch } from "./helpers";
+import { routeRequest, serviceFetch, serviceRequestHeaders } from "./helpers";
 import { assignCustomRole } from "./ownership-test-helpers";
 
 describe("Integration settings API", () => {
@@ -685,6 +685,49 @@ describe("Integration settings API", () => {
       await expect(resolved.json()).resolves.toMatchObject({
         config: { networkPolicy: approvedPolicy, terminalEnabled: true },
       });
+    });
+
+    it("rejects tunnel ports at every settings level while tunnels are disabled", async () => {
+      await new EnvironmentStore(env.DB).create(
+        {
+          id: "env_tunnels",
+          owner_team_id: null,
+          name: "Env tunnels",
+          description: null,
+          prebuild_enabled: 0,
+          channel_associations: null,
+          created_at: Date.now(),
+          updated_at: Date.now(),
+        },
+        [{ position: 0, repo_owner: "acme", repo_name: "web", repo_id: 1, base_branch: "main" }]
+      );
+      const putWithTunnelsDisabled = async (path: string, settings: unknown) => {
+        const url = `https://test.local/integration-settings/sandbox${path}`;
+        const body = JSON.stringify({ settings });
+        const headers = await serviceRequestHeaders(url, { method: "PUT", body });
+        return routeRequest(
+          new Request(url, { method: "PUT", body, headers }),
+          { ...env, SANDBOX_TUNNELS_POLICY: "disabled" },
+          createExecutionContext()
+        );
+      };
+      const levels = [
+        { path: "", settings: (s: object) => ({ defaults: s }) },
+        { path: "/repos/acme/widgets", settings: (s: object) => s },
+        { path: "/environments/env_tunnels", settings: (s: object) => s },
+      ];
+
+      for (const { path, settings } of levels) {
+        const refused = await putWithTunnelsDisabled(path, settings({ tunnelPorts: [3000] }));
+        expect(refused.status).toBe(400);
+        await expect(refused.json()).resolves.toEqual({
+          error:
+            "Public preview tunnels are disabled in this workspace. Deploy with the deploy-app tool instead.",
+        });
+        for (const allowed of [{ tunnelPorts: [] }, { terminalEnabled: true }]) {
+          expect((await putWithTunnelsDisabled(path, settings(allowed))).status).toBe(200);
+        }
+      }
     });
 
     it("PUT /integration-settings/sandbox with invalid tunnelPorts returns 400", async () => {

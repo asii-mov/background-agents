@@ -26,7 +26,7 @@ import {
 } from "@open-inspect/shared/types/integrations";
 import { checkHarnessCompatibility, type HarnessId } from "@open-inspect/shared/harnesses";
 import { isValidModel, isValidReasoningEffort } from "@open-inspect/shared/models";
-import { normalizeSandboxSettings } from "../sandbox/settings";
+import { normalizeSandboxSettings, type SandboxTunnelsPolicy } from "../sandbox/settings";
 import type { SqlDatabase } from "./sql-database";
 
 type SettingsLevel = "global" | "repo";
@@ -44,6 +44,11 @@ export class IntegrationSettingsValidationError extends Error {
     super(message);
     this.name = "IntegrationSettingsValidationError";
   }
+}
+
+export interface SettingsWriteOptions {
+  /** Deployment tunnel policy for sandbox writes. Defaults to "public". */
+  tunnelsPolicy?: SandboxTunnelsPolicy;
 }
 
 const VALID_INTEGRATION_IDS = new Set<string>(INTEGRATION_DEFINITIONS.map((d) => d.id));
@@ -114,7 +119,8 @@ export class IntegrationSettingsStore {
 
   async setGlobal<K extends keyof IntegrationSettingsMap>(
     integrationId: K,
-    settings: IntegrationSettingsMap[K]["global"]
+    settings: IntegrationSettingsMap[K]["global"],
+    options: SettingsWriteOptions = {}
   ): Promise<void> {
     settings = parseSettings(
       getIntegrationGlobalSettingsSchema(integrationId),
@@ -138,7 +144,12 @@ export class IntegrationSettingsStore {
     if (settings.defaults) {
       settings = {
         ...settings,
-        defaults: this.validateAndNormalizeSettings(integrationId, settings.defaults, "global"),
+        defaults: this.validateAndNormalizeSettings(
+          integrationId,
+          settings.defaults,
+          "global",
+          options
+        ),
       };
     }
 
@@ -185,14 +196,20 @@ export class IntegrationSettingsStore {
   async setRepoSettings<K extends keyof IntegrationSettingsMap>(
     integrationId: K,
     repo: string,
-    settings: IntegrationSettingsMap[K]["repo"]
+    settings: IntegrationSettingsMap[K]["repo"],
+    options: SettingsWriteOptions = {}
   ): Promise<void> {
     const structurallyValid = parseSettings(
       getIntegrationRepoSettingsSchema(integrationId),
       settings,
       "Repo integration settings"
     );
-    const normalized = this.validateAndNormalizeSettings(integrationId, structurallyValid, "repo");
+    const normalized = this.validateAndNormalizeSettings(
+      integrationId,
+      structurallyValid,
+      "repo",
+      options
+    );
 
     const now = Date.now();
     await this.db
@@ -267,14 +284,20 @@ export class IntegrationSettingsStore {
   async setEnvironmentSettings<K extends EnvironmentSettingsIntegrationId>(
     integrationId: K,
     environmentId: string,
-    settings: IntegrationSettingsMap[K]["repo"]
+    settings: IntegrationSettingsMap[K]["repo"],
+    options: SettingsWriteOptions = {}
   ): Promise<void> {
     const structurallyValid = parseSettings(
       getIntegrationRepoSettingsSchema(integrationId),
       settings,
       "Environment integration settings"
     );
-    const normalized = this.validateAndNormalizeSettings(integrationId, structurallyValid, "repo");
+    const normalized = this.validateAndNormalizeSettings(
+      integrationId,
+      structurallyValid,
+      "repo",
+      options
+    );
 
     const now = Date.now();
     await this.db
@@ -381,7 +404,8 @@ export class IntegrationSettingsStore {
   >(
     integrationId: K,
     settings: IntegrationSettingsAtLevel<K, L>,
-    level: L
+    level: L,
+    options: SettingsWriteOptions
   ): IntegrationSettingsAtLevel<K, L> {
     if (integrationId === "github") {
       return this.validateAndNormalizeGitHubSettings(
@@ -406,6 +430,7 @@ export class IntegrationSettingsStore {
         invalid: "throw",
         createError: (message) => new IntegrationSettingsValidationError(message),
         partial: level !== "global",
+        tunnelsPolicy: options.tunnelsPolicy,
       }) as IntegrationSettingsAtLevel<K, L>;
     }
 

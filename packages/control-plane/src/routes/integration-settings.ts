@@ -21,6 +21,7 @@ import {
   IntegrationSettingsValidationError,
   isValidIntegrationId,
   supportsEnvironmentSettings,
+  type SettingsWriteOptions,
 } from "../db/integration-settings";
 import { Hono } from "hono";
 import { EnvironmentStore } from "../db/environments";
@@ -30,6 +31,7 @@ import type { SqlDatabase } from "../db/sql-database";
 import { createLogger } from "../logger";
 import { admit, dispatch } from "../routing/admit";
 import type { ControlPlaneHonoEnv } from "../routing/hono-env";
+import { parseSandboxTunnelsPolicy } from "../sandbox/settings";
 import { repositoryParams } from "./repository-params";
 import {
   type RequestContext,
@@ -44,6 +46,10 @@ import {
 import { parseJsonBody } from "./body";
 
 const logger = createLogger("router:integration-settings");
+
+function sandboxWriteOptions(env: Env): SettingsWriteOptions {
+  return { tunnelsPolicy: parseSandboxTunnelsPolicy(env.SANDBOX_TUNNELS_POLICY) };
+}
 
 function sandboxNetworkPolicy(
   settings: Record<string, unknown> | null,
@@ -173,7 +179,7 @@ async function handleSetIntegrationSettings(
       );
       if (denied) return denied;
     }
-    await store.setGlobal(id, settings);
+    await store.setGlobal(id, settings, sandboxWriteOptions(env));
 
     logger.info("integration_settings.updated", {
       event: "integration_settings.updated",
@@ -304,7 +310,7 @@ async function handleSetRepoSettings(
       );
       if (denied) return denied;
     }
-    await store.setRepoSettings(id, repo, settings);
+    await store.setRepoSettings(id, repo, settings, sandboxWriteOptions(env));
 
     logger.info("integration_repo_settings.updated", {
       event: "integration_repo_settings.updated",
@@ -416,7 +422,12 @@ async function handleSetEnvironmentSettings(
       );
       if (denied) return denied;
     }
-    await store.setEnvironmentSettings(integrationId, environmentId, settings);
+    await store.setEnvironmentSettings(
+      integrationId,
+      environmentId,
+      settings,
+      sandboxWriteOptions(env)
+    );
 
     logger.info("integration_environment_settings.updated", {
       event: "integration_environment_settings.updated",
