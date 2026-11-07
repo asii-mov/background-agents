@@ -1,0 +1,59 @@
+name: Stack policy check
+description: >-
+  Fails a pull request that introduces technology the organization denies. Runs the same check
+  the Open-Inspect sandbox runs before every push, so a raw git push meets the same verdict.
+
+inputs:
+  policy-file:
+    description: Stack policy export (GET /stack-policy/export), relative to the workspace.
+    required: true
+  base:
+    description: Commit the pull request merges into.
+    default: ${{ github.event.pull_request.base.sha }}
+  head:
+    description: Commit under review.
+    default: ${{ github.event.pull_request.head.sha }}
+  repository:
+    description: owner/name that selects repository-scoped rules.
+    default: ${{ github.repository }}
+
+outputs:
+  report:
+    description: Path to the JSON report.
+    value: ${{ steps.check.outputs.report }}
+
+runs:
+  using: composite
+  steps:
+    - name: Setup uv
+      uses: astral-sh/setup-uv@v7
+      with:
+        version: "0.9.7"
+
+    - name: Install the checker
+      shell: bash
+      env:
+        UV_NO_CONFIG: "1"
+        UV_PROJECT_ENVIRONMENT: ${{ runner.temp }}/stack-policy-check-venv
+      # The checker never imports the agent SDK, whose wheel bundles the claude binary.
+      run: >-
+        uv sync --frozen --python 3.12 --no-install-package claude-agent-sdk
+        --project "$GITHUB_ACTION_PATH/../../../packages/sandbox-runtime"
+
+    - name: Check the stack policy
+      id: check
+      shell: bash
+      env:
+        UV_NO_CONFIG: "1"
+        UV_PROJECT_ENVIRONMENT: ${{ runner.temp }}/stack-policy-check-venv
+        POLICY_FILE: ${{ inputs.policy-file }}
+        BASE_SHA: ${{ inputs.base }}
+        HEAD_SHA: ${{ inputs.head }}
+        REPOSITORY: ${{ inputs.repository }}
+      run: |
+        report="$RUNNER_TEMP/stack-policy-report.json"
+        echo "report=$report" >> "$GITHUB_OUTPUT"
+        uv run --frozen --no-sync --project "$GITHUB_ACTION_PATH/../../../packages/sandbox-runtime" \
+          python -m sandbox_runtime.stack_policy_cli check --format github \
+          --policy "$POLICY_FILE" --base "$BASE_SHA" --head "$HEAD_SHA" --repo "$REPOSITORY" \
+          > "$report"

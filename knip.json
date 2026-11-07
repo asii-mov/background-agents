@@ -25,6 +25,10 @@
       "project": ["scripts/**/*.ts", "packages/sandbox-runtime/src/sandbox_runtime/**/*.{js,ts}"],
       "ignoreDependencies": ["@opencode-ai/plugin", "database", "loser", "survivor", "zod"]
     },
+    "packages/app-broker": {
+      "entry": ["src/index.ts", "guard/guard.ts", "dispatcher/dispatcher.ts", "test/**/*.test.ts"],
+      "project": ["{src,guard,dispatcher,test,scripts}/**/*.ts"]
+    },
     "packages/shared": {
       "project": ["src/**/*.ts"],
       "ignoreIssues": {
