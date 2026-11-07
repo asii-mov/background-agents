@@ -47,7 +47,7 @@ The browser test records the pipeline definition but does not execute it in a sa
 work with `packages/control-plane/test/integration/security-pipelines.test.ts`,
 `packages/control-plane/src/sandbox/lifecycle/manager.test.ts`, and
 `packages/sandbox-runtime/tests/test_security_pipeline.py`. Run `test_bridge_sse.py` and
-`test_bridge_push.py` for bridge orchestration and push blocking.
+`test_push_operation.py` for bridge orchestration and push blocking.
 
 The browser test saves repository criticality but does not prove PR draft enforcement. Run
 `packages/control-plane/src/risk/change-risk.test.ts`,

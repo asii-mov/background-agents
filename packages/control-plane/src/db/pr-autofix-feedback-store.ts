@@ -1,7 +1,8 @@
 import type { GitHubAutofixEnvelope } from "@open-inspect/shared";
 import type { SqlDatabase } from "./sql-database";
+import { visibleSessionsPredicate } from "./session-visibility";
 
-export type PrAutofixDecision = "received" | "queued" | "skipped" | "failed";
+type PrAutofixDecision = "received" | "queued" | "skipped" | "failed";
 
 export interface PrAutofixFeedbackRecord {
   feedbackKey: string;
@@ -88,14 +89,19 @@ interface ActivityCursor {
   feedbackKey: string;
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
 function encodeActivityCursor(cursor: ActivityCursor): string {
   return btoa(JSON.stringify(cursor));
 }
 
 function decodeActivityCursor(cursor: string): ActivityCursor {
   try {
-    const value = JSON.parse(atob(cursor)) as Partial<ActivityCursor>;
+    const value = JSON.parse(atob(cursor));
     if (
+      !isRecord(value) ||
       typeof value.lastReceivedAt !== "number" ||
       !Number.isFinite(value.lastReceivedAt) ||
       typeof value.feedbackKey !== "string" ||
@@ -169,24 +175,27 @@ export class PrAutofixFeedbackStore {
     limit: number;
     cursor: string | null;
   }): Promise<{ records: PrAutofixFeedbackRecord[]; nextCursor: string | null }> {
+    // Deleted sessions set feedback.session_id to NULL; unattached rows retain PR metadata.
     const cursor = options.cursor ? decodeActivityCursor(options.cursor) : null;
-    const statement = cursor
-      ? this.db
-          .prepare(
-            `SELECT * FROM pr_autofix_feedback
-             WHERE last_received_at < ?
-                OR (last_received_at = ? AND feedback_key < ?)
-             ORDER BY last_received_at DESC, feedback_key DESC
-             LIMIT ?`
-          )
-          .bind(cursor.lastReceivedAt, cursor.lastReceivedAt, cursor.feedbackKey, options.limit + 1)
-      : this.db
-          .prepare(
-            `SELECT * FROM pr_autofix_feedback
-             ORDER BY last_received_at DESC, feedback_key DESC
-             LIMIT ?`
-          )
-          .bind(options.limit + 1);
+    const visibility = visibleSessionsPredicate(
+      "s",
+      { kind: "service", teamId: null },
+      { mode: "on", excludePrivate: true }
+    );
+    const statement = this.db
+      .prepare(
+        `SELECT f.* FROM pr_autofix_feedback f
+         LEFT JOIN sessions s ON s.id = f.session_id
+         WHERE (f.session_id IS NULL OR (s.id IS NOT NULL AND (${visibility.sql})))
+           ${cursor ? "AND (f.last_received_at < ? OR (f.last_received_at = ? AND f.feedback_key < ?))" : ""}
+         ORDER BY f.last_received_at DESC, f.feedback_key DESC
+         LIMIT ?`
+      )
+      .bind(
+        ...visibility.params,
+        ...(cursor ? [cursor.lastReceivedAt, cursor.lastReceivedAt, cursor.feedbackKey] : []),
+        options.limit + 1
+      );
     const result = await statement.all<PrAutofixFeedbackRow>();
     const hasMore = result.results.length > options.limit;
     const rows = hasMore ? result.results.slice(0, options.limit) : result.results;

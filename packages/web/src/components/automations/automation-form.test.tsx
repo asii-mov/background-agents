@@ -1,12 +1,14 @@
 // @vitest-environment jsdom
 /// <reference types="@testing-library/jest-dom" />
 
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import * as matchers from "@testing-library/jest-dom/matchers";
 import type { ReactNode } from "react";
 import { MAX_AUTOMATION_REPOSITORIES } from "@open-inspect/shared/types/automations";
 import { DEFAULT_MODEL } from "@open-inspect/shared/models";
+import { DEFAULT_HARNESS } from "@open-inspect/shared/harnesses";
 import { AutomationForm, type AutomationFormValues } from "./automation-form";
 import { CronPicker } from "./cron-picker";
 
@@ -44,8 +46,27 @@ let environmentsValue: Array<{
   id: string;
   name: string;
   repositories: Array<{ repoOwner: string; repoName: string }>;
+  capabilities?: { canUse: boolean };
 }> = [];
+const scopeMocks = vi.hoisted(() => ({
+  repos: vi.fn(),
+  environments: vi.fn(),
+  allowWorkspace: true,
+}));
+vi.mock("@/hooks/use-resource-teams", () => ({
+  useResourceTeams: () => ({
+    teams: [
+      { id: "team-1", name: "Engineering" },
+      { id: "team-2", name: "Design" },
+    ],
+    allTeams: [],
+    loading: false,
+    error: null,
+    allowWorkspace: scopeMocks.allowWorkspace,
+  }),
+}));
 beforeEach(() => {
+  scopeMocks.allowWorkspace = true;
   enabledModelsValue = ["openai/gpt-5.4"];
   loadingModelsValue = false;
   environmentsValue = [];
@@ -57,17 +78,17 @@ beforeEach(() => {
 });
 
 vi.mock("@/hooks/use-repos", () => ({
-  useRepos: () => ({
-    repos: reposValue,
-    loading: false,
-  }),
+  useRepos: (enabled: boolean, teamId: string | null) => {
+    scopeMocks.repos(enabled, teamId);
+    return { repos: reposValue, loading: false };
+  },
 }));
 
 vi.mock("@/hooks/use-environments", () => ({
-  useEnvironments: () => ({
-    environments: environmentsValue,
-    loading: false,
-  }),
+  useEnvironments: (teamId: string | null) => {
+    scopeMocks.environments(teamId);
+    return { environments: environmentsValue, loading: false };
+  },
 }));
 
 vi.mock("@/hooks/use-branches", () => ({
@@ -112,7 +133,94 @@ const singleRepository = [
 const openRepositoryPicker = () =>
   fireEvent.click(screen.getByRole("button", { name: "Repository Configuration" }));
 
+beforeAll(() => {
+  // Radix Select uses pointer capture, which jsdom lacks.
+  Element.prototype.hasPointerCapture = () => false;
+  Element.prototype.releasePointerCapture = () => {};
+  Element.prototype.scrollIntoView = vi.fn();
+});
+
+async function chooseTeam(user: ReturnType<typeof userEvent.setup>, name: string) {
+  await user.click(screen.getByRole("combobox", { name: "Team" }));
+  await user.click(await screen.findByRole("option", { name }));
+}
+
 describe("automation cron submission", () => {
+  it("scopes creation targets and clears selections when the team changes", async () => {
+    const user = userEvent.setup();
+    environmentsValue = [
+      {
+        id: "env-draft",
+        name: "Draft environment",
+        repositories: [],
+        capabilities: { canUse: true },
+      },
+    ];
+    const onSubmit = vi.fn();
+    const { container } = render(
+      <AutomationForm
+        mode="create"
+        submitting={false}
+        onSubmit={onSubmit}
+        initialValues={{
+          name: "Review",
+          instructions: "Review code",
+          repositories: singleRepository,
+          environmentIds: [],
+          teamId: "team-1",
+        }}
+      />
+    );
+    expect(scopeMocks.repos).toHaveBeenLastCalledWith(true, "team-1");
+    expect(scopeMocks.environments).toHaveBeenLastCalledWith({ ownerTeamId: "team-1" });
+    openRepositoryPicker();
+    fireEvent.click(screen.getByRole("button", { name: "Select Multiple" }));
+    fireEvent.click(screen.getByRole("checkbox", { name: /Draft environment/ }));
+    await chooseTeam(user, "Design");
+    expect(scopeMocks.repos).toHaveBeenLastCalledWith(true, "team-2");
+    expect(scopeMocks.environments).toHaveBeenLastCalledWith({ ownerTeamId: "team-2" });
+    fireEvent.submit(container.querySelector("form")!);
+    expect(onSubmit).toHaveBeenCalledWith(
+      expect.objectContaining({ teamId: "team-2", repositories: [], environmentIds: [] })
+    );
+    scopeMocks.allowWorkspace = false;
+    await chooseTeam(user, "Workspace (no team)");
+    expect(screen.getByRole("button", { name: "Create Automation" })).toBeDisabled();
+    fireEvent.submit(container.querySelector("form")!);
+    expect(onSubmit).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(["team-1", null])("keeps owner %s read-only and omits edit ownership", (teamId) => {
+    scopeMocks.allowWorkspace = false;
+    const onSubmit = vi.fn();
+    const { container } = render(
+      <AutomationForm
+        mode="edit"
+        submitting={false}
+        onSubmit={onSubmit}
+        initialValues={{
+          name: "Review",
+          instructions: "Review code",
+          teamId,
+          repositories: singleRepository,
+        }}
+      />
+    );
+    expect(screen.getByRole("combobox", { name: "Team" })).toBeDisabled();
+    expect(screen.getByRole("combobox", { name: "Team" })).toHaveTextContent(
+      teamId ? "Engineering" : "Workspace (no team)"
+    );
+    fireEvent.submit(container.querySelector("form")!);
+    expect(onSubmit).toHaveBeenCalledTimes(1);
+    expect(onSubmit.mock.calls[0][0]).not.toHaveProperty("teamId");
+    expect(onSubmit.mock.calls[0][0].repositories).toEqual(singleRepository);
+  });
+
+  it("requests workspace-owned environments for a workspace automation", () => {
+    render(<AutomationForm mode="create" submitting={false} onSubmit={vi.fn()} />);
+    expect(scopeMocks.environments).toHaveBeenLastCalledWith({ ownerTeamId: null });
+  });
+
   it("locks provider authentication while submitting", () => {
     const props = {
       mode: "create" as const,
@@ -283,11 +391,171 @@ describe("automation cron submission", () => {
     );
 
     expect(screen.getByRole("button", { name: "Create Automation" })).toBeDisabled();
+    expect(screen.getByText("Event type is required.")).toBeInTheDocument();
 
     fireEvent.submit(container.querySelector("form")!);
 
-    expect(screen.getByText("Event type is required.")).toBeInTheDocument();
     expect(onSubmit).not.toHaveBeenCalled();
+  });
+
+  it("drops conditions the newly picked event type cannot answer, and says which", () => {
+    const onSubmit = vi.fn();
+    const { container } = render(
+      <AutomationForm
+        mode="edit"
+        submitting={false}
+        onSubmit={onSubmit}
+        initialValues={{
+          name: "CI watcher",
+          repositories: singleRepository,
+          model: "openai/gpt-5.4",
+          instructions: "Look at the failing workflow.",
+          triggerType: "github_event",
+          eventType: "workflow_run.completed",
+          triggerConfig: {
+            conditions: [{ type: "workflow_name", operator: "eq", value: "CI" }],
+          },
+        }}
+      />
+    );
+
+    expect(screen.getByPlaceholderText(/Exact workflow name/)).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("combobox", { name: "Event Type" }));
+    fireEvent.click(within(screen.getByRole("listbox")).getByRole("option", { name: /PR Opened/ }));
+
+    expect(screen.queryByPlaceholderText(/Exact workflow name/)).not.toBeInTheDocument();
+    expect(screen.getByRole("status")).toHaveTextContent(
+      "Removed Workflow Name — not available for this event type."
+    );
+
+    fireEvent.submit(container.querySelector("form")!);
+
+    expect(onSubmit).toHaveBeenCalledTimes(1);
+    expect(onSubmit.mock.calls[0][0]).toMatchObject({
+      eventType: "pull_request.opened",
+      triggerConfig: { conditions: [] },
+    });
+  });
+
+  it("restores conditions when switching back to a compatible GitHub event", () => {
+    render(
+      <AutomationForm
+        mode="edit"
+        submitting={false}
+        onSubmit={vi.fn()}
+        initialValues={{
+          name: "CI watcher",
+          repositories: singleRepository,
+          model: "openai/gpt-5.4",
+          instructions: "Look at the failing workflow.",
+          triggerType: "github_event",
+          eventType: "workflow_run.completed",
+          triggerConfig: {
+            conditions: [{ type: "workflow_name", operator: "eq", value: "CI" }],
+          },
+        }}
+      />
+    );
+
+    fireEvent.click(screen.getByRole("combobox", { name: "Event Type" }));
+    fireEvent.click(within(screen.getByRole("listbox")).getByRole("option", { name: /PR Opened/ }));
+    expect(screen.queryByPlaceholderText(/Exact workflow name/)).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("combobox", { name: "Event Type" }));
+    fireEvent.click(
+      within(screen.getByRole("listbox")).getByRole("option", { name: /Workflow Run Completed/ })
+    );
+
+    expect(screen.getByPlaceholderText(/Exact workflow name/)).toHaveValue("CI");
+    expect(screen.queryByRole("status")).not.toBeInTheDocument();
+  });
+
+  it("drops and restores conclusions based on event-specific values", () => {
+    const onSubmit = vi.fn();
+    const { container } = render(
+      <AutomationForm
+        mode="edit"
+        submitting={false}
+        onSubmit={onSubmit}
+        initialValues={{
+          name: "Check suite watcher",
+          repositories: singleRepository,
+          model: "openai/gpt-5.4",
+          instructions: "Inspect failed check suites.",
+          triggerType: "github_event",
+          eventType: "check_suite.completed",
+          triggerConfig: {
+            conditions: [{ type: "conclusion", operator: "eq", value: "startup_failure" }],
+          },
+        }}
+      />
+    );
+
+    expect(screen.getAllByText("startup_failure").length).toBeGreaterThan(0);
+
+    fireEvent.click(screen.getByRole("combobox", { name: "Event Type" }));
+    fireEvent.click(
+      within(screen.getByRole("listbox")).getByRole("option", { name: /Workflow Run Completed/ })
+    );
+    expect(screen.getByRole("status")).toHaveTextContent(
+      "Removed Conclusion — not available for this event type."
+    );
+
+    fireEvent.click(screen.getByText("Add condition..."));
+    fireEvent.click(
+      within(screen.getByRole("listbox")).getByRole("option", { name: "Conclusion" })
+    );
+    const conclusionSelect = screen
+      .getAllByRole("combobox")
+      .find((element) => element.textContent?.includes("success"));
+    expect(conclusionSelect).toBeDefined();
+    fireEvent.click(conclusionSelect!);
+    fireEvent.click(within(screen.getByRole("listbox")).getByRole("option", { name: "failure" }));
+
+    fireEvent.click(screen.getByRole("combobox", { name: "Event Type" }));
+    fireEvent.click(
+      within(screen.getByRole("listbox")).getByRole("option", { name: /Check Suite Completed/ })
+    );
+
+    expect(screen.queryByRole("status")).not.toBeInTheDocument();
+
+    fireEvent.submit(container.querySelector("form")!);
+    expect(onSubmit).toHaveBeenCalledTimes(1);
+    expect(onSubmit.mock.calls[0][0]).toMatchObject({
+      eventType: "check_suite.completed",
+      triggerConfig: {
+        conditions: [{ type: "conclusion", operator: "eq", value: "failure" }],
+      },
+    });
+  });
+
+  it("clears active and dropped conditions when changing trigger source", () => {
+    render(
+      <AutomationForm
+        mode="create"
+        submitting={false}
+        onSubmit={vi.fn()}
+        initialValues={{
+          name: "CI watcher",
+          repositories: singleRepository,
+          model: "openai/gpt-5.4",
+          instructions: "Look at the failing workflow.",
+          triggerType: "github_event",
+          eventType: "workflow_run.completed",
+          triggerConfig: {
+            conditions: [{ type: "workflow_name", operator: "eq", value: "CI" }],
+          },
+        }}
+      />
+    );
+
+    expect(screen.getByPlaceholderText(/Exact workflow name/)).toHaveValue("CI");
+
+    fireEvent.click(screen.getByRole("radio", { name: /^Sentry / }));
+
+    expect(screen.queryByPlaceholderText(/Exact workflow name/)).not.toBeInTheDocument();
+    expect(screen.queryByRole("status")).not.toBeInTheDocument();
   });
 
   it("submits triggerConfig with empty conditions for non-schedule automations", () => {
@@ -316,6 +584,30 @@ describe("automation cron submission", () => {
       triggerConfig: { conditions: [] },
     });
   });
+
+  it("renders condition validation errors beside the condition builder", () => {
+    render(
+      <AutomationForm
+        mode="edit"
+        submitting={false}
+        onSubmit={vi.fn()}
+        initialValues={{
+          name: "Review PRs",
+          repositories: singleRepository,
+          model: "openai/gpt-5.4",
+          instructions: "Review incoming PRs.",
+          triggerType: "github_event",
+          eventType: "pull_request.opened",
+          triggerConfig: {
+            conditions: [{ type: "branch", operator: "glob_match", value: [] }],
+          },
+        }}
+      />
+    );
+
+    expect(screen.getByText("At least one branch pattern required")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Save Changes" })).toBeDisabled();
+  });
 });
 
 describe("environment binding", () => {
@@ -329,11 +621,63 @@ describe("environment binding", () => {
   const fullstackEnvironment = {
     id: "env_1",
     name: "Fullstack",
+    capabilities: { canUse: true },
     repositories: [
       { repoOwner: "acme", repoName: "web-app" },
       { repoOwner: "acme", repoName: "api" },
     ],
   };
+
+  it.each([undefined, false])(
+    "permits unchanged and cleared edits but blocks changed targets without canUse %s",
+    (canUse) => {
+      const capabilities = canUse === undefined ? undefined : { canUse };
+      environmentsValue = [
+        { ...fullstackEnvironment, capabilities },
+        { ...fullstackEnvironment, id: "env_2", name: "Data", capabilities },
+      ];
+      const onSubmit = vi.fn();
+      const { container } = render(
+        <AutomationForm
+          mode="edit"
+          submitting={false}
+          onSubmit={onSubmit}
+          initialValues={{ ...scheduleBase, environmentIds: ["env_1", "env_2"] }}
+        />
+      );
+      openRepositoryPicker();
+      expect(screen.getByRole("checkbox", { name: /Fullstack/ })).toBeDisabled();
+      expect(screen.getByRole("button", { name: "Save Changes" })).toBeEnabled();
+      fireEvent.submit(container.querySelector("form")!);
+      expect(onSubmit).toHaveBeenLastCalledWith(
+        expect.objectContaining({ environmentIds: ["env_1", "env_2"] })
+      );
+      fireEvent.click(screen.getByRole("button", { name: "Select One" }));
+      expect(screen.getByRole("button", { name: "Save Changes" })).toBeDisabled();
+      fireEvent.submit(container.querySelector("form")!);
+      expect(onSubmit).toHaveBeenCalledTimes(1);
+      fireEvent.click(screen.getByRole("button", { name: "No repository" }));
+      expect(screen.getByRole("button", { name: "Save Changes" })).toBeEnabled();
+      fireEvent.submit(container.querySelector("form")!);
+      expect(onSubmit).toHaveBeenLastCalledWith(expect.objectContaining({ environmentIds: [] }));
+    }
+  );
+
+  it("does not exempt prefilled creation targets from use permission", () => {
+    environmentsValue = [{ ...fullstackEnvironment, capabilities: { canUse: false } }];
+    const onSubmit = vi.fn();
+    const { container } = render(
+      <AutomationForm
+        mode="create"
+        submitting={false}
+        onSubmit={onSubmit}
+        initialValues={{ ...scheduleBase, environmentIds: ["env_1"] }}
+      />
+    );
+    expect(screen.getByRole("button", { name: "Create Automation" })).toBeDisabled();
+    fireEvent.submit(container.querySelector("form")!);
+    expect(onSubmit).not.toHaveBeenCalled();
+  });
 
   it("submits the selected environment in single-select mode", () => {
     environmentsValue = [fullstackEnvironment];
@@ -492,7 +836,12 @@ describe("environment binding", () => {
   it("preserves hydrated multi-environment selections on untouched edits", () => {
     environmentsValue = [
       fullstackEnvironment,
-      { id: "env_2", name: "Data", repositories: [{ repoOwner: "acme", repoName: "data" }] },
+      {
+        id: "env_2",
+        name: "Data",
+        repositories: [{ repoOwner: "acme", repoName: "data" }],
+        capabilities: { canUse: true },
+      },
     ];
     const onSubmit = vi.fn();
     const { container } = render(
@@ -835,6 +1184,44 @@ describe("slack_event automation", () => {
     expect(screen.getByText(/require at least one Slack Channel/)).toBeInTheDocument();
   });
 
+  it("shows the Slack channel message only when it is the policy failure", () => {
+    render(
+      <AutomationForm
+        mode="edit"
+        submitting={false}
+        onSubmit={vi.fn()}
+        initialValues={{
+          ...slackBase,
+          name: "",
+          triggerConfig: { conditions: [] },
+        }}
+      />
+    );
+
+    expect(screen.queryByText(/require at least one Slack Channel/)).not.toBeInTheDocument();
+  });
+
+  it("explains why an empty slack_channel condition cannot be submitted", () => {
+    render(
+      <AutomationForm
+        mode="edit"
+        submitting={false}
+        onSubmit={vi.fn()}
+        initialValues={{
+          ...slackBase,
+          triggerConfig: {
+            conditions: [{ type: "slack_channel", operator: "any_of", value: [] }],
+          },
+        }}
+      />
+    );
+
+    expect(screen.getByRole("button", { name: "Save Changes" })).toBeDisabled();
+    expect(
+      screen.getByText("Slack Channel requires at least one nonblank channel ID")
+    ).toBeInTheDocument();
+  });
+
   it("submits a valid slack_event", () => {
     const onSubmit = vi.fn();
     const { container } = render(
@@ -995,5 +1382,104 @@ describe("model normalization", () => {
       />
     );
     expect(screen.getByRole("button", { name: "Save Changes" })).toBeDisabled();
+  });
+});
+
+describe("agent harness", () => {
+  const baseInitialValues = {
+    name: "Daily review",
+    repositories: singleRepository,
+    model: "openai/gpt-5.4",
+    scheduleCron: "0 9 * * *",
+    scheduleTz: "UTC",
+    instructions: "Review the repo.",
+    triggerType: "schedule" as const,
+  };
+
+  const renderForm = (initialValues: Partial<AutomationFormValues>, mode: "create" | "edit") => {
+    const onSubmit = vi.fn();
+    const { container } = render(
+      <AutomationForm
+        mode={mode}
+        submitting={false}
+        onSubmit={onSubmit}
+        initialValues={{ ...baseInitialValues, ...initialValues }}
+      />
+    );
+    return { onSubmit, submit: () => fireEvent.submit(container.querySelector("form")!) };
+  };
+
+  it("submits the built-in harness when none was chosen", () => {
+    const { onSubmit, submit } = renderForm({}, "create");
+    expect(screen.getByRole("combobox", { name: "Agent harness" })).toHaveTextContent("OpenCode");
+
+    submit();
+
+    expect(onSubmit.mock.calls[0][0]).toMatchObject({
+      harness: DEFAULT_HARNESS,
+      model: "openai/gpt-5.4",
+    });
+  });
+
+  it("loads an existing automation's harness and keeps the model inside it", () => {
+    enabledModelsValue = ["openai/gpt-5.4", DEFAULT_MODEL];
+    const { onSubmit, submit } = renderForm({ harness: "claude" }, "edit");
+    expect(screen.getByRole("combobox", { name: "Agent harness" })).toHaveTextContent(
+      "Claude Agent"
+    );
+
+    submit();
+
+    expect(onSubmit.mock.calls[0][0]).toMatchObject({ harness: "claude", model: DEFAULT_MODEL });
+  });
+
+  it("submits a newly selected harness and coerces the model to one it can run", () => {
+    enabledModelsValue = ["openai/gpt-5.4", DEFAULT_MODEL];
+    const { onSubmit, submit } = renderForm({}, "create");
+
+    fireEvent.click(screen.getByRole("combobox", { name: "Agent harness" }));
+    fireEvent.click(
+      within(screen.getByRole("listbox")).getByRole("option", { name: "Claude Agent" })
+    );
+    submit();
+
+    expect(onSubmit).toHaveBeenCalledTimes(1);
+    expect(onSubmit.mock.calls[0][0]).toMatchObject({ harness: "claude", model: DEFAULT_MODEL });
+  });
+
+  it("drops a connected Anthropic account pin when the harness switches to OpenCode", () => {
+    enabledModelsValue = ["openai/gpt-5.4", DEFAULT_MODEL];
+    const accountId = "b".repeat(32);
+    const { onSubmit, submit } = renderForm(
+      {
+        harness: "claude",
+        model: DEFAULT_MODEL,
+        providerSelections: { anthropic: { mode: "provider_account", accountId } },
+      },
+      "edit"
+    );
+
+    fireEvent.click(screen.getByRole("combobox", { name: "Agent harness" }));
+    fireEvent.click(within(screen.getByRole("listbox")).getByRole("option", { name: "OpenCode" }));
+    submit();
+
+    expect(onSubmit).toHaveBeenCalledTimes(1);
+    expect(onSubmit.mock.calls[0][0]).toMatchObject({
+      harness: "opencode",
+      model: DEFAULT_MODEL,
+      providerSelections: {},
+    });
+  });
+
+  it("blocks submission and says so when the harness can run none of the enabled models", () => {
+    enabledModelsValue = ["openai/gpt-5.4"];
+    const { onSubmit, submit } = renderForm({ harness: "claude" }, "edit");
+
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "No enabled models can run on Claude Agent."
+    );
+    expect(screen.getByRole("button", { name: "Save Changes" })).toBeDisabled();
+    submit();
+    expect(onSubmit).not.toHaveBeenCalled();
   });
 });

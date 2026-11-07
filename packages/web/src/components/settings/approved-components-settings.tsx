@@ -1,5 +1,12 @@
 "use client";
 
+import {
+  Select,
+  SelectTrigger,
+  SelectValue,
+  SelectContent,
+  SelectItem,
+} from "@/components/ui/select";
 import { useState } from "react";
 import useSWR from "swr";
 import { toast } from "sonner";
@@ -157,18 +164,20 @@ function ComponentEditor({
         </div>
         <div>
           <Label className="mb-1.5">Kind</Label>
-          <select
+          <Select
             value={form.kind}
-            onChange={(event) =>
-              setForm({ ...form, kind: event.target.value as ApprovedComponentKind })
-            }
-            className="h-9 w-full rounded-sm border border-border bg-background px-3 text-sm"
+            onValueChange={(value) => setForm({ ...form, kind: value as ApprovedComponentKind })}
           >
-            <option value="library">Library</option>
-            <option value="service">Service</option>
-            <option value="template">Template</option>
-            <option value="snippet">Snippet</option>
-          </select>
+            <SelectTrigger className="h-9 w-full rounded-sm border border-border bg-background px-3 text-sm">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="library">Library</SelectItem>
+              <SelectItem value="service">Service</SelectItem>
+              <SelectItem value="template">Template</SelectItem>
+              <SelectItem value="snippet">Snippet</SelectItem>
+            </SelectContent>
+          </Select>
         </div>
       </div>
       <div>
@@ -257,17 +266,21 @@ function ComponentEditor({
       <div className="grid items-end gap-3 sm:grid-cols-2">
         <div>
           <Label className="mb-1.5">Lifecycle</Label>
-          <select
+          <Select
             value={form.lifecycle}
-            onChange={(event) =>
-              setForm({ ...form, lifecycle: event.target.value as ApprovedComponentLifecycle })
+            onValueChange={(value) =>
+              setForm({ ...form, lifecycle: value as ApprovedComponentLifecycle })
             }
-            className="h-9 w-full rounded-sm border border-border bg-background px-3 text-sm"
           >
-            <option value="development">Development</option>
-            <option value="approved">Approved</option>
-            <option value="deprecated">Deprecated</option>
-          </select>
+            <SelectTrigger className="h-9 w-full rounded-sm border border-border bg-background px-3 text-sm">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="development">Development</SelectItem>
+              <SelectItem value="approved">Approved</SelectItem>
+              <SelectItem value="deprecated">Deprecated</SelectItem>
+            </SelectContent>
+          </Select>
         </div>
         <label className="flex h-9 items-center justify-between text-sm">
           Enabled

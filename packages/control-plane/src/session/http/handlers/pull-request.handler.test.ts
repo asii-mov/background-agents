@@ -1,3 +1,4 @@
+import { createMockSession } from "../../../sandbox/lifecycle/test-helpers";
 import { describe, expect, it, vi } from "vitest";
 import type { Logger } from "../../../logger";
 import type { SessionRepositoryRow } from "../../types";
@@ -26,33 +27,16 @@ function createRepositoryRow(
 }
 
 function createSession(overrides: Partial<SessionRow> = {}): SessionRow {
-  return {
+  return createMockSession({
     id: "session-1",
     session_name: "public-session-1",
-    title: "Session title",
     repo_owner: "acme",
     repo_name: "repo",
     repo_id: 1,
     base_branch: "main",
     branch_name: "feature/test",
-    base_sha: null,
-    current_sha: null,
-    opencode_session_id: null,
-    model: "anthropic/claude-haiku-4-5",
-    reasoning_effort: null,
-    status: "active",
-    parent_session_id: null,
-    spawn_source: "user",
-    spawn_depth: 0,
-    code_server_enabled: 0,
-    vnc_enabled: 0,
-    total_cost: 0,
-    sandbox_settings: null,
-    environment_id: null,
-    created_at: 1000,
-    updated_at: 2000,
     ...overrides,
-  };
+  });
 }
 
 function createParticipant(overrides: Partial<ParticipantRow> = {}): ParticipantRow {
@@ -295,28 +279,6 @@ describe("PullRequestHandler", () => {
     expect(createPullRequest).not.toHaveBeenCalled();
   });
 
-  it("returns auth resolution error payload", async () => {
-    const { handler, getSession, getPromptingParticipantForPR, resolveAuthForPR } = createHandler();
-    const participant = createParticipant();
-    getSession.mockReturnValue(createSession());
-    getPromptingParticipantForPR.mockResolvedValue({ participant });
-    resolveAuthForPR.mockResolvedValue({
-      error: "Token expired",
-      status: 401,
-    });
-
-    const response = await handler.createPr(
-      new Request("http://internal/internal/create-pr", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ title: "PR", body: "desc" }),
-      })
-    );
-
-    expect(response.status).toBe(401);
-    expect(await response.json()).toEqual({ error: "Token expired" });
-  });
-
   it("forwards service error and passes the raw base branch through", async () => {
     const {
       handler,
@@ -360,7 +322,7 @@ describe("PullRequestHandler", () => {
         repoOwner: "acme",
         repoName: "repo",
         promptingUserId: "user-123",
-        promptingAuth: { authType: "oauth", token: "token" },
+        resolvePromptingAuth: expect.any(Function),
         sessionUrl: "https://app.example.com/session/public-session-1",
         draft: undefined,
       },
@@ -404,10 +366,11 @@ describe("PullRequestHandler", () => {
         title: "PR",
         body: "desc",
         baseBranch: undefined,
+        headBranch: undefined,
         repoOwner: "acme",
         repoName: "repo",
         promptingUserId: "user-123",
-        promptingAuth: null,
+        resolvePromptingAuth: expect.any(Function),
         sessionUrl: "https://app.example.com/session/public-session-1",
         draft: undefined,
       },
@@ -473,7 +436,7 @@ describe("PullRequestHandler", () => {
         repoOwner: "acme",
         repoName: "repo",
         promptingUserId: "user-1",
-        promptingAuth: null,
+        resolvePromptingAuth: expect.any(Function),
         sessionUrl: "https://app.example.com/session/public-session-1",
         draft: true,
       },

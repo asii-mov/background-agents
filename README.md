@@ -3,6 +3,11 @@
 An open-source background agents coding system inspired by
 [Ramp's Inspect](https://builders.ramp.com/post/why-we-built-our-background-agent).
 
+![Open-Inspect web UI: session sidebar and new session composer](docs/images/ui-overview.png)
+
+See [the fork comparison](docs/FORK_DIFFERENCES.md) for the retained governance controls and
+upstream overlap.
+
 ## Overview
 
 Open-Inspect provides a hosted background coding agent that can:
@@ -12,10 +17,12 @@ Open-Inspect provides a hosted background coding agent that can:
 - Connect from anywhere — web UI, Slack, GitHub PRs, Linear issues, or webhooks
 - Enable multiplayer sessions where multiple people can collaborate in real time
 - Create PRs with proper commit attribution to the prompting user
-- Run on a schedule — cron jobs, Sentry alerts, and webhook-triggered automations
+- Run scheduled automations for cron jobs, or event-driven automations for GitHub events, Sentry
+  alerts, and webhooks
 - Spawn parallel sub-tasks that work in separate sandboxes simultaneously
-- Use your choice of AI model — Anthropic Claude, OpenAI Codex (via ChatGPT subscription), xAI Grok
-  (via SuperGrok subscription), or OpenCode Zen
+- Use your choice of AI model — Anthropic Claude (via API key or a connected Claude subscription on
+  the Claude Agent harness), OpenAI Codex (via ChatGPT subscription), xAI Grok (via SuperGrok
+  subscription), or OpenCode Zen
 
 ## Security Model (Single-Tenant Only)
 
@@ -39,7 +46,23 @@ to sandboxes through the git credential helper on demand. This means:
   repos they have write access to. Users who sign in another way (e.g. Google) carry no SCM token,
   so they must link GitHub before starting a repository-backed session
 
-### Token Architecture
+Teams own sessions, environments, and automations. A session's Workspace, Team, or Private
+visibility is separate from its fixed ownership; resources cannot move between teams or to/from the
+workspace. Team-owned session actions require current owning-team membership, even for workspace
+Owners and Administrators. With enforcement on, deletion additionally requires `sessions.delete` and
+being the session owner, an owning-team lead, or a workspace administrator; team-owned and private
+sessions apply their action checks in every mode.
+
+Private sessions are readable by their owner and explicit collaborators. Workspace Owners have an
+audited break-glass read path, not automatic collaboration or sandbox access. Team visibility's read
+boundary requires `TEAMS_ENFORCEMENT=on`; the deployment default remains `shadow`.
+
+For a single-team deployment, create one team, add the users who need to act on its sessions, and
+grant its repositories. Existing workspace-owned rows are not moved or hidden. Even with every user
+in one team, being a Member does not let someone delete another member's session under enforcement
+unless they satisfy the ownership/lead rule. Follow the
+[first-team setup](docs/GETTING_STARTED.md#step-10-create-the-first-team-and-test-a-session) before
+inviting users.
 
 | Token Type         | Purpose                                | Scope                    |
 | ------------------ | -------------------------------------- | ------------------------ |
@@ -47,6 +70,11 @@ to sandboxes through the git credential helper on demand. This means:
 | User OAuth Token   | Create PRs, user info                  | Repos user has access to |
 | Sandbox Auth Token | Sandbox-to-control-plane session calls | Single session           |
 | WebSocket Token    | Real-time session auth                 | Single session           |
+
+Sandbox credentials remain limited by the session's persisted repositories and current team grants.
+GitHub session admission additionally checks the initiating user's repository permissions. GitLab
+credentials remain a deployment-wide PAT. Issued credentials can remain in snapshots until expiry.
+See [Authentication and Authorization](docs/AUTH.md) for workspace and team access rules.
 
 ### Why Single-Tenant Only
 
@@ -71,6 +99,16 @@ catalogues. GitLab deployments do not yet have linked per-user GitLab identity a
    rather than "All repositories"
 5. **Bootstrap platform ownership** - Set `platform_admin_users` and optionally
    `platform_editor_users`, then manage persisted roles under Settings > AppSec
+
+See [Authentication and Authorization](docs/AUTH.md) for workspace roles, session access, automation
+ownership, bots, and member suspension.
+
+## Local web development
+
+Use Node 24. Copy `.env.web.example` to `.env.web`, configure the development control-plane URL and
+matching web service secret, and run `npm run dev`. The backend uses `.env.example` separately. For
+local browser verification with deterministic backend responses, run
+`npm run test:e2e -w @open-inspect/web`.
 
 ## Architecture
 
@@ -105,8 +143,10 @@ catalogues. GitLab deployments do not yet have linked per-user GitLab identity a
 │  ┌──────────────────────────────────────────────────────────────┐  │
 │  │                     Session Sandbox                          │  │
 │  │  ┌───────────┐  ┌───────────┐  ┌───────────┐                 │  │
-│  │  │ Supervisor│──│  OpenCode │──│   Bridge  │─────────────────┼──┼──▶ Control Plane
-│  │  └───────────┘  └───────────┘  └───────────┘                 │  │
+│  │  │ Supervisor│──│  Harness  │──│   Bridge  │─────────────────┼──┼──▶ Control Plane
+│  │  └───────────┘  │ (OpenCode │  └───────────┘                 │  │
+│  │                 │ or Claude)│                                │  │
+│  │                 └───────────┘                                │  │
 │  │                      │                                       │  │
 │  │              Full Dev Environment                            │  │
 │  │      (Node.js, Python, git, agent-browser)                   │  │
@@ -220,17 +260,14 @@ await configureGitIdentity({
 
 Choose the AI model that fits your task, with per-session reasoning effort controls:
 
-| Provider         | Models                                                               |
-| ---------------- | -------------------------------------------------------------------- |
-| Anthropic        | Claude Haiku 4.5, Sonnet 4.5/4.6/5, Opus 4.5/4.6/4.7/4.8/5, Fable 5  |
-| OpenAI           | GPT 5.4, GPT 5.5, 5.3 Codex, 5.3 Codex Spark                         |
-| xAI / SuperGrok  | Grok models (opt-in)                                                 |
-| OpenCode Zen     | Kimi K2.5/K2.6/K3, MiniMax M2.5, Qwen3.7 Max, GLM 5/5.1/5.2 (opt-in) |
-| Z.AI Coding Plan | GLM 5.2/5.3 (opt-in)                                                 |
+Anthropic and OpenAI models are enabled by default. xAI / SuperGrok, OpenCode Zen and Go, Z.AI
+Coding Plan, and DeepSeek models are opt-in. See [Available Models](docs/AVAILABLE_MODELS.md) for
+current model IDs, descriptions, and reasoning efforts.
 
 OpenAI models work with your existing ChatGPT subscription via OAuth — no separate API key needed.
-Grok models work with an eligible SuperGrok subscription through control-plane-managed OAuth. See
-**[docs/AVAILABLE_MODELS.md](docs/AVAILABLE_MODELS.md)** for the full model list and
+Anthropic models can run on the **Claude Agent** harness with a connected Claude subscription; see
+[Using the Claude Agent Harness](docs/CLAUDE_AGENT.md). Grok models work with an eligible SuperGrok
+subscription through control-plane-managed OAuth. See
 **[docs/OPENAI_MODELS.md](docs/OPENAI_MODELS.md)** or **[docs/GROK_MODELS.md](docs/GROK_MODELS.md)**
 for subscription setup instructions.
 
@@ -255,6 +292,8 @@ Schedule recurring tasks or react to external events — no human in the loop:
 
 - **Cron schedules** — Hourly, daily, weekly, monthly, or custom 5-field cron with timezone support
 - **Sentry alerts** — Auto-triage on new errors, regressions, or critical metric alerts
+- **GitHub workflow runs** — Start work when a GitHub Actions workflow finishes, with optional
+  workflow-name and conclusion filters
 - **Inbound webhooks** — JSONPath condition filters to gate which payloads spawn sessions
 - **Multi-repo fan-out** — One scheduled automation can run across up to 10 repositories, opening a
   separate session and pull request for each
@@ -266,7 +305,7 @@ See **[docs/AUTOMATIONS.md](docs/AUTOMATIONS.md)** for setup instructions.
 
 Every session runs in an isolated sandbox backend with a full development environment:
 
-- **Pre-installed:** Node.js 22, Python 3.12, Bun, git, GitHub CLI, build-essential
+- **Pre-installed:** Node.js 24, Python 3.12, Bun, git, GitHub CLI, build-essential
 - **Browser automation:** agent-browser CLI with headless Chromium for screenshots, visual diffs,
   and UI verification
 - **Code-server:** Optional browser-based VS Code connected to the session workspace
@@ -309,9 +348,14 @@ docker compose up -d postgres redis
 - `setup.sh` failures are non-fatal for fresh sessions, but fatal in image build mode
 - `start.sh` runs for every non-build session startup (fresh, prebuilt-image, snapshot-restore)
 - `start.sh` failures are strict: if present and it fails, session startup fails
-- Default timeouts:
-  - `SETUP_TIMEOUT_SECONDS` (default `300`)
-  - `START_TIMEOUT_SECONDS` (default `120`)
+- Open-Inspect does not impose hook-specific timeouts. Scripts remain subject to the boot budget
+  (`SANDBOX_BOOT_TIMEOUT_MS`, 30 minutes by default, measured across the whole session boot), to
+  enclosing sandbox shutdown and image-build limits, and can apply their own command-specific
+  deadlines when needed.
+- Each script's progress is reported to the session while it runs. Failure reports retain the phase,
+  repository when available, and error or warning metadata, but hook stdout and stderr are discarded
+  rather than collected or shown. Image builds report neither, having no session to report to. See
+  [How Open-Inspect Works](docs/HOW_IT_WORKS.md#fresh-start-no-snapshot)
 - Both hooks receive `OPENINSPECT_BOOT_MODE` (`build`, `fresh`, `repo_image`, `snapshot_restore`)
 - Git operations in hooks can authenticate only to repositories admitted to the current session
 
@@ -330,5 +374,7 @@ built with:
 - [OpenComputer](https://www.opencomputer.dev) - Cloud sandbox infrastructure
 - [E2B](https://e2b.dev) - Cloud sandbox infrastructure
 - [Cloudflare Workers](https://workers.cloudflare.com) - Edge computing
-- [OpenCode](https://opencode.ai) - Coding agent runtime
+- [OpenCode](https://opencode.ai) - Coding agent runtime (built-in harness)
+- [Claude Agent SDK](https://docs.anthropic.com/en/docs/agent-sdk) - Coding agent runtime (Claude
+  Agent harness)
 - [Next.js](https://nextjs.org) - Web framework

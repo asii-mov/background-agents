@@ -1,27 +1,43 @@
-import { describe, expect, it } from "vitest";
-import { extractRepoParams, parsePattern } from "./shared";
+import { describe, expect, expectTypeOf, it } from "vitest";
+import type { TeamAdmissionNeed, TeamAdmissionRequirement } from "../routing/team-admission";
+import { requireAll, requireTeam } from "./shared";
 
-describe("repository route parameters", () => {
-  it("decodes a nested owner namespace from one URL segment", () => {
-    const match = "/repos/group%2Fsubgroup/web/branches".match(
-      parsePattern("/repos/:owner/:name/branches")
-    );
+describe("team admission requirements", () => {
+  it("excludes presentation capabilities from requireTeam", () => {
+    expectTypeOf<Parameters<typeof requireTeam>[0]>().toEqualTypeOf<
+      Exclude<TeamAdmissionNeed, "removeMember">
+    >();
 
-    expect(match).not.toBeNull();
-    expect(extractRepoParams(match!)).toEqual({ owner: "group/subgroup", name: "web" });
+    // @ts-expect-error Presentation grants are not route authorization needs.
+    requireTeam("canReadTeamSessions");
+    // @ts-expect-error Presentation grants are not route authorization needs.
+    requireTeam("canReadTeamRepositories");
+    // @ts-expect-error Presentation grants are not route authorization needs.
+    requireTeam("canReadTeamEnvironments");
+    // @ts-expect-error Presentation grants are not route authorization needs.
+    requireTeam("canReadAutomations");
   });
 
-  it("rejects an encoded slash in the repository name", async () => {
-    const match = "/repos/group/web%2Fapi/branches".match(
-      parsePattern("/repos/:owner/:name/branches")
-    );
+  it("requires a target path parameter when removing a member", () => {
+    const requirement = {
+      kind: "team",
+      teamIdParam: "id",
+      need: "removeMember",
+      targetUserIdParam: "userId",
+    } as const satisfies TeamAdmissionRequirement;
+    expect(requireAll(requirement).allOf).toEqual([requirement]);
 
-    const result = extractRepoParams(match!);
+    // @ts-expect-error requireTeam cannot express the required target path parameter.
+    requireTeam("removeMember");
+    // @ts-expect-error Removing a member must name the target path parameter.
+    requireAll({ kind: "team", teamIdParam: "id", need: "removeMember" });
+  });
 
-    expect(result).toBeInstanceOf(Response);
-    expect((result as Response).status).toBe(400);
-    await expect((result as Response).json()).resolves.toEqual({
-      error: "Owner and name must be valid repository path segments",
-    });
+  it("keeps read admission quiet and mutation admission audited", () => {
+    expect(requireTeam("read").auditAllowed).toBe(false);
+    expect(requireTeam("member").auditAllowed).toBe(false);
+    expect(requireTeam("canManageMembers").auditAllowed).toBe(true);
+    expect(requireTeam("canJoin").auditAllowed).toBe(true);
+    expect(requireTeam("canArchive", { auditAllowed: false }).auditAllowed).toBe(false);
   });
 });

@@ -1,27 +1,22 @@
 import type { Logger } from "../../../logger";
 import type { ParticipantRepository } from "../../participant-repository";
+import { sessionScmDisplayFieldsSchema } from "../../contracts";
 import { z } from "zod";
 
 const nullableOptionalString = z.string().nullable().optional();
 
-const generateWsTokenRequestSchema = z.object({
+const generateWsTokenRequestSchema = sessionScmDisplayFieldsSchema.extend({
   userId: z.string().optional(),
-  canonicalUserId: nullableOptionalString,
+  canonicalUserId: z.string().min(1),
   scmUserId: nullableOptionalString,
-  scmLogin: nullableOptionalString,
-  scmName: nullableOptionalString,
-  scmEmail: nullableOptionalString,
-  scmTokenEncrypted: nullableOptionalString,
-  scmRefreshTokenEncrypted: nullableOptionalString,
-  scmTokenExpiresAt: z.number().nullable().optional(),
+  replaceScmIdentity: z.boolean().optional(),
 });
 
 type GenerateWsTokenRequest = z.infer<typeof generateWsTokenRequestSchema>;
 
 /**
- * HTTP boundary for WS-token minting: upserts the requesting participant
- * (coalescing SCM tokens against server-side refreshes) and rotates their
- * WebSocket token.
+ * HTTP boundary for WS-token minting: upserts the requesting participant and
+ * rotates their WebSocket token. OAuth grants are held only by Better Auth.
  */
 export class WsTokenHandler {
   constructor(
@@ -31,6 +26,7 @@ export class WsTokenHandler {
     private readonly now: () => number = Date.now
   ) {}
 
+  /** Mint a token for a participant bound to the authenticated canonical user. */
   async generateWsToken(request: Request, log: Logger): Promise<Response> {
     let raw: unknown;
     try {
@@ -53,50 +49,28 @@ export class WsTokenHandler {
     let participant = this.repository.getParticipantByUserId(body.userId);
 
     if (participant) {
-      // Only accept client tokens if they're newer than what we have in the DB.
-      // The server-side refresh may have rotated tokens, and the client could
-      // be sending stale values from an old session cookie.
-      const clientExpiresAt = body.scmTokenExpiresAt ?? null;
-      const dbExpiresAt = participant.scm_token_expires_at;
-      const clientSentAnyToken =
-        body.scmTokenEncrypted != null || body.scmRefreshTokenEncrypted != null;
-
-      const shouldUpdateTokens =
-        clientSentAnyToken &&
-        (dbExpiresAt == null || (clientExpiresAt != null && clientExpiresAt > dbExpiresAt));
-
-      // If we already have a refresh token (server-side refresh may rotate it),
-      // only accept an incoming refresh token when we're also accepting the
-      // access token update, or when we don't have one yet.
-      const shouldUpdateRefreshToken =
-        body.scmRefreshTokenEncrypted != null &&
-        (participant.scm_refresh_token_encrypted == null || shouldUpdateTokens);
-
-      this.repository.updateParticipantCoalesce(participant.id, {
-        ...(body.canonicalUserId ? { canonicalUserId: body.canonicalUserId } : {}),
+      const identity = {
+        canonicalUserId: body.canonicalUserId,
         scmUserId: body.scmUserId ?? null,
         scmLogin: body.scmLogin ?? null,
         scmName: body.scmName ?? null,
         scmEmail: body.scmEmail ?? null,
-        scmAccessTokenEncrypted: shouldUpdateTokens ? (body.scmTokenEncrypted ?? null) : null,
-        scmRefreshTokenEncrypted: shouldUpdateRefreshToken
-          ? (body.scmRefreshTokenEncrypted ?? null)
-          : null,
-        scmTokenExpiresAt: shouldUpdateTokens ? clientExpiresAt : null,
-      });
+      };
+      if (body.replaceScmIdentity) {
+        this.repository.updateParticipantIdentity(participant.id, identity);
+      } else {
+        this.repository.updateParticipantCoalesce(participant.id, identity);
+      }
     } else {
       const id = this.generateId();
       this.repository.createParticipant({
         id,
         userId: body.userId,
-        ...(body.canonicalUserId ? { canonicalUserId: body.canonicalUserId } : {}),
+        canonicalUserId: body.canonicalUserId,
         scmUserId: body.scmUserId ?? null,
         scmLogin: body.scmLogin ?? null,
         scmName: body.scmName ?? null,
         scmEmail: body.scmEmail ?? null,
-        scmAccessTokenEncrypted: body.scmTokenEncrypted ?? null,
-        scmRefreshTokenEncrypted: body.scmRefreshTokenEncrypted ?? null,
-        scmTokenExpiresAt: body.scmTokenExpiresAt ?? null,
         role: "member",
         joinedAt: now,
       });

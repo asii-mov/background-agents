@@ -1,23 +1,28 @@
 import {
+  imageBuildScopeKindSchema,
+  imageBuildStatusSchema,
   type ImageBuildRecordView,
   type ImageBuildScopeKind,
   type ImageBuildStatus,
   type RepositoryShaEntry,
 } from "@open-inspect/shared/types/image-builds";
-import type {
-  ImageBuildProvider,
-  ImageBuildScope,
-  MarkImageBuildReadyResult,
-  SupersededImageBuild,
+import { z } from "zod";
+import {
+  imageBuildProviderSchema,
+  type ImageBuildProvider,
+  type ImageBuildScope,
+  type MarkImageBuildReadyResult,
+  type SupersededImageBuild,
 } from "../image-builds/model";
 import { ImageBuildFinalizationStore } from "./image-build-finalization";
 import type { SqlDatabase } from "./sql-database";
+import { parseRepositoryShasJson } from "../image-builds/provenance";
 
 /** D1 caps bound parameters per statement; IN-list queries chunk below it. */
 const MAX_SCOPE_IDS_PER_QUERY = 50;
 
 /**
- * The exact `ImageBuildRecordView` wire columns, in declaration order. Status
+ * The exact public-safe storage columns, in declaration order. Status
  * reads project this list rather than `SELECT *` so internal columns
  * (callback token, provider session/image ids) never reach a client — the
  * table carries columns the wire contract does not.
@@ -39,10 +44,10 @@ const STATUS_VIEW_KEYS = [
   "build_duration_seconds",
   "error_message",
   "created_at",
-] as const satisfies readonly (keyof ImageBuildRecordView)[];
+] as const satisfies readonly (keyof ImageBuildStatusRow)[];
 
-type MissingStatusViewKey = Exclude<keyof ImageBuildRecordView, (typeof STATUS_VIEW_KEYS)[number]>;
-// Fails to compile — naming the missing key — if ImageBuildRecordView gains a
+type MissingStatusViewKey = Exclude<keyof ImageBuildStatusRow, (typeof STATUS_VIEW_KEYS)[number]>;
+// Fails to compile — naming the missing key — if ImageBuildStatusRow gains a
 // field the projection does not carry.
 const _statusViewComplete: MissingStatusViewKey extends never ? true : MissingStatusViewKey = true;
 void _statusViewComplete;
@@ -63,17 +68,69 @@ export interface ImageBuildRegistration {
   callbackTokenExpiresAt?: number;
 }
 
+/** Public-safe D1 projection retained in storage encoding inside persistence. */
+interface ImageBuildStatusRow {
+  id: string;
+  scope_kind: ImageBuildScopeKind;
+  scope_id: string;
+  provider: ImageBuildProvider;
+  status: ImageBuildStatus;
+  repositories_fingerprint: string;
+  repository_shas: string;
+  runtime_version: string;
+  build_duration_seconds: number | null;
+  error_message: string | null;
+  created_at: number;
+}
+
+const imageBuildStatusRowSchema = z.object({
+  id: z.string(),
+  scope_kind: imageBuildScopeKindSchema,
+  scope_id: z.string(),
+  provider: imageBuildProviderSchema,
+  status: imageBuildStatusSchema,
+  repositories_fingerprint: z.string(),
+  repository_shas: z.string(),
+  runtime_version: z.string(),
+  build_duration_seconds: z.number().nullable(),
+  error_message: z.string().nullable(),
+  created_at: z.number(),
+});
+
+function toImageBuildRecordView(row: ImageBuildStatusRow): ImageBuildRecordView {
+  return {
+    id: row.id,
+    scopeKind: row.scope_kind,
+    scopeId: row.scope_id,
+    provider: row.provider,
+    status: row.status,
+    repositoriesFingerprint: row.repositories_fingerprint,
+    repositoryShas: parseRepositoryShasJson(row.repository_shas),
+    runtimeVersion: row.runtime_version,
+    buildDurationSeconds: row.build_duration_seconds,
+    errorMessage: row.error_message,
+    createdAt: row.created_at,
+  };
+}
+
+function parseImageBuildStatusRows(rows: unknown[] | undefined): ImageBuildStatusRow[] {
+  return (rows ?? []).flatMap((row) => {
+    const parsed = imageBuildStatusRowSchema.safeParse(row);
+    return parsed.success ? [parsed.data] : [];
+  });
+}
+
 /**
  * One full row, including the internal columns (callback token, provider
  * session/image ids). Mirrors the `image_builds` table (migration 0039).
  * Internal row — never serialized to clients; the outward wire contract is
- * `ImageBuildRecordView`, and status reads project exactly its columns.
+ * `ImageBuildStatusRow`, and status reads project exactly its columns.
  */
-export interface ImageBuildRow extends ImageBuildRecordView {
-  provider: ImageBuildProvider;
+export interface ImageBuildRow extends ImageBuildStatusRow {
   provider_image_id: string | null;
-  repositories_fingerprint: string;
   provider_session_id: string | null;
+  provider_operation_ref: string | null;
+  provider_operation_deadline_at: number | null;
   completion_hash: string | null;
   finalization_lease_token: string | null;
   finalization_lease_expires_at: number | null;
@@ -111,6 +168,42 @@ export interface RecoverableImageBuildFinalizationRow {
   callback_token_used_at: number;
 }
 
+/** A terminal row whose build source may exist under its reserved name. */
+export interface UnboundSourceIntentRow {
+  id: string;
+  provider: ImageBuildProvider;
+  created_at: number;
+}
+
+/** A terminal row whose reserved artifact operation never produced an artifact. */
+export interface UnresolvedProviderOperationRow {
+  id: string;
+  provider: ImageBuildProvider;
+  provider_session_id: string | null;
+  provider_operation_ref: string;
+  /** Fixed wall-clock deadline (ms) the reservation recorded; null before it existed. */
+  provider_operation_deadline_at: number | null;
+  created_at: number;
+}
+
+/**
+ * A row that owes nothing to the provider's sandbox API.
+ *
+ * `provider_session_cleanup_pending = 1` is set before the source sandbox
+ * exists on adapters that can recover an uncertain create by name, so a null
+ * `provider_session_id` no longer means "nothing was created". Only an
+ * explicitly settled obligation (flag 0) or a row that never recorded one at
+ * all (flag NULL, which is every row written before the flag existed, and no
+ * session id) is free of it.
+ */
+const NO_PROVIDER_SESSION_OBLIGATION_SQL = `(provider_session_cleanup_pending = 0
+     OR (provider_session_cleanup_pending IS NULL AND provider_session_id IS NULL))`;
+
+/**
+ * Bound sources awaiting teardown. An unbound create intent is deliberately
+ * absent: it has no id to tear down, and is resolved by the maintenance pass
+ * that recovers a source by its reserved provider name.
+ */
 export const PROVIDER_SESSION_CLEANUP_SQL = `SELECT id, provider, status,
         provider_image_id, provider_session_id, provider_session_cleanup_pending,
         error_message, created_at
@@ -118,6 +211,27 @@ export const PROVIDER_SESSION_CLEANUP_SQL = `SELECT id, provider, status,
  WHERE status IN ('ready', 'failed', 'superseded')
    AND provider_session_id IS NOT NULL
    AND provider_session_cleanup_pending IS NOT 0
+ ORDER BY created_at, id`;
+
+/** Terminal rows whose source may exist provider-side but was never bound. */
+export const UNBOUND_SOURCE_INTENTS_SQL = `SELECT id, provider, created_at
+ FROM image_builds
+ WHERE status IN ('failed', 'superseded')
+   AND provider_session_id IS NULL
+   AND provider_session_cleanup_pending = 1
+ ORDER BY created_at, id`;
+
+/**
+ * Terminal rows holding a reserved artifact operation that never produced a
+ * tracked artifact. Recording an artifact retires the reference, so anything
+ * still listed here is an obligation nothing else on the row records.
+ */
+export const UNRESOLVED_PROVIDER_OPERATIONS_SQL = `SELECT id, provider, provider_session_id,
+        provider_operation_ref, provider_operation_deadline_at, created_at
+ FROM image_builds
+ WHERE status IN ('failed', 'superseded')
+   AND provider_operation_ref IS NOT NULL
+   AND provider_image_id IS NULL
  ORDER BY created_at, id`;
 
 export const RECOVERABLE_IMAGE_FINALIZATIONS_SQL = `SELECT id, completion_hash,
@@ -137,19 +251,20 @@ export const SUPERSEDED_IMAGES_SQL = `SELECT id, scope_kind, scope_id, provider,
         provider_image_id, provider_session_id, created_at
  FROM image_builds
  WHERE status = 'superseded'
-   AND (provider_session_id IS NULL OR provider_session_cleanup_pending = 0)
+   AND ${NO_PROVIDER_SESSION_OBLIGATION_SQL}
  ORDER BY created_at, id`;
 
 export const FAILED_IMAGE_ARTIFACTS_SQL = `SELECT id, scope_kind, scope_id, provider,
         provider_image_id, provider_session_id, created_at
  FROM image_builds
  WHERE status = 'failed' AND provider_image_id IS NOT NULL
-   AND (provider_session_id IS NULL OR provider_session_cleanup_pending = 0)
+   AND ${NO_PROVIDER_SESSION_OBLIGATION_SQL}
  ORDER BY created_at, id`;
 
 export const DELETE_OLD_FAILED_BUILDS_SQL = `DELETE FROM image_builds
 WHERE status = 'failed' AND provider_image_id IS NULL
-  AND (provider_session_id IS NULL OR provider_session_cleanup_pending = 0)
+  AND ${NO_PROVIDER_SESSION_OBLIGATION_SQL}
+  AND provider_operation_ref IS NULL
   AND created_at < ?`;
 
 export const MARK_STALE_IMAGE_BUILDS_SQL = `UPDATE image_builds
@@ -246,6 +361,120 @@ export class ImageBuildStore {
            AND (provider_session_id IS NULL OR provider_session_id = ?)`
       )
       .bind(providerSessionId, buildId, provider, providerSessionId)
+      .run();
+
+    return (result.meta?.changes ?? 0) > 0;
+  }
+
+  /**
+   * Records that a build source is about to be created, before the provider
+   * can answer with its id.
+   *
+   * A create whose response is lost still leaves a sandbox running, and
+   * nothing on the row would name it. The pending flag is therefore raised
+   * first, with no session id, so the row reads as "something may exist" from
+   * the moment before the request goes out; the maintenance pass then finds
+   * the sandbox by its reserved name. Returns false when the row is no longer
+   * a fresh building row, which must abort the create — an unrecorded source
+   * is an untracked one.
+   */
+  async markSourceCreateIntent(buildId: string, provider: ImageBuildProvider): Promise<boolean> {
+    const result = await this.db
+      .prepare(
+        `UPDATE image_builds SET provider_session_cleanup_pending = 1
+         WHERE id = ? AND provider = ? AND status = 'building'
+           AND provider_session_id IS NULL`
+      )
+      .bind(buildId, provider)
+      .run();
+
+    return (result.meta?.changes ?? 0) > 0;
+  }
+
+  /**
+   * Attaches a source found by its reserved provider name to the terminal row
+   * that ordered it, FOR CLEANUP ONLY.
+   *
+   * Scoped to failed and superseded rows so a late attach can never restore a
+   * building row, authorize a launch, or let a callback be accepted: the
+   * normal bind-before-launch path still requires a building row and runs
+   * before any repository work.
+   *
+   * The id and the cleanup obligation are written in one statement, and the
+   * obligation is asserted rather than required: a source that exists under
+   * the reserved name must be torn down even if a concurrent pass settled the
+   * intent on a stale absence first. A bound id with a settled obligation is
+   * the one shape no sweep acts on — the session sweep skips it and row
+   * deletion reads it as owing nothing — so the source would outlive the only
+   * record naming it.
+   */
+  async attachRecoveredProviderSession(
+    buildId: string,
+    provider: ImageBuildProvider,
+    providerSessionId: string
+  ): Promise<boolean> {
+    const result = await this.db
+      .prepare(
+        `UPDATE image_builds
+         SET provider_session_id = ?, provider_session_cleanup_pending = 1
+         WHERE id = ? AND provider = ? AND status IN ('failed', 'superseded')
+           AND provider_session_id IS NULL`
+      )
+      .bind(providerSessionId, buildId, provider)
+      .run();
+
+    return (result.meta?.changes ?? 0) > 0;
+  }
+
+  /**
+   * Settles a create intent that produced nothing. Only for a source whose
+   * absence is established — a lookup 404 alone is not, since a create can
+   * still be in flight; the caller waits out the source's hard lifetime
+   * first.
+   */
+  async clearUnboundSourceIntent(buildId: string): Promise<boolean> {
+    const result = await this.db
+      .prepare(
+        `UPDATE image_builds SET provider_session_cleanup_pending = 0
+         WHERE id = ? AND provider_session_id IS NULL
+           AND provider_session_cleanup_pending = 1`
+      )
+      .bind(buildId)
+      .run();
+
+    return (result.meta?.changes ?? 0) > 0;
+  }
+
+  /** Terminal rows whose source may exist provider-side but was never bound. */
+  async listUnboundSourceIntents(): Promise<UnboundSourceIntentRow[]> {
+    const result = await this.db.prepare(UNBOUND_SOURCE_INTENTS_SQL).all<UnboundSourceIntentRow>();
+    return result.results ?? [];
+  }
+
+  /** Terminal rows whose reserved artifact operation is still outstanding. */
+  async listUnresolvedOperations(): Promise<UnresolvedProviderOperationRow[]> {
+    const result = await this.db
+      .prepare(UNRESOLVED_PROVIDER_OPERATIONS_SQL)
+      .all<UnresolvedProviderOperationRow>();
+    return result.results ?? [];
+  }
+
+  /**
+   * Settles an artifact operation whose outcome is known: nothing exists
+   * under the reserved name, or what did exist has been reclaimed. Scoped to
+   * the exact reference so a row that moved on is never cleared by a stale
+   * reconciliation, and to terminal rows so a live capture is never dropped.
+   */
+  async clearProviderOperation(buildId: string, operationRef: string): Promise<boolean> {
+    const result = await this.db
+      .prepare(
+        `UPDATE image_builds
+         SET provider_operation_ref = NULL, provider_operation_deadline_at = NULL
+         WHERE id = ? AND provider_operation_ref = ?
+           AND status IN ('failed', 'superseded')
+           AND provider_image_id IS NULL`
+      )
+      .bind(buildId, operationRef)
       .run();
 
     return (result.meta?.changes ?? 0) > 0;
@@ -491,7 +720,8 @@ export class ImageBuildStore {
       .prepare(
         `DELETE FROM image_builds
          WHERE id = ? AND status = 'superseded' AND provider_image_id IS NULL
-           AND (provider_session_id IS NULL OR provider_session_cleanup_pending = 0)`
+           AND ${NO_PROVIDER_SESSION_OBLIGATION_SQL}
+           AND provider_operation_ref IS NULL`
       )
       .bind(imageBuildId);
 
@@ -505,7 +735,7 @@ export class ImageBuildStore {
         .prepare(
           `UPDATE image_builds SET provider_image_id = NULL
            WHERE id = ? AND status = 'superseded' AND provider_image_id = ?
-             AND (provider_session_id IS NULL OR provider_session_cleanup_pending = 0)`
+             AND ${NO_PROVIDER_SESSION_OBLIGATION_SQL}`
         )
         .bind(imageBuildId, reapedProviderImageId),
       deleteStatement,
@@ -513,6 +743,7 @@ export class ImageBuildStore {
     return (deleted.meta?.changes ?? 0) > 0;
   }
 
+  /** Fail a trigger only before a callback hands the build to finalization. */
   async markBuildFailed(
     buildId: string,
     provider: ImageBuildProvider,
@@ -520,7 +751,9 @@ export class ImageBuildStore {
   ): Promise<boolean> {
     const result = await this.db
       .prepare(
-        "UPDATE image_builds SET status = 'failed', error_message = ? WHERE id = ? AND provider = ? AND status = 'building'"
+        `UPDATE image_builds SET status = 'failed', error_message = ?
+         WHERE id = ? AND provider = ? AND status = 'building'
+           AND callback_token_used_at IS NULL`
       )
       .bind(error, buildId, provider)
       .run();
@@ -591,9 +824,9 @@ export class ImageBuildStore {
         `SELECT ${STATUS_VIEW_COLUMNS} FROM image_builds WHERE scope_kind = ? AND scope_id = ? AND status <> 'superseded' ORDER BY created_at DESC LIMIT 10`
       )
       .bind(scope.kind, scope.id)
-      .all<ImageBuildRecordView>();
+      .all<ImageBuildStatusRow>();
 
-    return result.results || [];
+    return parseImageBuildStatusRows(result.results).map(toImageBuildRecordView);
   }
 
   /**
@@ -613,9 +846,9 @@ export class ImageBuildStore {
          ORDER BY created_at DESC`
       )
       .bind(scope.kind, scope.id, provider)
-      .all<ImageBuildRecordView>();
+      .all<ImageBuildStatusRow>();
 
-    return result.results || [];
+    return parseImageBuildStatusRows(result.results).map(toImageBuildRecordView);
   }
 
   /**
@@ -646,12 +879,12 @@ export class ImageBuildStore {
              WHERE scope_kind = ? AND scope_id IN (${placeholders}) AND status <> 'superseded'`
           )
           .bind(kind, ...chunk)
-          .all<ImageBuildRecordView>();
-        rows.push(...(result.results || []));
+          .all<ImageBuildStatusRow>();
+        rows.push(...parseImageBuildStatusRows(result.results).map(toImageBuildRecordView));
       }
     }
 
-    rows.sort((a, b) => b.created_at - a.created_at || (a.id < b.id ? 1 : -1));
+    rows.sort((a, b) => b.createdAt - a.createdAt || (a.id < b.id ? 1 : -1));
     return rows;
   }
 
@@ -714,7 +947,7 @@ export class ImageBuildStore {
       .prepare(
         `UPDATE image_builds SET provider_image_id = NULL, provider_session_id = NULL
          WHERE id = ? AND status = 'failed' AND provider_image_id = ?
-           AND (provider_session_id IS NULL OR provider_session_cleanup_pending = 0)`
+           AND ${NO_PROVIDER_SESSION_OBLIGATION_SQL}`
       )
       .bind(imageBuildId, reapedProviderImageId)
       .run();

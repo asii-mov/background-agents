@@ -24,13 +24,14 @@ test("sessions.core-workflow-terminal-diff-pr", async ({ page, api }) => {
   );
   await expect(page.getByText("open", { exact: true })).toBeVisible();
 
-  await page.getByRole("button", { name: /validator\.ts modified/ }).click();
+  await page.getByRole("tab", { name: /^Changes/ }).click();
+  await page.getByRole("button", { name: /validator\.ts/ }).click();
   await expect(page.getByRole("region", { name: "Session changes" })).toBeVisible();
   await expect(page.getByRole("heading", { name: "src/identity/validator.ts" })).toBeVisible();
-  await page.getByRole("button", { name: "Hide file list" }).click();
   await expect(page.getByText("if (!input.trim()) return false;", { exact: true })).toBeVisible();
 
-  await page.getByRole("button", { name: "Close changes" }).click();
+  await page.getByRole("button", { name: "Back to session" }).click();
+  await page.getByRole("tab", { name: "Tools", exact: true }).click();
   await page.getByRole("button", { name: "Show", exact: true }).click();
   const terminal = page.frameLocator('iframe[title="Session terminal"]');
   await expect(page.locator('iframe[title="Session terminal"]')).toHaveAttribute(

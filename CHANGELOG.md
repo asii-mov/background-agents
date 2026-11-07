@@ -2,6 +2,256 @@
 
 New features, integrations, and notable improvements to Open-Inspect — newest first.
 
+## October 4, 2026
+
+**GitHub model overrides.** Start a GitHub `@mention` with `!model` or `!reasoning`, the same flags
+Slack uses, to pick the model and reasoning effort for that session. Upgrade the GitHub bot and
+control plane together. See
+[GitHub integration](docs/integrations/GITHUB.md#model-and-reasoning-overrides).
+
+## October 3, 2026
+
+**Persistent memory.** Personal, repository, and environment memories carry facts and directives
+between sessions. Agents in both harnesses search, read, and propose memories. Only personal facts
+written in a root session that has stayed private and owner-only become active immediately; all
+other agent writes wait for approval. Manage personal memories under **Settings > Memories** and
+repository and environment memories under **Settings > Shared memories**; each session's sidebar
+lists the memories it loaded. Requires D1 migration 0084 and a sandbox image rebuild. See
+[Persistent session memory](docs/MEMORY.md).
+
+## October 2, 2026
+
+**Analytics redesign.** The analytics page is now an overview plus Usage, Cost, Pull requests, and
+People tabs. The range, scope, and tab are kept in the URL. A new **Session origins** breakdown
+shows where sessions start and who they are attributed to.
+
+**Saved prompt drafts.** Unsent prompts survive page reloads. Each session and the new-session
+composer keep their own draft.
+
+**Teams.** Group members into teams that own sessions, environments, automations, and secrets, with
+repository grants and Slack and Linear channel bindings managed from **Settings > Teams**. GitHub
+work routes to teams by numeric repository ID: upgrade the GitHub bot and control plane together,
+and reselect repositories on older GitHub event automations so they keep matching events. Sandbox
+GitHub tokens now cover only the session's repositories. See
+[Authentication and Authorization](docs/AUTH.md).
+
+**Classifier reasoning effort.** Set `classification_reasoning_effort` to send a reasoning effort to
+OpenAI classification models used by the Slack and Linear bots. Leaving it blank keeps the model
+default.
+
+## October 1, 2026
+
+**Brokered credentials for Modal restores.** Restored Modal sandboxes now fetch git credentials from
+the control plane like fresh ones, so Modal no longer needs the `github-app` secret. You can delete
+it after upgrading.
+
+**Session page redesign.** The session sidebar is split into Info, Changes, Tasks, and Tools tabs,
+with captured media under **Artifacts** in Info. Changed files open in the main column beside the
+sidebar, which leaves room for split diffs.
+
+## September 28, 2026
+
+**Claude Sonnet 5.5.** Adds `anthropic/claude-sonnet-5-5` to the model picker and integrations, with
+adaptive thinking controls from low through max.
+
+**ChatGPT subscription cost estimates.** OpenCode sessions using a connected ChatGPT subscription
+now report API-equivalent cost estimates in the session cost display and spending limit.
+
+## September 27, 2026
+
+**Trace export schema 2.** Messages, events, and usage are now exported oldest first, and
+single-session downloads include only the requested session. See the
+[trace export reference](docs/TRACE_EXPORT.md).
+
+**Docker-capable Modal sandboxes.** Operators can select the `modal-vm` backend deployment-wide for
+Docker support; `modal` remains the default. See [Modal VM setup](docs/MODAL_DOCKER.md).
+
+**Scoped analytics.** The analytics dashboard and API can filter human, agent, automation, or all
+sessions, with breakdowns by model, harness, provider, and automation, token totals, cache hit
+ratio, and cost per merged PR.
+
+## September 26, 2026
+
+**Richer bulk session export.** Bulk export can now include each session's messages, timeline
+events, and per-step token usage through the `include` parameter.
+
+## September 25, 2026
+
+**Bulk export metadata and permission.** Exported session lines now include run identity, harness,
+model provider, repositories, pull request lifecycle, and token totals. Bulk export now requires the
+`sessions.export` permission, granted to Owners and Administrators by default.
+
+## September 23, 2026
+
+**Sessions discovery across full history.** A new **Sessions** destination in the sidebar (above
+Automations) searches every session the viewer may read, including archived work and history beyond
+the command menu's recent window. Search matches titles, session-id prefixes, and any member
+repository of a multi-repository session; creator, repository, environment, lifecycle, and
+automation-origin filters compose on the server and live in the URL, so a filtered view can be
+shared or reloaded. The command menu now labels its results as recent sessions and offers **Search
+all sessions**, carrying typed text to the page; the sidebar's Archived shortcut opens the archived
+view, with archive management still under Settings → Data Controls. The Inbox is unchanged.
+
+**Open changed files from agent output.** Repository file links in a session's agent output now open
+matching files in the Changes panel, including renamed files and line references. Links to files
+outside the session diff remain inert; external links retain their existing behavior.
+
+**Clearer audit log outcomes.** Authorization decisions in the workspace audit log now show
+**Allowed** or **Denied** with the recorded HTTP response (for example, HTTP 409 Conflict) instead
+of a green **Applied** badge, because admitting a request does not prove the change took effect.
+**Applied**, **No change**, and **Rejected** are reserved for events recorded by the operation
+itself. Older rows without a recorded status show the decision with the response marked as not
+recorded; stored audit data is unchanged.
+
+**Claude Opus 5.5.** Adds `anthropic/claude-opus-5-5` to the model picker and integrations, with
+adaptive thinking controls from low through max. The Claude Agent harness now uses
+`claude-agent-sdk` 0.2.158, whose bundled Claude Code release natively supports Opus 5.5.
+
+## September 21, 2026
+
+**Grok 4.7.** Adds `xai/grok-4.7` to the model picker and integrations, with reasoning efforts from
+low through xhigh. `xai/grok-4.6` now also offers xhigh, which it supported but the catalog did not
+expose. The **xAI / SuperGrok** group stays opt-in — enable the model under **Settings > Models**.
+See [Available models](docs/AVAILABLE_MODELS.md#xai--supergrok).
+
+## September 20, 2026
+
+**Graceful sandbox shutdown and recovery.** Sandboxes approaching their provider lifetime now stop
+admitting new work, preserve the filesystem, and confirm retirement before expiry, reserving a
+configurable **Final snapshot buffer** set globally or per repository and environment. Sessions show
+shutdown and recovery progress: work queued at a clean prompt boundary restores automatically into a
+new generation, while an interrupted prompt fails once and, after state is saved, queued work waits
+for **Resume queued work** — the interrupted prompt is never replayed automatically. A failed or
+uncertain shutdown stays held rather than falling back to a fresh checkout, offering retry or
+restore only when the server authorizes it.
+
+**Provider-aware sandbox settings.** The per-session CPU, memory, and session-timeout controls are
+now hidden when the configured provider cannot honor them. Daytona sandboxes inherit CPU and memory
+from their snapshot and take no per-session lifetime, so all three are hidden with an explanation
+while its image build timeout stays configurable, and stored values a provider cannot apply are
+stripped before a session starts instead of blocking the spawn.
+
+## September 19, 2026
+
+**Prebuilt images for Daytona.** Daytona joins the image-prebuild subsystem: it can build repository
+and environment snapshots, start sessions from them, and reclaim sources and snapshots afterwards.
+The feature is opt-in behind `DAYTONA_PREBUILDS_ENABLED` and off by default. Admission gates exactly
+two things — starting a build and selecting a prebuilt image for a fresh session — so while it is
+closed a manual rebuild returns 503, save hooks do nothing, and the cron skips new builds while
+finalization, status, and cleanup keep running. None of this has been exercised against a live
+Daytona deployment; the gates an operator should pass before opening admission are listed in
+[Image prebuilds](docs/IMAGE_PREBUILD.md#verification-gates).
+
+**Slack model flags set session defaults.** A `!model` or `!reasoning` flag on the message that
+opens a session now becomes that session's default for every following turn, instead of applying
+only to the first prompt. Flags on a follow-up still apply to that one request. The "Starting
+work..." acknowledgement names the resulting defaults whenever they differ from your App Home
+preferences.
+
+## September 17, 2026
+
+**Repository-less Slack sessions.** The Slack target classifier can start suitable work in an empty
+sandbox, while uncertain requests use a target picker that also exposes **No repository**. Session
+startup messages now use concise target-neutral copy.
+
+**Sandbox boot progress.** The sandbox runtime now connects to the control plane before it clones
+the repository, so a session shows each boot step as it runs: Cloning repository, Running setup.sh,
+Starting services, Installing skills, Starting agent, with the repository named in multi-repository
+sessions. Failure reports retain phase, repository, and error metadata, while hook stdout and stderr
+are discarded rather than collected or shown. Long setup scripts no longer trip the four-minute
+connect timeout; a boot may take up to `SANDBOX_BOOT_TIMEOUT_MS` (30 minutes by default). See
+[How Open-Inspect Works](docs/HOW_IT_WORKS.md#fresh-start-no-snapshot).
+
+## September 14, 2026
+
+**OpenCode Go models.** Adds 27 opt-in `opencode-go/*` models to Settings > Models for OpenCode
+sessions. Configure `OPENCODE_API_KEY` in Settings > Secrets with an active Go subscription. See
+[Available models](docs/AVAILABLE_MODELS.md#opencode-go).
+
+## September 9, 2026
+
+**Claude Fable 5.1.** Adds `claude-fable-5-1` to the model picker and integrations, with adaptive
+thinking controls from low through max.
+
+**Claude Agent harness.** Sessions can run on the Claude Agent SDK as a second harness beside
+OpenCode, chosen in the composer and inherited by child sessions and automations. Claude Agent
+sessions can use a **connected Claude subscription** from Settings > Provider Accounts instead of an
+API key. See [Using the Claude Agent Harness](docs/CLAUDE_AGENT.md).
+
+## September 1, 2026
+
+**Workspace audit log.** Owners, Administrators, and authorized custom roles can review paginated
+authorization activity from Settings, including allowed, denied, rejected, and no-op decisions with
+actor and resource snapshots, reasons, request context, and structured before-and-after details.
+
+**Safer event-triggered automations.** Slack, Sentry, and other event-driven automations now keep
+untrusted event content separate from authoritative workspace and automation instructions, reducing
+the risk that event payloads override unattended-run behavior.
+
+**Complete GitHub review feedback for Autofix.** Automated pull request reviews now submit their
+summary and inline findings together, ensuring Autofix receives all actionable feedback in one
+attempt while preserving comment-only reviews for bot-authored pull requests.
+
+**Larger follow-up queues.** Sessions can now retain up to 50 unfinished prompts, increased from 10,
+while preserving durable ordering and queue-full safeguards.
+
+## August 31, 2026
+
+**Workspace roles and access controls.** Every admitted user now has an Owner, Administrator,
+Member, or Viewer role, with permissions enforced across sessions, automations, settings,
+repositories, environments, and integrations. Owners and Administrators can manage member roles and
+suspensions from Settings; automation ownership and execution authority are enforced, and live
+session connections are revoked after access changes.
+
+## August 30, 2026
+
+**Dedicated, searchable settings.** Settings now use a responsive navigation surface with grouped
+category search instead of the session sidebar. The global command menu links directly to settings,
+automations, and analytics, with descriptions, keyboard guidance, and matching mobile navigation.
+
+## August 28, 2026
+
+**Faster long session timelines.** Session timelines now render only visible rows, keeping histories
+with tens of thousands of events responsive while preserving scroll position, older-history loading,
+unread observation, and expanded task details.
+
+**Simpler Slack app setup.** Self-hosted deployments now include a reusable Slack app manifest for
+the supported bot features, plus Terraform outputs for the generated event and interaction URLs.
+
+**Flexible Autofix attempt limits.** Pull request Autofix can now allow any positive per-PR attempt
+limit or no limit, with global and repository-specific settings preserved consistently.
+
+## August 27, 2026
+
+**Pull request feedback Autofix.** Opt in globally or per repository to resume a pull request's
+owning session when eligible human comments or actionable reviews arrive. Autofix supports reviews
+from the Open-Inspect GitHub App and allowlisted bots, deduplicates feedback, and enforces a rolling
+per-PR attempt limit.
+
+**GitHub Actions workflow automations.** Automations can now start when a GitHub Actions workflow
+run completes, with exact workflow-name and conclusion filters, run metadata in the agent context,
+and rerun-aware deduplication.
+
+**Configurable bot classifiers.** Slack and Linear target classifiers can now use Anthropic or
+OpenAI with provider-specific credentials. Classification requests are bounded to 15 seconds so a
+stalled provider falls back promptly to manual target selection.
+
+**Rich pull request timeline events.** Pull request tool calls now render dedicated previews for
+created, updated, draft, pending, manual, and failed outcomes, with sanitized descriptions, branch
+details, safe links, and expandable long bodies.
+
+## August 26, 2026
+
+**Reliable long-running tool calls.** Bridge heartbeats now renew sandbox activity while a prompt is
+processing, preventing event-silent work from being stopped by inactivity cleanup while preserving
+ordinary idle cleanup.
+
+## August 24, 2026
+
+**Import managed skills from repositories.** Import and re-import skills from connected GitHub or
+GitLab repositories with a complete file preview, pinned source revision, and provenance. Validation
+rejects changed, invalid, oversized, or unsupported repository content before saving.
+
 ## August 22, 2026
 
 **Unified model and reasoning selection.** New-session and follow-up composers now combine model and

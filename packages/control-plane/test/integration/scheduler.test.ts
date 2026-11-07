@@ -1,41 +1,45 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
 import { env } from "cloudflare:test";
-import { sqlDatabase } from "./helpers";
+import { seedActiveUser, sqlDatabase } from "./helpers";
 import { AutomationStore, type AutomationRow } from "../../src/db/automation-store";
+import { GitHubAutomationStore } from "../../src/db/github-automation-store";
 import type { AutomationRunStatus } from "@open-inspect/shared/types/automations";
+import type { GitHubAutomationEvent } from "@open-inspect/shared/triggers";
 import { cleanD1Tables } from "./cleanup";
+import { seedTeam } from "./ownership-test-helpers";
 import { makeRunRow, seedRun, fetchRuns } from "./run-helpers";
-import { Scheduler, resolveAutomationProviderAuth } from "../../src/scheduler/scheduler";
+import {
+  AutomationExecutionUnauthorizedError,
+  Scheduler,
+  resolveAutomationProviderAuth,
+} from "../../src/scheduler/scheduler";
 import { AutomationModelProviderAuthStore } from "../../src/db/automation-model-provider-auth";
 import { ModelProviderAccountStore } from "../../src/db/model-provider-accounts";
 import { ProviderDefaultStore } from "../../src/db/provider-account-defaults";
-import type { Env } from "../../src/types";
+import { createCloudflareEnv } from "../../src/cloudflare/platform";
 
-function getSchedulerStub(schedulerEnv = env as Env) {
-  const scheduler = new Scheduler(env.DB, schedulerEnv, { submit() {} });
-  return {
-    fetch(input: RequestInfo | URL, init?: RequestInit) {
-      return scheduler.dispatch(new Request(input, init));
-    },
-  };
+function createScheduler(schedulerEnv = createCloudflareEnv(env)) {
+  return new Scheduler(env.DB, schedulerEnv, { submit() {} });
 }
 
 function makeAutomation(overrides?: Partial<AutomationRow>): AutomationRow {
   const now = Date.now();
   return {
     id: `auto-${Math.random().toString(36).slice(2, 8)}`,
+    owner_team_id: null,
     name: "Test Automation",
     instructions: "Run tests",
     trigger_type: "schedule",
     schedule_cron: "0 9 * * *",
     schedule_tz: "UTC",
+    harness: "opencode",
     model: "anthropic/claude-sonnet-4-6",
     reasoning_effort: null,
     enabled: 1,
     next_run_at: now + 86400000,
     consecutive_failures: 0,
     created_by: "user-1",
-    user_id: null,
+    user_id: "user-1",
     created_at: now,
     updated_at: now,
     deleted_at: null,
@@ -49,6 +53,7 @@ function makeAutomation(overrides?: Partial<AutomationRow>): AutomationRow {
 describe("Scheduler (integration)", () => {
   beforeEach(async () => {
     await cleanD1Tables();
+    await seedActiveUser("user-1");
     await env.DB.exec(
       "DELETE FROM model_provider_account_defaults; DELETE FROM model_provider_accounts;"
     );
@@ -154,37 +159,9 @@ describe("Scheduler (integration)", () => {
     );
   });
 
-  // ─── Health check ─────────────────────────────────────────────────────────
-
-  describe("/internal/health", () => {
-    it("returns healthy with overdue count", async () => {
-      const store = new AutomationStore(env.DB);
-      const now = Date.now();
-      await store.create(makeAutomation({ id: "auto-h1", next_run_at: now - 60000, enabled: 1 }));
-      await store.create(makeAutomation({ id: "auto-h2", next_run_at: now + 60000, enabled: 1 }));
-
-      const stub = getSchedulerStub();
-      const res = await stub.fetch("http://internal/internal/health", { method: "GET" });
-
-      expect(res.status).toBe(200);
-      const body = await res.json<{ status: string; overdueCount: number }>();
-      expect(body.status).toBe("healthy");
-      expect(body.overdueCount).toBe(1);
-    });
-
-    it("returns zero overdue when none are due", async () => {
-      const stub = getSchedulerStub();
-      const res = await stub.fetch("http://internal/internal/health", { method: "GET" });
-
-      expect(res.status).toBe(200);
-      const body = await res.json<{ status: string; overdueCount: number }>();
-      expect(body.overdueCount).toBe(0);
-    });
-  });
-
   // ─── Run complete callback ────────────────────────────────────────────────
 
-  describe("/internal/run-complete", () => {
+  describe("run completion", () => {
     it("marks run as completed and resets failures on success", async () => {
       const store = new AutomationStore(env.DB);
       const now = Date.now();
@@ -199,22 +176,15 @@ describe("Scheduler (integration)", () => {
         })
       );
 
-      const stub = getSchedulerStub();
-      const res = await stub.fetch("http://internal/internal/run-complete", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          automationId: "auto-rc1",
-          runId: "run-rc1",
-          sessionId: "sess-1",
-          messageId: "msg-1",
-          success: true,
-        }),
+      const result = await createScheduler().runComplete({
+        automationId: "auto-rc1",
+        runId: "run-rc1",
+        sessionId: "sess-1",
+        messageId: "msg-1",
+        success: true,
       });
 
-      expect(res.status).toBe(200);
-      const body = await res.json<{ ok: boolean }>();
-      expect(body.ok).toBe(true);
+      expect(result).toBeUndefined();
 
       // Verify run status
       const run = await store.getRunById("auto-rc1", "run-rc1");
@@ -224,6 +194,76 @@ describe("Scheduler (integration)", () => {
       // Verify consecutive failures were reset
       const automation = await store.getById("auto-rc1");
       expect(automation!.consecutive_failures).toBe(0);
+    });
+
+    it("corrects a sweep-declared timeout when the real success callback arrives", async () => {
+      const store = new AutomationStore(env.DB);
+      const now = Date.now();
+      // The sweep already struck this invocation on its way to auto-pause.
+      await store.create(makeAutomation({ id: "auto-rc-late", consecutive_failures: 2 }));
+
+      const sweptRun = makeRunRow("auto-rc-late", {
+        id: "run-rc-late",
+        session_id: "sess-late",
+        status: "failed",
+        failure_reason: "execution_timeout",
+        started_at: now - 60_000,
+        completed_at: now - 1000,
+      });
+      await seedRun(sweptRun);
+      const struck = await env.DB.prepare(
+        `UPDATE automation_invocations SET failure_counted_at = ? WHERE id = ?`
+      )
+        .bind(now - 1000, sweptRun.invocation_id)
+        .run();
+      expect(struck.meta.changes).toBe(1);
+
+      await createScheduler().runComplete({
+        automationId: "auto-rc-late",
+        runId: "run-rc-late",
+        sessionId: "sess-late",
+        messageId: "msg-late",
+        success: true,
+      });
+
+      const run = await store.getRunById("auto-rc-late", "run-rc-late");
+      expect(run!.status).toBe("completed");
+      expect(run!.failure_reason).toBeNull();
+      // The correction stops at the run row: invocation accounting is
+      // unordered, so the sweep's strike stands until the next fully
+      // successful firing resets the streak.
+      expect((await store.getById("auto-rc-late"))!.consecutive_failures).toBe(2);
+      const invocation = await store.getInvocationById(sweptRun.invocation_id);
+      expect(invocation!.failure_counted_at).toBe(now - 1000);
+    });
+
+    it("leaves an observed failure final when a late success callback arrives", async () => {
+      const store = new AutomationStore(env.DB);
+      const now = Date.now();
+      await store.create(makeAutomation({ id: "auto-rc-obs", consecutive_failures: 1 }));
+
+      await seedRun(
+        makeRunRow("auto-rc-obs", {
+          id: "run-rc-obs",
+          session_id: "sess-obs",
+          status: "failed",
+          failure_reason: "Sandbox crashed",
+          started_at: now - 60_000,
+          completed_at: now - 1000,
+        })
+      );
+
+      await createScheduler().runComplete({
+        automationId: "auto-rc-obs",
+        runId: "run-rc-obs",
+        sessionId: "sess-obs",
+        messageId: "msg-obs",
+        success: true,
+      });
+
+      const run = await store.getRunById("auto-rc-obs", "run-rc-obs");
+      expect(run!.status).toBe("failed");
+      expect(run!.failure_reason).toBe("Sandbox crashed");
     });
 
     it("marks run as failed and increments failures on failure", async () => {
@@ -240,21 +280,16 @@ describe("Scheduler (integration)", () => {
         })
       );
 
-      const stub = getSchedulerStub();
-      const res = await stub.fetch("http://internal/internal/run-complete", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          automationId: "auto-rc2",
-          runId: "run-rc2",
-          sessionId: "sess-2",
-          messageId: "msg-2",
-          success: false,
-          error: "Sandbox crashed",
-        }),
+      const result = await createScheduler().runComplete({
+        automationId: "auto-rc2",
+        runId: "run-rc2",
+        sessionId: "sess-2",
+        messageId: "msg-2",
+        success: false,
+        error: "Sandbox crashed",
       });
 
-      expect(res.status).toBe(200);
+      expect(result).toBeUndefined();
 
       const run = await store.getRunById("auto-rc2", "run-rc2");
       expect(run!.status).toBe("failed");
@@ -285,19 +320,15 @@ describe("Scheduler (integration)", () => {
         })
       );
 
-      const stub = getSchedulerStub();
-      await stub.fetch("http://internal/internal/run-complete", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          automationId: "auto-rc3",
-          runId: "run-rc3",
-          sessionId: "sess-3",
-          messageId: "msg-3",
-          success: false,
-          error: "Third consecutive failure",
-        }),
+      const result = await createScheduler().runComplete({
+        automationId: "auto-rc3",
+        runId: "run-rc3",
+        sessionId: "sess-3",
+        messageId: "msg-3",
+        success: false,
+        error: "Third consecutive failure",
       });
+      expect(result).toBeUndefined();
 
       const automation = await store.getById("auto-rc3");
       expect(automation!.consecutive_failures).toBe(3);
@@ -319,19 +350,15 @@ describe("Scheduler (integration)", () => {
         })
       );
 
-      const stub = getSchedulerStub();
-      await stub.fetch("http://internal/internal/run-complete", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          automationId: "auto-rc4",
-          runId: "run-rc4",
-          sessionId: "sess-4",
-          messageId: "msg-4",
-          success: false,
-          error: "Second failure",
-        }),
+      const result = await createScheduler().runComplete({
+        automationId: "auto-rc4",
+        runId: "run-rc4",
+        sessionId: "sess-4",
+        messageId: "msg-4",
+        success: false,
+        error: "Second failure",
       });
+      expect(result).toBeUndefined();
 
       const automation = await store.getById("auto-rc4");
       expect(automation!.consecutive_failures).toBe(2);
@@ -341,16 +368,11 @@ describe("Scheduler (integration)", () => {
 
   // ─── Tick handler ─────────────────────────────────────────────────────────
 
-  describe("/internal/tick", () => {
+  describe("scheduled tick", () => {
     it("returns empty tick summary when nothing to process", async () => {
-      const stub = getSchedulerStub();
-      const res = await stub.fetch("http://internal/internal/tick", { method: "POST" });
+      const result = await createScheduler().tick();
 
-      expect(res.status).toBe(200);
-      const body = await res.json<{ processed: number; skipped: number; failed: number }>();
-      expect(body.processed).toBe(0);
-      expect(body.skipped).toBe(0);
-      expect(body.failed).toBe(0);
+      expect(result).toEqual({ processed: 0, skipped: 0, failed: 0 });
     });
 
     it("recovers orphaned starting runs during sweep", async () => {
@@ -371,9 +393,8 @@ describe("Scheduler (integration)", () => {
         })
       );
 
-      const stub = getSchedulerStub();
-      const res = await stub.fetch("http://internal/internal/tick", { method: "POST" });
-      expect(res.status).toBe(200);
+      const result = await createScheduler().tick();
+      expect(result).toEqual({ processed: 0, skipped: 0, failed: 0 });
 
       // Verify orphaned run was recovered
       const run = await store.getRunById("auto-t1", "run-orphan-t1");
@@ -385,14 +406,13 @@ describe("Scheduler (integration)", () => {
       expect(automation!.consecutive_failures).toBe(1);
     });
 
-    it("recovers timed-out running runs during sweep", async () => {
+    it("recovers running runs whose execution deadline has passed", async () => {
       const store = new AutomationStore(env.DB);
       const now = Date.now();
       await store.create(
         makeAutomation({ id: "auto-t2", next_run_at: now + 86400000, enabled: 1 })
       );
 
-      // Default EXECUTION_TIMEOUT_MS is 90 minutes
       const twoHoursAgo = now - 2 * 60 * 60 * 1000;
       await seedRun(
         makeRunRow("auto-t2", {
@@ -401,17 +421,47 @@ describe("Scheduler (integration)", () => {
           session_id: "sess-timeout",
           scheduled_at: twoHoursAgo,
           started_at: twoHoursAgo,
+          execution_deadline_at: now - 1000,
           created_at: twoHoursAgo,
         })
       );
 
-      const stub = getSchedulerStub();
-      const res = await stub.fetch("http://internal/internal/tick", { method: "POST" });
-      expect(res.status).toBe(200);
+      const result = await createScheduler().tick();
+      expect(result).toEqual({ processed: 0, skipped: 0, failed: 0 });
 
       const run = await store.getRunById("auto-t2", "run-timeout-t2");
       expect(run!.status).toBe("failed");
       expect(run!.failure_reason).toBe("execution_timeout");
+    });
+
+    it("leaves a run alone past the old 90-minute mark while its deadline is in the future", async () => {
+      const store = new AutomationStore(env.DB);
+      const now = Date.now();
+      await store.create(
+        makeAutomation({ id: "auto-t2b", next_run_at: now + 86400000, enabled: 1 })
+      );
+
+      // Three hours of real work under an eight-hour sandbox timeout: the old
+      // sweep failed this at 90 minutes while the session was still producing.
+      const threeHoursAgo = now - 3 * 60 * 60 * 1000;
+      await seedRun(
+        makeRunRow("auto-t2b", {
+          id: "run-long-t2b",
+          status: "running",
+          session_id: "sess-long",
+          scheduled_at: threeHoursAgo,
+          started_at: threeHoursAgo,
+          execution_deadline_at: threeHoursAgo + 8 * 60 * 60 * 1000,
+          created_at: threeHoursAgo,
+        })
+      );
+
+      await createScheduler().tick();
+
+      const run = await store.getRunById("auto-t2b", "run-long-t2b");
+      expect(run!.status).toBe("running");
+      expect(run!.failure_reason).toBeNull();
+      expect((await store.getById("auto-t2b"))!.consecutive_failures).toBe(0);
     });
 
     it("skips overdue automations with active runs (concurrency guard)", async () => {
@@ -432,12 +482,9 @@ describe("Scheduler (integration)", () => {
         })
       );
 
-      const stub = getSchedulerStub();
-      const res = await stub.fetch("http://internal/internal/tick", { method: "POST" });
-      expect(res.status).toBe(200);
-
-      const body = await res.json<{ processed: number; skipped: number; failed: number }>();
-      expect(body.skipped).toBeGreaterThanOrEqual(1);
+      const result = await createScheduler().tick();
+      expect(result).toMatchObject({ processed: 0, skipped: expect.any(Number), failed: 0 });
+      expect(result.skipped).toBeGreaterThanOrEqual(1);
 
       // Assert on the automation this test owns rather than only the tick's
       // global counters: auto-t3 must get exactly one skipped firing — a
@@ -469,12 +516,8 @@ describe("Scheduler (integration)", () => {
       });
       await store.create(overdue);
 
-      const stub = getSchedulerStub();
-      const res = await stub.fetch("http://internal/internal/tick", { method: "POST" });
-      expect(res.status).toBe(200);
-
-      const body = await res.json<{ processed: number; skipped: number; failed: number }>();
-      expect(body.processed + body.failed).toBeGreaterThanOrEqual(1);
+      const result = await createScheduler().tick();
+      expect(result.processed + result.failed).toBeGreaterThanOrEqual(1);
 
       // Assert on auto-t4 specifically rather than the tick's global counters.
       // Session creation may succeed or fail in the test env; either way the
@@ -488,6 +531,41 @@ describe("Scheduler (integration)", () => {
       const automation = await store.getById("auto-t4");
       expect(automation!.next_run_at).not.toBeNull();
       expect(automation!.next_run_at!).toBeGreaterThan(now);
+    });
+
+    it("records and pauses an authorization-denied schedule so it is not repeatedly overdue", async () => {
+      const store = new AutomationStore(env.DB);
+      const scheduledAt = Date.now() - 60_000;
+      await store.create(
+        makeAutomation({ id: "auto-denied-schedule", next_run_at: scheduledAt, enabled: 1 })
+      );
+      await env.DB.prepare(
+        "UPDATE user_role_assignments SET role_id = 'role_builtin_viewer' WHERE user_id = ?"
+      )
+        .bind("user-1")
+        .run();
+
+      expect(await createScheduler().tick()).toMatchObject({ skipped: 1, failed: 0 });
+      const denied = await store.getById("auto-denied-schedule");
+      expect(denied).toMatchObject({ enabled: 0, next_run_at: null });
+      const firstInvocations = await store.listInvocations("auto-denied-schedule", {
+        limit: 20,
+        offset: 0,
+      });
+      expect(firstInvocations.invocations).toEqual([
+        expect.objectContaining({
+          status: "skipped",
+          skipReason: "execution_authorization_denied",
+          scheduledAt,
+        }),
+      ]);
+
+      expect(await createScheduler().tick()).toEqual({ processed: 0, skipped: 0, failed: 0 });
+      const secondInvocations = await store.listInvocations("auto-denied-schedule", {
+        limit: 20,
+        offset: 0,
+      });
+      expect(secondInvocations.invocations).toHaveLength(1);
     });
 
     it("auto-pauses after recovery sweep detects 3rd consecutive failure", async () => {
@@ -512,8 +590,7 @@ describe("Scheduler (integration)", () => {
         })
       );
 
-      const stub = getSchedulerStub();
-      await stub.fetch("http://internal/internal/tick", { method: "POST" });
+      await createScheduler().tick();
 
       const automation = await store.getById("auto-t5");
       expect(automation!.consecutive_failures).toBe(3);
@@ -541,9 +618,7 @@ describe("Scheduler (integration)", () => {
         );
       }
 
-      const stub = getSchedulerStub();
-      const res = await stub.fetch("http://internal/internal/tick", { method: "POST" });
-      expect(res.status).toBe(200);
+      await createScheduler().tick();
 
       for (const runId of runIds) {
         const run = await store.getRunById("auto-t6", runId);
@@ -558,7 +633,7 @@ describe("Scheduler (integration)", () => {
 
   // ─── Trigger handler ──────────────────────────────────────────────────────
 
-  describe("/internal/trigger", () => {
+  describe("manual trigger", () => {
     it("admits exactly one run across two triggers and a concurrent tick", async () => {
       const store = new AutomationStore(env.DB);
       const dueAt = Date.now() - 60_000;
@@ -582,49 +657,49 @@ describe("Scheduler (integration)", () => {
         }
         return new Response("Not Found", { status: 404 });
       });
-      const schedulerEnv = {
-        ...(env as Env),
+      const schedulerEnv = createCloudflareEnv({
+        ...env,
         SESSION: {
           idFromName: vi.fn((name: string) => name),
           get: vi.fn(() => ({ fetch: sessionFetch })),
         } as unknown as DurableObjectNamespace,
-      };
+      });
 
-      const triggerRequest = () =>
-        new Request("http://internal/internal/trigger", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ automationId: "auto-concurrent-admission" }),
-        });
       const schedulers = [
-        getSchedulerStub(schedulerEnv),
-        getSchedulerStub(schedulerEnv),
-        getSchedulerStub(schedulerEnv),
+        createScheduler(schedulerEnv),
+        createScheduler(schedulerEnv),
+        createScheduler(schedulerEnv),
       ];
 
-      // Not allSettled: a rejected entry point is itself a failure of this
-      // gate. Losing the admission race must degrade to a clean status code,
-      // not a thrown request — that is exactly what the removed Durable
-      // Object used to guarantee by serializing every caller.
-      const [triggerA, triggerB, tick] = await Promise.all([
-        schedulers[0]!.fetch(triggerRequest()),
-        schedulers[1]!.fetch(triggerRequest()),
-        schedulers[2]!.fetch("http://internal/internal/tick", { method: "POST" }),
+      const [triggerA, triggerB, tick] = await Promise.allSettled([
+        schedulers[0]!.trigger("auto-concurrent-admission", "user-1"),
+        schedulers[1]!.trigger("auto-concurrent-admission", "user-1"),
+        schedulers[2]!.tick(),
       ]);
 
-      const triggerStatuses = [triggerA.status, triggerB.status].sort();
-      const tickSummary = await tick.json<{ processed: number; skipped: number }>();
-
-      expect(tick.status).toBe(200);
       // Exactly one admission across all three entry points: either a trigger
-      // won (the other returns 409 and the tick found nothing to process) or
-      // the tick won (both triggers return 409).
-      if (triggerStatuses.includes(201)) {
-        expect(triggerStatuses).toEqual([201, 409]);
-        expect(tickSummary.processed).toBe(0);
-      } else {
-        expect(triggerStatuses).toEqual([409, 409]);
-        expect(tickSummary.processed).toBe(1);
+      // fulfills or the tick processes the firing. Every losing trigger rejects
+      // as blocked.
+      expect(tick.status).toBe("fulfilled");
+      if (tick.status !== "fulfilled") throw tick.reason;
+
+      const triggers = [triggerA, triggerB];
+      const successfulTriggers = triggers.filter((result) => result.status === "fulfilled");
+      const blockedTriggers = triggers.filter((result) => result.status === "rejected");
+      expect(successfulTriggers).toHaveLength(tick.value.processed === 1 ? 0 : 1);
+      expect(successfulTriggers.length + tick.value.processed).toBe(1);
+      for (const successful of successfulTriggers) {
+        expect(successful).toMatchObject({
+          status: "fulfilled",
+          value: { invocationId: expect.any(String), runs: [expect.any(Object)] },
+        });
+      }
+      expect(blockedTriggers).toHaveLength(2 - successfulTriggers.length);
+      for (const blocked of blockedTriggers) {
+        expect(blocked).toMatchObject({
+          status: "rejected",
+          reason: expect.objectContaining({ message: "An active run already exists" }),
+        });
       }
 
       const runs = await fetchRuns("auto-concurrent-admission");
@@ -698,27 +773,13 @@ describe("Scheduler (integration)", () => {
       expect((await store.getById("auto-slot-ownership"))!.next_run_at).toBe(winnerNext);
     });
 
-    it("returns 400 when automationId is missing", async () => {
-      const stub = getSchedulerStub();
-      const res = await stub.fetch("http://internal/internal/trigger", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({}),
-      });
-      expect(res.status).toBe(400);
+    it("rejects when automation is not found", async () => {
+      await expect(createScheduler().trigger("nonexistent", "user-1")).rejects.toThrow(
+        "Automation not found"
+      );
     });
 
-    it("returns 404 when automation not found", async () => {
-      const stub = getSchedulerStub();
-      const res = await stub.fetch("http://internal/internal/trigger", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ automationId: "nonexistent" }),
-      });
-      expect(res.status).toBe(404);
-    });
-
-    it("returns 409 when active run exists", async () => {
+    it("rejects when active run exists", async () => {
       const store = new AutomationStore(env.DB);
       const now = Date.now();
       await store.create(makeAutomation({ id: "auto-trig1" }));
@@ -732,40 +793,121 @@ describe("Scheduler (integration)", () => {
         })
       );
 
-      const stub = getSchedulerStub();
-      const res = await stub.fetch("http://internal/internal/trigger", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ automationId: "auto-trig1" }),
-      });
-      expect(res.status).toBe(409);
+      await expect(createScheduler().trigger("auto-trig1", "user-1")).rejects.toThrow(
+        "An active run already exists"
+      );
     });
 
-    it("creates a run record when triggered", async () => {
+    it("requires the requester to have session execution authority", async () => {
+      const requesterId = "manual-trigger-requester";
+      await seedActiveUser(requesterId);
+      const roleId = "role_manual_trigger_only";
+      await env.DB.batch([
+        env.DB.prepare(
+          `INSERT INTO roles (id, key, name, normalized_name, description, is_system)
+           VALUES (?, NULL, 'Manual Trigger Only', 'manual trigger only', NULL, 0)`
+        ).bind(roleId),
+        env.DB.prepare(
+          `INSERT INTO role_permissions (role_id, permission_id)
+           VALUES (?, 'automations.trigger.any')`
+        ).bind(roleId),
+        env.DB.prepare(`UPDATE user_role_assignments SET role_id = ? WHERE user_id = ?`).bind(
+          roleId,
+          requesterId
+        ),
+      ]);
       const store = new AutomationStore(env.DB);
-      await store.create(makeAutomation({ id: "auto-trig2" }));
+      await store.create(makeAutomation({ id: "auto-trigger-only" }));
 
-      const stub = getSchedulerStub();
-      const res = await stub.fetch("http://internal/internal/trigger", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ automationId: "auto-trig2" }),
+      await expect(
+        createScheduler().trigger("auto-trigger-only", requesterId)
+      ).rejects.toBeInstanceOf(AutomationExecutionUnauthorizedError);
+      expect(await fetchRuns("auto-trigger-only")).toEqual([]);
+    });
+
+    it("creates manual-trigger sessions as the requester", async () => {
+      const requesterId = "manual-trigger-requester";
+      await seedActiveUser(requesterId);
+      const store = new AutomationStore(env.DB);
+      await store.create(makeAutomation({ id: "auto-requester-principal" }));
+      const promptBodies: Array<Record<string, unknown>> = [];
+      const sessionFetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const request = input instanceof Request ? input : new Request(input, init);
+        const path = new URL(request.url).pathname;
+        if (path === "/internal/init") return Response.json({ status: "ok" });
+        if (path === "/internal/prompt") {
+          promptBodies.push(await request.json<Record<string, unknown>>());
+          return Response.json({ messageId: "msg-requester", status: "queued" });
+        }
+        return new Response("Not Found", { status: 404 });
+      });
+      const schedulerEnv = createCloudflareEnv({
+        ...env,
+        SESSION: {
+          idFromName: vi.fn((name: string) => name),
+          get: vi.fn(() => ({ fetch: sessionFetch })),
+        } as unknown as DurableObjectNamespace,
       });
 
-      // Trigger will attempt session creation. In test env it may succeed (201)
-      // or fail at prompt sending (500). Either way, a run record is created.
-      expect([201, 500]).toContain(res.status);
+      await createScheduler(schedulerEnv).trigger("auto-requester-principal", requesterId);
+
+      expect(
+        await env.DB.prepare(
+          `SELECT user_id FROM sessions WHERE automation_id = 'auto-requester-principal'`
+        ).first()
+      ).toEqual({ user_id: requesterId });
+      expect(promptBodies).toContainEqual(
+        expect.objectContaining({ authorId: requesterId, canonicalUserId: requesterId })
+      );
+    });
+
+    it("repairs a legacy owner before creating a triggered run", async () => {
+      const store = new AutomationStore(env.DB);
+      await env.DB.prepare(
+        `INSERT INTO user_identities
+          (id, user_id, provider, provider_user_id, provider_issuer, created_at, updated_at)
+         VALUES ('legacy-identity', 'user-1', 'github', 'legacy-github-id',
+           'https://github.com', 1, 1)`
+      ).run();
+      await store.create(
+        makeAutomation({ id: "auto-trig2", created_by: "legacy-github-id", user_id: null })
+      );
+
+      const sessionFetch = vi.fn(async (input: RequestInfo | URL) => {
+        const path = new URL(
+          typeof input === "string" ? input : input instanceof Request ? input.url : input.href
+        ).pathname;
+        if (path === "/internal/init") return Response.json({ status: "ok" });
+        if (path === "/internal/prompt") {
+          return Response.json({ messageId: "msg-trigger", status: "queued" });
+        }
+        return new Response("Not Found", { status: 404 });
+      });
+      const schedulerEnv = createCloudflareEnv({
+        ...env,
+        SESSION: {
+          idFromName: vi.fn((name: string) => name),
+          get: vi.fn(() => ({ fetch: sessionFetch })),
+        } as unknown as DurableObjectNamespace,
+      });
+
+      const result = await createScheduler(schedulerEnv).trigger("auto-trig2", "user-1");
+      expect(result).toEqual({
+        invocationId: expect.any(String),
+        runs: [expect.objectContaining({ status: "running" })],
+      });
 
       const runs = await fetchRuns("auto-trig2");
-      expect(runs.length).toBeGreaterThanOrEqual(1);
+      expect(runs).toHaveLength(1);
       expect(runs[0]!.invocation_id).not.toBeNull();
+      expect((await store.getById("auto-trig2"))!.user_id).toBe("user-1");
     });
   });
 
   // ─── Invocation finalization (D2) ─────────────────────────────────────────
 
   describe("invocation finalization", () => {
-    /** Seed an invocation with N children in the given statuses via the real guarded insert. */
+    /** Seed an invocation with N children in the given statuses via the real conditional insert. */
     async function seedInvocation(
       store: AutomationStore,
       automationId: string,
@@ -797,6 +939,7 @@ describe("Scheduler (integration)", () => {
           failure_reason: child.status === "failed" ? "seeded failure" : null,
           scheduled_at: now,
           started_at: child.status === "starting" ? null : now,
+          execution_deadline_at: child.status === "running" ? now + 60_000 : null,
           completed_at: child.status === "failed" || child.status === "completed" ? now : null,
           created_at: now + index,
           repo_owner: null,
@@ -810,23 +953,14 @@ describe("Scheduler (integration)", () => {
       expect(inserted).toBe(true);
     }
 
-    async function completeRun(
-      automationId: string,
-      runId: string,
-      success: boolean
-    ): Promise<Response> {
-      const stub = getSchedulerStub();
-      return stub.fetch("http://internal/internal/run-complete", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          automationId,
-          runId,
-          sessionId: `sess-${runId}`,
-          messageId: `msg-${runId}`,
-          success,
-          ...(success ? {} : { error: "boom" }),
-        }),
+    async function completeRun(automationId: string, runId: string, success: boolean) {
+      return createScheduler().runComplete({
+        automationId,
+        runId,
+        sessionId: `sess-${runId}`,
+        messageId: `msg-${runId}`,
+        success,
+        ...(success ? {} : { error: "boom" }),
       });
     }
 
@@ -883,14 +1017,14 @@ describe("Scheduler (integration)", () => {
       // died after the child update, before the callback's accounting).
       await seedInvocation(store, "auto-f2", "inv-f2", [{ id: "run-f2-a", status: "failed" }]);
 
-      const stub = getSchedulerStub();
-      await stub.fetch("http://internal/internal/tick", { method: "POST" });
+      const scheduler = createScheduler();
+      await scheduler.tick();
 
       let automation = await store.getById("auto-f2");
       expect(automation!.consecutive_failures).toBe(1);
 
       // A second sweep must not double-strike (failure_counted_at CAS).
-      await stub.fetch("http://internal/internal/tick", { method: "POST" });
+      await scheduler.tick();
       automation = await store.getById("auto-f2");
       expect(automation!.consecutive_failures).toBe(1);
     });
@@ -906,19 +1040,168 @@ describe("Scheduler (integration)", () => {
         { id: "run-f2r-b", status: "completed" },
       ]);
 
-      const stub = getSchedulerStub();
-      await stub.fetch("http://internal/internal/tick", { method: "POST" });
+      await createScheduler().tick();
 
       const automation = await store.getById("auto-f2r");
       expect(automation!.consecutive_failures).toBe(0);
     });
-  });
 
-  // ─── Unknown routes ────────────────────────────────────────────────────────
+    describe("neutral-denial recovery", () => {
+      const automationId = "auto-neutral-recovery";
+      const deniedEvent: GitHubAutomationEvent = {
+        source: "github",
+        eventType: "pull_request.opened",
+        repositoryId: 101,
+        repoOwner: "acme",
+        repoName: "app",
+        triggerKey: "github:101:pr:7:opened",
+        concurrencyKey: "github:101:pr:7",
+        contextBlock: "Pull request #7 opened.",
+        meta: {},
+      };
 
-  it("returns 404 for unknown routes", async () => {
-    const stub = getSchedulerStub();
-    const res = await stub.fetch("http://internal/unknown", { method: "GET" });
-    expect(res.status).toBe(404);
+      beforeEach(async () => {
+        await seedTeam("team-neutral-recovery");
+        await new AutomationStore(env.DB).create(
+          makeAutomation({
+            id: automationId,
+            owner_team_id: "team-neutral-recovery",
+            consecutive_failures: 2,
+          })
+        );
+      });
+
+      it("recovers a missed success reset through a newer conditional GitHub denial", async () => {
+        const store = new AutomationStore(env.DB);
+        const now = Date.now();
+        const success = makeRunRow(automationId, {
+          status: "completed",
+          created_at: now - 60_000,
+          completed_at: now - 59_000,
+        });
+        await seedRun(success);
+        expect(
+          await new GitHubAutomationStore(env.DB).recordGitHubGrantDenied(automationId, deniedEvent)
+        ).toBe(true);
+        const history = await store.listInvocations(automationId, { limit: 10, offset: 0 });
+        const denied = history.invocations[0];
+        expect(denied).toMatchObject({
+          status: "unauthorized",
+          skipReason: null,
+          runs: [
+            expect.objectContaining({ status: "unauthorized", failureReason: "repo_not_granted" }),
+          ],
+        });
+        expect(denied.createdAt).toBeGreaterThan(success.created_at);
+        expect(await store.getInvocationById(denied.id)).toMatchObject({
+          skip_reason: null,
+          failure_counted_at: null,
+        });
+        expect(await store.getInvocationRunAggregate(denied.id)).toMatchObject({
+          total: 1,
+          active: 0,
+          failed: 0,
+          completed: 0,
+          skipped: 0,
+        });
+        expect(await store.getStaleFailureResetCandidates(now - 120_000, 10)).toEqual([
+          { automation_id: automationId, invocation_id: success.invocation_id },
+        ]);
+
+        expect(await createScheduler().tick()).toEqual({ processed: 0, skipped: 0, failed: 0 });
+
+        expect(await store.getById(automationId)).toMatchObject({
+          enabled: 1,
+          consecutive_failures: 0,
+        });
+        expect(await store.listInvocations(automationId, { limit: 10, offset: 0 })).toEqual(
+          history
+        );
+        expect(await store.getInvocationById(denied.id)).toMatchObject({
+          failure_counted_at: null,
+        });
+      });
+
+      it("does not reset a streak with only unauthorized and skipped history", async () => {
+        const store = new AutomationStore(env.DB);
+        const now = Date.now();
+        await seedRun(
+          makeRunRow(automationId, {
+            status: "skipped",
+            skip_reason: "concurrent_run_active",
+            created_at: now - 60_000,
+            completed_at: now - 59_000,
+          })
+        );
+        expect(
+          await new GitHubAutomationStore(env.DB).recordGitHubGrantDenied(automationId, deniedEvent)
+        ).toBe(true);
+
+        expect(await store.getStaleFailureResetCandidates(now - 120_000, 10)).toEqual([]);
+        expect(await createScheduler().tick()).toEqual({ processed: 0, skipped: 0, failed: 0 });
+        expect(await store.getById(automationId)).toMatchObject({
+          enabled: 1,
+          consecutive_failures: 2,
+        });
+      });
+
+      it.each([
+        ["starting", false],
+        ["starting", true],
+        ["running", false],
+        ["running", true],
+        ["failed", false],
+        ["failed", true],
+      ] as const)(
+        "keeps a newer %s invocation as a reset barrier (unauthorized sibling: %s)",
+        async (status, unauthorizedSibling) => {
+          const store = new AutomationStore(env.DB);
+          const now = Date.now();
+          await seedRun(
+            makeRunRow(automationId, {
+              status: "completed",
+              created_at: now - 60_000,
+              completed_at: now - 59_000,
+            })
+          );
+          const barrier = makeRunRow(automationId, {
+            status,
+            created_at: now - 30_000,
+            started_at: status === "running" ? now - 30_000 : null,
+            execution_deadline_at: status === "running" ? now + 60_000 : null,
+            completed_at: status === "failed" ? now - 29_000 : null,
+            failure_reason: status === "failed" ? "seeded failure" : null,
+          });
+          await seedRun(barrier);
+          if (unauthorizedSibling) {
+            await seedRun(
+              makeRunRow(automationId, {
+                invocation_id: barrier.invocation_id,
+                status: "unauthorized",
+                failure_reason: "repo_not_granted",
+                created_at: now - 30_000,
+                completed_at: now - 29_000,
+              })
+            );
+          }
+          expect(
+            await new GitHubAutomationStore(env.DB).recordGitHubGrantDenied(
+              automationId,
+              deniedEvent
+            )
+          ).toBe(true);
+
+          expect(await store.getStaleFailureResetCandidates(now - 120_000, 10)).toEqual([
+            { automation_id: automationId, invocation_id: barrier.invocation_id },
+          ]);
+          expect(await createScheduler().tick()).toEqual({ processed: 0, skipped: 0, failed: 0 });
+          expect(await store.getById(automationId)).toMatchObject({
+            consecutive_failures: status === "failed" ? 3 : 2,
+            enabled: status === "failed" ? 0 : 1,
+          });
+          expect(await store.getRunById(automationId, barrier.id)).toMatchObject({ status });
+        }
+      );
+    });
   });
 });

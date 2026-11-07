@@ -75,14 +75,20 @@ export async function reconcileGovernanceCatalogNow(
   const source: GovernanceSource = { provider: provider.name, ...config };
   const store = new GovernanceCatalogStore(db);
   try {
-    const snapshot = await readRepositorySnapshot(provider, {
-      owner: config.owner,
-      name: config.name,
-      ref: config.ref,
-      path: config.path,
-      maxFiles: GOVERNANCE_MAX_FILES,
-      maxBytes: GOVERNANCE_MAX_BYTES,
-    });
+    const access = await provider.checkRepositoryAccess(config);
+    if (!access) throw new Error("Governance repository is not accessible");
+    const snapshot = await readRepositorySnapshot(
+      provider,
+      {
+        owner: config.owner,
+        name: config.name,
+        ref: config.ref,
+        path: config.path,
+        maxFiles: GOVERNANCE_MAX_FILES,
+        maxBytes: GOVERNANCE_MAX_BYTES,
+      },
+      { kind: "repositories", repositoryIds: [access.repoId] }
+    );
     const catalog = parseGovernanceCatalog(snapshot, config.path);
     const resolvedMcpMetadata = await Promise.all(
       catalog.mcpServers.map(({ sourcePath, definition }) =>
@@ -150,8 +156,7 @@ export async function reconcileGovernanceCatalogNow(
 export async function reconcileGovernanceCatalog(env: Env): Promise<GovernanceCatalogStatus> {
   const namespace = env.GOVERNANCE_CATALOG;
   if (!namespace) throw new Error("Governance catalogue coordinator is not configured");
-  const id = namespace.idFromName("singleton");
-  const response = await namespace.get(id).fetch("https://governance.internal/sync", {
+  const response = await namespace.fetch("https://governance.internal/sync", {
     method: "POST",
   });
   const body: unknown = await response.json();

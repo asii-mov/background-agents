@@ -26,12 +26,15 @@ vi.mock("@/hooks/use-environments", () => ({
 }));
 
 const noop = () => {};
+const CURRENT_USER_ID = "11111111111111111111111111111111";
+const NO_CAPABILITIES = { canRead: false, canManage: false, canTrigger: false };
 
 function makeAutomation(overrides: Partial<AutomationListItem> = {}): AutomationListItem {
   return {
     id: "auto-1",
     name: "Nightly review",
     instructions: "Review the repo.",
+    harness: "opencode",
     triggerType: "schedule",
     scheduleCron: "0 9 * * *",
     scheduleTz: "UTC",
@@ -41,6 +44,8 @@ function makeAutomation(overrides: Partial<AutomationListItem> = {}): Automation
     nextRunAt: null,
     consecutiveFailures: 0,
     createdBy: "user-1",
+    userId: CURRENT_USER_ID,
+    ownerTeamId: null,
     createdAt: Date.now(),
     updatedAt: Date.now(),
     deletedAt: null,
@@ -50,6 +55,7 @@ function makeAutomation(overrides: Partial<AutomationListItem> = {}): Automation
     environmentIds: [],
     providerSelections: {},
     recentExecutions: [],
+    capabilities: { canRead: true, canManage: true, canTrigger: true },
     ...overrides,
   };
 }
@@ -58,6 +64,7 @@ describe("AutomationsList repository labels", () => {
   const renderList = (automations: AutomationListItem[]) =>
     render(
       <AutomationsList
+        canCreate
         automations={automations}
         emptyState={{ kind: "no-automations" }}
         onPause={noop}
@@ -102,6 +109,7 @@ describe("AutomationsList schedule metadata", () => {
 
     render(
       <AutomationsList
+        canCreate
         automations={[makeAutomation({ nextRunAt: Date.now() + 2 * 60 * 60 * 1000 })]}
         emptyState={{ kind: "no-automations" }}
         onPause={noop}
@@ -117,10 +125,62 @@ describe("AutomationsList schedule metadata", () => {
 });
 
 describe("AutomationsList actions", () => {
+  const renderListWithActions = (automation: AutomationListItem) =>
+    render(
+      <AutomationsList
+        canCreate
+        automations={[automation]}
+        emptyState={{ kind: "no-automations" }}
+        onPause={noop}
+        onResume={noop}
+        onTrigger={noop}
+        onDelete={noop}
+      />
+    );
+
+  it("disables controls without capabilities, regardless of ownership", () => {
+    render(
+      <AutomationsList
+        canCreate
+        automations={[
+          makeAutomation({
+            createdBy: CURRENT_USER_ID,
+            userId: "22222222222222222222222222222222",
+            capabilities: NO_CAPABILITIES,
+          }),
+        ]}
+        emptyState={{ kind: "no-automations" }}
+        onPause={noop}
+        onResume={noop}
+        onTrigger={noop}
+        onDelete={noop}
+      />
+    );
+
+    expect(screen.queryByRole("button", { name: "Pause" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Trigger" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Delete" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /actions for/i })).not.toBeInTheDocument();
+  });
+
+  it("gates manage and trigger controls independently", () => {
+    renderListWithActions(
+      makeAutomation({
+        userId: null,
+        capabilities: { canRead: true, canManage: true, canTrigger: false },
+      })
+    );
+
+    expect(screen.getByRole("button", { name: "Pause" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Delete" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Trigger" })).not.toBeInTheDocument();
+  });
+
   it("offers row actions from the compact menu", async () => {
     const onTrigger = vi.fn();
     render(
       <AutomationsList
+        canCreate
         automations={[makeAutomation()]}
         emptyState={{ kind: "no-automations" }}
         onPause={noop}
@@ -143,6 +203,7 @@ describe("AutomationsList actions", () => {
     const onDelete = vi.fn();
     render(
       <AutomationsList
+        canCreate
         automations={[makeAutomation()]}
         emptyState={{ kind: "no-automations" }}
         onPause={noop}
@@ -165,9 +226,34 @@ describe("AutomationsList actions", () => {
 });
 
 describe("AutomationsList execution activity", () => {
+  it("renders an unauthorized execution as a terminal denial with an accessible label", () => {
+    render(
+      <AutomationsList
+        canCreate
+        automations={[
+          makeAutomation({
+            recentExecutions: [{ id: "inv-denied", status: "unauthorized", createdAt: 100 }],
+          }),
+        ]}
+        emptyState={{ kind: "no-automations" }}
+        onPause={noop}
+        onResume={noop}
+        onTrigger={noop}
+        onDelete={noop}
+      />
+    );
+
+    const execution = screen.getByRole("listitem", { name: /^Unauthorized,/ });
+    expect(execution).toHaveAttribute("title", expect.stringContaining("Unauthorized"));
+    expect(execution).toHaveAttribute("data-status-shape", "unauthorized");
+    expect(execution.firstElementChild).toHaveAttribute("class", "h-px w-2 bg-current");
+    expect(execution).toHaveAttribute("tabindex", "0");
+  });
+
   it("shows recent execution statuses from oldest to newest", () => {
     render(
       <AutomationsList
+        canCreate
         automations={[
           makeAutomation({
             recentExecutions: [
@@ -200,6 +286,7 @@ describe("AutomationsList execution activity", () => {
   it("shows an explicit empty history state", () => {
     render(
       <AutomationsList
+        canCreate
         automations={[makeAutomation()]}
         emptyState={{ kind: "no-automations" }}
         onPause={noop}
@@ -217,6 +304,7 @@ describe("AutomationsList empty state", () => {
   it("offers a template path and a from-scratch path when there are no automations", () => {
     render(
       <AutomationsList
+        canCreate
         automations={[]}
         emptyState={{ kind: "no-automations" }}
         onPause={noop}
@@ -236,9 +324,27 @@ describe("AutomationsList empty state", () => {
     );
   });
 
+  it("hides creation entry points when creation is not allowed", () => {
+    render(
+      <AutomationsList
+        canCreate={false}
+        automations={[]}
+        emptyState={{ kind: "no-automations" }}
+        onPause={noop}
+        onResume={noop}
+        onTrigger={noop}
+        onDelete={noop}
+      />
+    );
+
+    expect(screen.queryByRole("link", { name: /template/i })).not.toBeInTheDocument();
+    expect(screen.queryByRole("link", { name: /create automation/i })).not.toBeInTheDocument();
+  });
+
   it("describes an empty name search without showing creation prompts", () => {
     render(
       <AutomationsList
+        canCreate
         automations={[]}
         emptyState={{ kind: "no-search-results", nameSearch: "release" }}
         onPause={noop}

@@ -98,6 +98,24 @@ describe("POST /sessions/:id/scm-credentials", () => {
     expect(body.error).toMatch(/GitHub App not configured/i);
   });
 
+  it("refuses credentials for a repository outside the session", async () => {
+    const { sessionName, sandboxToken } = await setupSession();
+
+    const res = await SELF.fetch(`https://test.local/sessions/${sessionName}/scm-credentials`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${sandboxToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ repoOwner: "acme", repoName: "payments" }),
+    });
+
+    expect(res.status).toBe(403);
+    const body = await res.json<Record<string, unknown>>();
+    expect(body).not.toHaveProperty("username");
+    expect(body).not.toHaveProperty("password");
+  });
+
   it("rejects a sandbox token bound to another session", async () => {
     const { sandboxToken } = await setupSession();
     const { sessionName } = await setupSession();

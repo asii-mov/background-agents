@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState, type ReactNode } from "react";
+import { useEffect, useState } from "react";
 import useSWR, { mutate } from "swr";
 import { toast } from "sonner";
 import { DEFAULT_MENTIONS_POLICY } from "@open-inspect/shared/slack";
@@ -14,6 +14,7 @@ import type {
   ListEnvironmentsResponse,
 } from "@open-inspect/shared/types/environments";
 import {
+  DEFAULT_SLACK_UNBOUND_CHANNELS,
   MAX_SESSION_INSTRUCTIONS_LENGTH,
   MAX_SLACK_ROUTING_RULES,
   type SlackGlobalConfig,
@@ -28,6 +29,7 @@ import { useEnabledModels } from "@/hooks/use-enabled-models";
 import { ENVIRONMENTS_KEY } from "@/hooks/use-environments";
 import { environmentOptionValue, parseEnvironmentOptionValue } from "@/lib/session-target";
 import { IntegrationSettingsSkeleton } from "./integration-settings-skeleton";
+import { SettingsCardSection } from "../settings-card-section";
 import { Button } from "@/components/ui/button";
 import { APP_NAME } from "@/lib/site-config";
 import { RadioCard } from "@/components/ui/form-controls";
@@ -52,6 +54,7 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
+import { useCurrentUserAuthorization } from "@/hooks/use-current-user-authorization";
 
 const GLOBAL_SETTINGS_KEY = "/api/integration-settings/slack";
 const REPO_SETTINGS_KEY = "/api/integration-settings/slack/repos";
@@ -113,7 +116,13 @@ function mergedGlobalDefaults(
   return defaults;
 }
 
+/**
+ * Displays Slack integration settings with global and repository edits gated by their respective permissions.
+ */
 export function SlackIntegrationSettings() {
+  const { hasPermission } = useCurrentUserAuthorization();
+  const canManageGlobal = hasPermission("integrations.manage");
+  const canManageRepos = hasPermission("repositories.settings.manage");
   const { data: globalData, isLoading: globalLoading } =
     useSWR<GlobalResponse>(GLOBAL_SETTINGS_KEY);
   const { data: repoSettingsData, isLoading: repoSettingsLoading } =
@@ -136,13 +145,13 @@ export function SlackIntegrationSettings() {
 
   return (
     <div>
-      <h3 className="text-lg font-semibold text-foreground mb-1">Slack</h3>
+      <h2 className="text-lg font-semibold text-foreground mb-1">Slack</h2>
       <p className="text-sm text-muted-foreground mb-6">
         Let agents post Slack notifications when the user explicitly asks for them. Posts go through
         the control plane — the Slack token never enters the sandbox.
       </p>
 
-      <Section
+      <SettingsCardSection
         title="Channel access"
         description={`${APP_NAME} does not maintain its own channel allowlist.`}
       >
@@ -151,29 +160,41 @@ export function SlackIntegrationSettings() {
           Slack. The bot can post only to channels it&apos;s a member of; remove access by kicking
           the bot from the channel.
         </p>
-      </Section>
+      </SettingsCardSection>
 
-      <GlobalSettingsSection settings={settings} />
+      <fieldset disabled={!canManageGlobal} className="min-w-0">
+        <GlobalSettingsSection settings={settings} canManageGlobal={canManageGlobal} />
+      </fieldset>
 
-      <RoutingRulesSection
-        settings={settings}
-        availableRepos={availableRepos}
-        availableEnvironments={availableEnvironments}
-        reposLoaded={reposLoaded}
-        environmentsLoaded={environmentsLoaded}
-      />
+      <fieldset disabled={!canManageGlobal} className="min-w-0">
+        <RoutingRulesSection
+          settings={settings}
+          availableRepos={availableRepos}
+          availableEnvironments={availableEnvironments}
+          reposLoaded={reposLoaded}
+          environmentsLoaded={environmentsLoaded}
+        />
+      </fieldset>
 
-      <Section
+      <SettingsCardSection
         title="Repository overrides"
         description="Override the master switch for specific repositories. Mentions policy is workspace-wide and is not overridable per repo."
       >
-        <RepoOverridesSection overrides={repoOverrides} availableRepos={availableRepos} />
-      </Section>
+        <fieldset disabled={!canManageRepos} className="min-w-0">
+          <RepoOverridesSection overrides={repoOverrides} availableRepos={availableRepos} />
+        </fieldset>
+      </SettingsCardSection>
     </div>
   );
 }
 
-function GlobalSettingsSection({ settings }: { settings: SlackGlobalConfig | null | undefined }) {
+function GlobalSettingsSection({
+  settings,
+  canManageGlobal,
+}: {
+  settings: SlackGlobalConfig | null | undefined;
+  canManageGlobal: boolean;
+}) {
   const { enabledModels, enabledModelOptions, loading: modelsLoading } = useEnabledModels();
   const [agentNotificationsEnabled, setAgentNotificationsEnabled] = useState(
     settings?.defaults?.agentNotificationsEnabled ?? false
@@ -185,6 +206,9 @@ function GlobalSettingsSection({ settings }: { settings: SlackGlobalConfig | nul
   const [sessionInstructions, setSessionInstructions] = useState(
     settings?.defaults?.sessionInstructions ?? ""
   );
+  const [unboundChannels, setUnboundChannels] = useState<"workspace" | "reject">(
+    settings?.defaults?.unboundChannels ?? DEFAULT_SLACK_UNBOUND_CHANNELS
+  );
   const [saving, setSaving] = useState(false);
   const [dirty, setDirty] = useState(false);
   const [showResetDialog, setShowResetDialog] = useState(false);
@@ -195,6 +219,7 @@ function GlobalSettingsSection({ settings }: { settings: SlackGlobalConfig | nul
     setModel(settings?.defaults?.model ?? "");
     setMentionsPolicy(settings?.defaults?.mentionsPolicy ?? DEFAULT_MENTIONS_POLICY);
     setSessionInstructions(settings?.defaults?.sessionInstructions ?? "");
+    setUnboundChannels(settings?.defaults?.unboundChannels ?? DEFAULT_SLACK_UNBOUND_CHANNELS);
   }, [settings, dirty, saving]);
 
   const selectedModelEnabled = model ? enabledModels.includes(model) : true;
@@ -207,7 +232,7 @@ function GlobalSettingsSection({ settings }: { settings: SlackGlobalConfig | nul
   const handleConfirmReset = async () => {
     setSaving(true);
     try {
-      // Reset only the notification/mention defaults. If routing rules exist,
+      // Reset the defaults edited in this section. If routing rules exist,
       // preserve them by writing a blob that keeps just the rules (rather than
       // deleting the whole row); otherwise clear the row entirely.
       const existingRules = settings?.defaults?.routingRules;
@@ -229,6 +254,7 @@ function GlobalSettingsSection({ settings }: { settings: SlackGlobalConfig | nul
         setModel("");
         setMentionsPolicy(DEFAULT_MENTIONS_POLICY);
         setSessionInstructions("");
+        setUnboundChannels(DEFAULT_SLACK_UNBOUND_CHANNELS);
         setDirty(false);
         toast.success("Settings reset to defaults.");
       } else {
@@ -250,6 +276,7 @@ function GlobalSettingsSection({ settings }: { settings: SlackGlobalConfig | nul
         model: model || undefined,
         mentionsPolicy,
         sessionInstructions: sessionInstructions || undefined,
+        unboundChannels,
       }),
     };
 
@@ -278,9 +305,9 @@ function GlobalSettingsSection({ settings }: { settings: SlackGlobalConfig | nul
   };
 
   return (
-    <Section
+    <SettingsCardSection
       title="Defaults"
-      description="Workspace-wide settings for agent-initiated Slack posts."
+      description="Workspace-wide settings for Slack-created sessions and agent-initiated posts."
     >
       <label
         htmlFor="slack-master-switch"
@@ -301,6 +328,39 @@ function GlobalSettingsSection({ settings }: { settings: SlackGlobalConfig | nul
           }}
         />
       </label>
+
+      <div className="mb-4">
+        <label
+          htmlFor="slack-unbound-channels"
+          className="block text-sm font-medium text-foreground mb-2"
+        >
+          Unbound channels
+        </label>
+        <p id="slack-unbound-channels-help" className="text-xs text-muted-foreground mb-2">
+          Choose what happens when a request comes from a Slack channel without a team binding.
+          Manage bindings in a team&apos;s Channels tab.
+        </p>
+        <Select
+          value={unboundChannels}
+          disabled={!canManageGlobal}
+          onValueChange={(value) => {
+            setUnboundChannels(value as "workspace" | "reject");
+            setDirty(true);
+          }}
+        >
+          <SelectTrigger
+            id="slack-unbound-channels"
+            aria-describedby="slack-unbound-channels-help"
+            className="w-full sm:w-96"
+          >
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="workspace">Create workspace-level sessions</SelectItem>
+            <SelectItem value="reject">Reject requests until the channel is bound</SelectItem>
+          </SelectContent>
+        </Select>
+      </div>
 
       <div className="mb-4">
         <p className="text-sm font-medium text-foreground mb-2">Default model</p>
@@ -418,8 +478,8 @@ function GlobalSettingsSection({ settings }: { settings: SlackGlobalConfig | nul
             <AlertDialogDescription>
               Reset Slack defaults? The master switch will turn off, the default model will use the
               system default, mentions policy will return to <strong>allow</strong>, and session
-              instructions will be cleared. Per-repository overrides and routing rules are not
-              affected.
+              instructions will be cleared. Unbound channels will create workspace-level sessions.
+              Per-repository overrides and routing rules are not affected.
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
@@ -428,7 +488,7 @@ function GlobalSettingsSection({ settings }: { settings: SlackGlobalConfig | nul
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
-    </Section>
+    </SettingsCardSection>
   );
 }
 
@@ -743,7 +803,7 @@ function RoutingRulesSection({
   ));
 
   return (
-    <Section
+    <SettingsCardSection
       title="Routing rules"
       description="Map keywords to repositories or environments. When a Slack message contains a keyword, the agent is routed to that target before falling back to channel association or automatic detection."
     >
@@ -765,22 +825,25 @@ function RoutingRulesSection({
 
             return (
               <div key={rule.id}>
-                <div className="flex items-center gap-2">
+                <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
                   <input
                     aria-label="Routing keyword"
                     value={rule.keyword}
                     onChange={(e) => updateRule(rule.id, { keyword: e.target.value })}
                     placeholder="keyword"
-                    className="w-48 px-3 py-2 text-sm bg-input border border-border rounded-sm focus:outline-none focus:ring-2 focus:ring-ring text-foreground placeholder:text-secondary-foreground"
+                    className="w-full rounded-sm border border-border bg-input px-3 py-2 text-sm text-foreground placeholder:text-secondary-foreground focus:outline-none focus:ring-2 focus:ring-ring sm:w-48"
                   />
-                  <span className="text-muted-foreground" aria-hidden="true">
+                  <span
+                    className="self-center text-muted-foreground max-sm:rotate-90"
+                    aria-hidden="true"
+                  >
                     &rarr;
                   </span>
                   <Select
                     value={selectValue}
                     onValueChange={(v) => updateRule(rule.id, { target: v })}
                   >
-                    <SelectTrigger className="flex-1" aria-label="Routing target">
+                    <SelectTrigger className="w-full sm:flex-1" aria-label="Routing target">
                       <SelectValue placeholder="Select a target..." />
                     </SelectTrigger>
                     <SelectContent>
@@ -867,26 +930,6 @@ function RoutingRulesSection({
         Keywords match whole words, case-insensitively. Point each keyword at one repository or
         environment; the same keyword on two targets will prompt for a choice instead of guessing.
       </p>
-    </Section>
-  );
-}
-
-function Section({
-  title,
-  description,
-  children,
-}: {
-  title: string;
-  description: string;
-  children: ReactNode;
-}) {
-  return (
-    <section className="border border-border-muted rounded-md p-5 mb-5">
-      <h4 className="text-sm font-semibold uppercase tracking-wider text-foreground mb-1">
-        {title}
-      </h4>
-      <p className="text-sm text-muted-foreground mb-4">{description}</p>
-      {children}
-    </section>
+    </SettingsCardSection>
   );
 }

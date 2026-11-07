@@ -1,5 +1,10 @@
+import { harnessIdSchema } from "../harnesses";
 import { z } from "zod";
-import { automationTriggerTypeSchema, triggerConfigSchema } from "../triggers/types";
+import {
+  type AutomationTriggerType,
+  automationTriggerTypeSchema,
+  triggerConfigSchema,
+} from "../triggers/types";
 import {
   MAX_TARGET_REPOSITORIES,
   repositoriesInputSchema,
@@ -7,8 +12,12 @@ import {
 } from "./repositories";
 import type { RepositoryInput, RepositoryRef } from "./repositories";
 import { modelProviderSelectionsSchema } from "./provider-accounts";
+import { isEnvironmentId } from "./environments";
+import { isCanonicalUserId } from "../user-id";
 
-export type AutomationRunStatus = "starting" | "running" | "completed" | "failed" | "skipped";
+/** `unauthorized` is a terminal, sessionless GitHub repository grant denial. */
+export type AutomationRunStatus =
+  "starting" | "running" | "completed" | "failed" | "skipped" | "unauthorized";
 
 export type AutomationInvocationSource = "schedule" | "manual" | "event";
 
@@ -24,12 +33,52 @@ export const automationInvocationStatusSchema = z.enum([
   "failed",
   "partial_failed",
   "skipped",
+  "unauthorized",
 ]);
 
 export type AutomationInvocationStatus = z.infer<typeof automationInvocationStatusSchema>;
 
 /** Maximum repositories an automation can fan out across per invocation. */
 export const MAX_AUTOMATION_REPOSITORIES = MAX_TARGET_REPOSITORIES;
+
+/** Maximum length of an automation's instruction prompt. */
+export const MAX_AUTOMATION_INSTRUCTIONS_LENGTH = 15_000;
+
+/** Maximum length of an automation's name. */
+export const MAX_AUTOMATION_NAME_LENGTH = 200;
+
+/** Largest page `GET /automations` serves; larger limits are refused. */
+export const MAX_AUTOMATION_LIST_PAGE_SIZE = 100;
+
+/** Page size `GET /automations` serves when the client sends no limit. */
+export const DEFAULT_AUTOMATION_LIST_PAGE_SIZE = 25;
+
+/**
+ * Validate target-count rules shared by automation clients and the API.
+ * Repository-scoped triggers bind to exactly one repository and no
+ * environments; fan-out is schedule-only; both target kinds share one cap.
+ */
+export function validateAutomationTargetCounts(
+  triggerType: AutomationTriggerType,
+  repositoryCount: number,
+  environmentCount: number
+): string | null {
+  if ((triggerType === "github_event" || triggerType === "linear_event") && repositoryCount === 0) {
+    return "Repository-scoped triggers require exactly one repository";
+  }
+  if ((triggerType === "github_event" || triggerType === "linear_event") && environmentCount > 0) {
+    return "Repository-scoped triggers cannot target environments";
+  }
+  if (repositoryCount + environmentCount > 1 && triggerType !== "schedule") {
+    return "Multi-target selections require a schedule trigger";
+  }
+  if (repositoryCount + environmentCount > MAX_AUTOMATION_REPOSITORIES) {
+    return `At most ${MAX_AUTOMATION_REPOSITORIES} repositories and environments combined`;
+  }
+  return null;
+}
+/** Largest page `GET /automations/:id/invocations` serves; larger limits are refused. */
+export const MAX_AUTOMATION_INVOCATION_LIST_LIMIT = 100;
 
 /** A repository selected on an automation (response shape, resolved). */
 const automationRepositorySchema = z.object({
@@ -73,12 +122,15 @@ const automationSchema = z.object({
   triggerType: automationTriggerTypeSchema,
   scheduleCron: z.string().nullable(),
   scheduleTz: z.string(),
+  harness: harnessIdSchema,
   model: z.string(),
   reasoningEffort: z.string().nullable(),
   enabled: z.boolean(),
   nextRunAt: z.number().nullable(),
   consecutiveFailures: z.number(),
   createdBy: z.string(),
+  userId: z.string().refine(isCanonicalUserId, "Invalid canonical user ID").nullable(),
+  ownerTeamId: z.string().nullable(),
   createdAt: z.number(),
   updatedAt: z.number(),
   deletedAt: z.number().nullable(),
@@ -91,6 +143,22 @@ const automationSchema = z.object({
 
 export type Automation = z.infer<typeof automationSchema>;
 
+const automationCapabilitiesSchema = z.object({
+  canRead: z.boolean(),
+  canManage: z.boolean(),
+  canTrigger: z.boolean(),
+});
+
+/** What one viewer may do with an automation. */
+export type AutomationCapabilities = z.infer<typeof automationCapabilitiesSchema>;
+
+/** An automation as returned to a viewer, with that viewer's capabilities. */
+const automationViewSchema = automationSchema.extend({
+  capabilities: automationCapabilitiesSchema,
+});
+
+export type AutomationView = z.infer<typeof automationViewSchema>;
+
 const automationExecutionSummarySchema = z.object({
   id: z.string(),
   status: automationInvocationStatusSchema,
@@ -99,27 +167,59 @@ const automationExecutionSummarySchema = z.object({
 
 export type AutomationExecutionSummary = z.infer<typeof automationExecutionSummarySchema>;
 
-const automationListItemSchema = automationSchema.extend({
+const automationListItemSchema = automationViewSchema.extend({
   recentExecutions: z.array(automationExecutionSummarySchema),
 });
 
 export type AutomationListItem = z.infer<typeof automationListItemSchema>;
 
+const automationEnvironmentIdsSchema = z
+  .array(
+    z.string().refine(isEnvironmentId, {
+      message: "must be an environment id (env_…)",
+    })
+  )
+  .superRefine((environmentIds, ctx) => {
+    const seen = new Set<string>();
+    environmentIds.forEach((environmentId, index) => {
+      if (seen.has(environmentId)) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: "must not contain duplicates",
+          path: [index],
+        });
+      }
+      seen.add(environmentId);
+    });
+  });
+
+/** Sentry client secrets are opaque but must contain at least one non-whitespace character. */
+export const sentryClientSecretSchema = z.string().refine((secret) => secret.trim().length > 0, {
+  message: "must not be empty",
+});
+
 export const createAutomationRequestSchema = z.object({
+  teamId: z
+    .string()
+    .regex(/^team_[A-Za-z0-9_-]+$/)
+    .nullable()
+    .optional(),
   name: z.string(),
   instructions: z.string(),
   triggerType: automationTriggerTypeSchema.optional(),
   scheduleCron: z.string().optional(),
   scheduleTz: z.string().optional(),
+  /** Agent harness for the sessions this automation creates. Omission means the built-in harness. */
+  harness: harnessIdSchema.optional(),
   model: z.string().optional(),
   reasoningEffort: z.string().nullable().optional(),
   eventType: z.string().optional(),
   triggerConfig: triggerConfigSchema.optional(),
-  sentryClientSecret: z.string().optional(),
+  sentryClientSecret: sentryClientSecretSchema.optional(),
   /** Repositories to run against (0..MAX_AUTOMATION_REPOSITORIES). */
   repositories: automationRepositoriesInputSchema.optional(),
   /** Environments to fan out over, one workspace session each (design §13.3). */
-  environmentIds: z.array(z.string()).optional(),
+  environmentIds: automationEnvironmentIdsSchema.optional(),
   /** Complete pin set. Omission creates the automation without pins. */
   providerSelections: modelProviderSelectionsSchema.optional(),
 });
@@ -130,14 +230,15 @@ export const updateAutomationRequestSchema = z.object({
   instructions: z.string().optional(),
   scheduleCron: z.string().optional(),
   scheduleTz: z.string().optional(),
+  harness: harnessIdSchema.optional(),
   model: z.string().optional(),
   reasoningEffort: z.string().nullable().optional(),
   eventType: z.string().optional(),
-  triggerConfig: triggerConfigSchema.optional(),
+  triggerConfig: triggerConfigSchema.nullable().optional(),
   /** Replaces the full repository selection when present. */
   repositories: automationRepositoriesInputSchema.optional(),
   /** Replaces the full environment selection when present (empty clears). */
-  environmentIds: z.array(z.string()).optional(),
+  environmentIds: automationEnvironmentIdsSchema.optional(),
   /** Replaces every provider pin when present; an empty map clears all pins. */
   providerSelections: modelProviderSelectionsSchema.optional(),
 });
@@ -211,4 +312,28 @@ export interface ListAutomationInvocationsResponse {
   invocations: AutomationInvocation[];
   /** Counts invocations (each firing is one row regardless of fan-out width). */
   total: number;
+}
+
+/** `POST /webhooks/automation/:id` response. */
+export interface WebhookTriggerResponse {
+  ok: true;
+  triggered: number;
+  skipped: number;
+  steered: number;
+  /**
+   * The invocation representing this request: newly started, recorded as
+   * skipped, or — for a retry with the same idempotency key — the original.
+   * Null when nothing was recorded (conditions did not match).
+   */
+  invocationId: string | null;
+}
+
+/**
+ * `GET /webhooks/automation/:id/invocations/:invocationId` response — readable
+ * with the webhook key, so it carries status only, never session content.
+ */
+export interface WebhookInvocationStatusResponse {
+  invocationId: string;
+  status: AutomationInvocationStatus;
+  runs: Pick<AutomationRun, "id" | "status" | "sessionId">[];
 }

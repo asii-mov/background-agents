@@ -4,8 +4,11 @@ import {
   type SessionSkillsView,
   skillAssignmentSchema,
 } from "@open-inspect/shared/types/skills";
+import { hashSessionSkillManifest, SKILL_RESOLVER_VERSION } from "../skills/content-addressing";
 import { SkillStore } from "./skills";
 import type { SqlDatabase } from "./sql-database";
+
+const LEGACY_SESSION_SKILL_SELECTION = { mode: "all" as const };
 
 /** Snapshot rows preserve resolution-time provenance independently of the mutable catalog. */
 interface ManifestRow {
@@ -92,11 +95,26 @@ export class SessionSkillStore {
     sessionId: string,
     page?: { after: number; limit: number }
   ): Promise<{ manifest: ManifestRow; revisions: RevisionRow[] } | null> {
-    const manifest = await this.db
+    let manifest = await this.db
       .prepare("SELECT * FROM session_skill_manifests WHERE session_id = ?")
       .bind(sessionId)
       .first<ManifestRow>();
-    if (!manifest) return null;
+    if (!manifest) {
+      const session = await this.db
+        .prepare("SELECT created_at FROM sessions WHERE id = ?")
+        .bind(sessionId)
+        .first<{ created_at: number }>();
+      if (!session) return null;
+      manifest = {
+        session_id: sessionId,
+        selection_mode: LEGACY_SESSION_SKILL_SELECTION.mode,
+        profile_id: null,
+        profile_name: null,
+        resolver_version: SKILL_RESOLVER_VERSION,
+        manifest_sha256: await hashSessionSkillManifest(LEGACY_SESSION_SKILL_SELECTION, []),
+        resolved_at: session.created_at,
+      };
+    }
     const revisions = await this.db
       .prepare(
         page

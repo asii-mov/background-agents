@@ -23,7 +23,7 @@ sign-in are supported, while GitHub App repository credentials remain required f
 
 Required:
 
-- Node.js `22+` (minimum supported: `20+`)
+- Node.js `24+`
 - npm
 - Git
 
@@ -232,12 +232,23 @@ protection and the separate authentication used by control-plane callers.
 
 Critical notes before deploy:
 
+- After [Owner bootstrap](GETTING_STARTED.md#step-9-bootstrap-the-workspace-owner),
+  [create the first team](GETTING_STARTED.md#step-10-create-the-first-team-and-test-a-session). The
+  creator becomes Lead; choose membership policy and default visibility, grant repositories,
+  join/add operators, and create a team-owned test session.
+- Fresh deployments should explicitly set `teams_enforcement = "on"` in Terraform to deploy
+  `TEAMS_ENFORCEMENT=on`. Runtime and Terraform defaults remain `shadow`. Existing deployments must
+  review production `shadow_denied:*` authorization audit entries before opting in; no completed
+  default-flip audit gate is established by this guide.
 - Build workers before running Terraform apply.
 - Build `@open-inspect/shared` first.
 - Use two-phase Terraform deploy for DO/service bindings.
 - For Modal deployments, eagerly build the Sandbox image with
   `uv run python deploy.py --build-sandbox-image`, then deploy with `uv run modal deploy deploy.py`
   (not `src/app.py`).
+- Modal's legacy `github-app` secret is not required for fresh or restored sandbox Git credentials;
+  keep the App private key in the control plane (and the GitHub bot's own bindings when enabled).
+  Retain the required Modal `llm-api-keys` and `internal-api` secret objects.
 - Existing sessions keep their pinned authentication. Remove legacy OAuth keys only after dependent
   legacy-bound sessions are no longer needed.
 
@@ -272,6 +283,8 @@ configured/deployed.
 
 - Architecture and internals: [docs/HOW_IT_WORKS.md](./HOW_IT_WORKS.md)
 - Full production deployment: [docs/GETTING_STARTED.md](./GETTING_STARTED.md)
+- Control plane in a container (no Cloudflare):
+  [docs/CONTROL_PLANE_CONTAINER.md](./CONTROL_PLANE_CONTAINER.md)
 - GitHub integration usage: [docs/integrations/GITHUB.md](./integrations/GITHUB.md)
 - Linear integration usage: [docs/integrations/LINEAR.md](./integrations/LINEAR.md)
 - Debugging and observability: [docs/DEBUGGING_PLAYBOOK.md](./DEBUGGING_PLAYBOOK.md)

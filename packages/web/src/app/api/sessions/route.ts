@@ -47,6 +47,7 @@ export async function POST(request: NextRequest) {
       repoName: body.repoName,
       model: body.model,
       reasoningEffort: body.reasoningEffort,
+      harness: body.harness,
       branch: body.branch,
       title: body.title,
       // The picker's other two target modes (mutually exclusive with the
@@ -55,7 +56,10 @@ export async function POST(request: NextRequest) {
       environmentId: body.environmentId,
       repositories: body.repositories,
       skillSelection: body.skillSelection,
+      includePersonalMemories: body.includePersonalMemories,
       providerSelections: body.providerSelections,
+      teamId: body.teamId,
+      visibility: body.visibility,
     };
 
     const response = await controlPlaneUserFetch("/sessions", {

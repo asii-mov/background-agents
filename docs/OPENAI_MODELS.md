@@ -10,18 +10,12 @@ can use the installation default, select a specific account, or explicitly use A
 
 ## Supported Models
 
-For the full model list, including Claude Fable 5 and other Anthropic models, see
-[Available Models](AVAILABLE_MODELS.md).
+See [Available Models — OpenAI](AVAILABLE_MODELS.md#openai) for supported model IDs, reasoning
+effort options, and defaults.
 
-| Model               | Description               |
-| ------------------- | ------------------------- |
-| GPT 5.4             | Flagship model            |
-| GPT 5.5             | Latest flagship model     |
-| GPT 5.3 Codex       | Latest codex variant      |
-| GPT 5.3 Codex Spark | Lightweight Codex variant |
-
-OpenAI models support reasoning effort levels: none, low, medium, high, and extra high (default:
-high for Codex models).
+Existing sessions and saved bot settings selecting `gpt-5.3-codex` or `gpt-5.3-codex-spark` resolve
+to `openai/gpt-6-sol` when used. The retired models are no longer offered in the picker; update
+saved defaults and automations to a model available to your account.
 
 ---
 

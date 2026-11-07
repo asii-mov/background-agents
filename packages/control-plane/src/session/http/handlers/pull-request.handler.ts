@@ -104,10 +104,6 @@ export class PullRequestHandler {
     }
 
     const promptingParticipant = promptingParticipantResult.participant;
-    const authResolution = await this.participants.resolveAuthForPR(promptingParticipant);
-    if ("error" in authResolution) {
-      return Response.json({ error: authResolution.error }, { status: authResolution.status });
-    }
 
     let risk: RiskAssessment | null = null;
     if (this.riskPolicy) {
@@ -136,7 +132,7 @@ export class PullRequestHandler {
         repoOwner: target.repoOwner,
         repoName: target.repoName,
         promptingUserId: promptingParticipant.user_id,
-        promptingAuth: authResolution.auth,
+        resolvePromptingAuth: () => this.participants.resolveAuthForPR(promptingParticipant),
         sessionUrl: this.getSessionUrl(session),
         draft: risk?.requiresSecurityReview === true ? true : body.draft,
       },

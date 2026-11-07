@@ -19,9 +19,12 @@ import {
 import type { SessionItem } from "@/hooks/use-sidebar-sessions";
 import { buildSessionHref } from "@/lib/session-list";
 
-export const MOBILE_LONG_PRESS_MS = 450;
+const MOBILE_LONG_PRESS_MS = 450;
 const MOBILE_LONG_PRESS_MOVE_THRESHOLD_PX = 10;
 
+/**
+ * Displays a session with lifecycle controls from its server-computed capabilities.
+ */
 export function SessionListItem({
   session,
   environmentName,
@@ -39,6 +42,8 @@ export function SessionListItem({
   onSessionSelect?: () => void;
   onMarkLatestMessageRead: (sessionId: string) => Promise<void>;
 }) {
+  const canManageLifecycle = session.capabilities?.canManageLifecycle ?? false;
+  const canMarkRead = session.capabilities?.canRead === true && session.readState.unread;
   const timestamp = session.updatedAt || session.createdAt;
   const relativeTime = formatRelativeTime(timestamp);
   const repoInfo = formatSessionRepositoriesLabel(
@@ -73,6 +78,7 @@ export function SessionListItem({
   }, [displayTitle, isRenaming]);
 
   const handleStartRename = () => {
+    if (!canManageLifecycle) return;
     isStartingRenameRef.current = true;
     setIsActionsOpen(false);
     setTitle(displayTitle);
@@ -96,12 +102,13 @@ export function SessionListItem({
   };
 
   const handleStartArchive = () => {
+    if (!canManageLifecycle) return;
     setIsActionsOpen(false);
     setShowArchiveDialog(true);
   };
 
   const handleMarkLatestMessageRead = async () => {
-    if (isMarkingLatestRead) return;
+    if (!canMarkRead || isMarkingLatestRead) return;
     setIsActionsOpen(false);
     setIsMarkingLatestRead(true);
     try {
@@ -161,11 +168,12 @@ export function SessionListItem({
       touchStartRef.current = { x: touch.clientX, y: touch.clientY };
       clearLongPressTimer();
       longPressTimerRef.current = window.setTimeout(() => {
+        if (!canManageLifecycle && !canMarkRead) return;
         longPressTriggeredRef.current = true;
         setIsActionsOpen(true);
       }, MOBILE_LONG_PRESS_MS);
     },
-    [clearLongPressTimer, isMobile]
+    [canManageLifecycle, canMarkRead, clearLongPressTimer, isMobile]
   );
 
   const handleTouchMove = useCallback(
@@ -303,57 +311,65 @@ export function SessionListItem({
           </Link>
         )}
 
-        <div className="absolute inset-y-0 right-2 flex items-center">
-          <DropdownMenu open={isActionsOpen} onOpenChange={setIsActionsOpen}>
-            <DropdownMenuTrigger asChild>
-              <button
-                type="button"
-                aria-label="Session actions"
-                aria-hidden={isMobile && !session.readState.unread ? "true" : undefined}
-                tabIndex={isMobile && !session.readState.unread ? -1 : undefined}
-                className={`items-center justify-center text-muted-foreground hover:text-foreground hover:bg-muted transition data-[state=open]:opacity-100 ${
-                  isMobile
-                    ? session.readState.unread
-                      ? "flex h-10 w-10"
-                      : "pointer-events-none flex h-6 w-6 opacity-0"
-                    : "flex h-6 w-6 opacity-0 group-hover:opacity-100 group-focus-within:opacity-100"
-                }`}
-              >
-                <MoreIcon className="w-4 h-4" />
-              </button>
-            </DropdownMenuTrigger>
-            <DropdownMenuContent
-              align="end"
-              onCloseAutoFocus={(event) => {
-                if (isStartingRenameRef.current) {
-                  event.preventDefault();
-                  isStartingRenameRef.current = false;
-                }
-              }}
-            >
-              <DropdownMenuItem onSelect={handleStartRename}>Rename</DropdownMenuItem>
-              {session.readState.unread && (
-                <DropdownMenuItem
-                  onSelect={handleMarkLatestMessageRead}
-                  disabled={isMarkingLatestRead}
+        {(canManageLifecycle || canMarkRead) && (
+          <div className="absolute inset-y-0 right-2 flex items-center">
+            <DropdownMenu open={isActionsOpen} onOpenChange={setIsActionsOpen}>
+              <DropdownMenuTrigger asChild>
+                <button
+                  type="button"
+                  aria-label="Session actions"
+                  aria-hidden={isMobile && !session.readState.unread ? "true" : undefined}
+                  tabIndex={isMobile && !session.readState.unread ? -1 : undefined}
+                  className={`items-center justify-center text-muted-foreground hover:text-foreground hover:bg-muted transition data-[state=open]:opacity-100 ${
+                    isMobile
+                      ? session.readState.unread
+                        ? "flex h-10 w-10"
+                        : "pointer-events-none flex h-6 w-6 opacity-0"
+                      : "flex h-6 w-6 opacity-0 group-hover:opacity-100 group-focus-within:opacity-100"
+                  }`}
                 >
-                  Mark as read
-                </DropdownMenuItem>
-              )}
-              <DropdownMenuItem onClick={handleStartArchive} disabled={isArchiving}>
-                <ArchiveIcon className="w-4 h-4" />
-                Archive
-              </DropdownMenuItem>
-            </DropdownMenuContent>
-          </DropdownMenu>
-        </div>
+                  <MoreIcon className="w-4 h-4" />
+                </button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent
+                align="end"
+                onCloseAutoFocus={(event) => {
+                  if (isStartingRenameRef.current) {
+                    event.preventDefault();
+                    isStartingRenameRef.current = false;
+                  }
+                }}
+              >
+                {canManageLifecycle && (
+                  <DropdownMenuItem onSelect={handleStartRename}>Rename</DropdownMenuItem>
+                )}
+                {canMarkRead && (
+                  <DropdownMenuItem
+                    onSelect={handleMarkLatestMessageRead}
+                    disabled={isMarkingLatestRead}
+                  >
+                    Mark as read
+                  </DropdownMenuItem>
+                )}
+                {canManageLifecycle && (
+                  <DropdownMenuItem onClick={handleStartArchive} disabled={isArchiving}>
+                    <ArchiveIcon className="w-4 h-4" />
+                    Archive
+                  </DropdownMenuItem>
+                )}
+              </DropdownMenuContent>
+            </DropdownMenu>
+          </div>
+        )}
       </div>
 
-      <ArchiveSessionDialog
-        open={showArchiveDialog}
-        onOpenChange={setShowArchiveDialog}
-        onConfirm={handleConfirmArchive}
-      />
+      {canManageLifecycle && (
+        <ArchiveSessionDialog
+          open={showArchiveDialog}
+          onOpenChange={setShowArchiveDialog}
+          onConfirm={handleConfirmArchive}
+        />
+      )}
     </>
   );
 }
@@ -374,13 +390,14 @@ export function ChildSessionListItem({
   onMarkLatestMessageRead: (sessionId: string) => Promise<void>;
 }) {
   const [isMarkingLatestRead, setIsMarkingLatestRead] = useState(false);
+  const canMarkRead = session.capabilities?.canRead === true && session.readState.unread;
   const timestamp = session.updatedAt || session.createdAt;
   const relativeTime = formatRelativeTime(timestamp);
   const prDisplay = pullRequestSummaryDisplay(session.pullRequestSummary);
   const displayTitle = session.title || "Sub-task";
   const paddingLeftRem = 1.75 + Math.max(depth - 1, 0) * 1;
   const handleMarkLatestMessageRead = async () => {
-    if (isMarkingLatestRead) return;
+    if (!canMarkRead || isMarkingLatestRead) return;
     setIsMarkingLatestRead(true);
     try {
       await onMarkLatestMessageRead(session.id);
@@ -421,7 +438,7 @@ export function ChildSessionListItem({
           )}
         </div>
       </Link>
-      {session.readState.unread && (
+      {canMarkRead && (
         <DropdownMenu>
           <DropdownMenuTrigger asChild>
             <button
@@ -430,7 +447,7 @@ export function ChildSessionListItem({
               className={`absolute right-0 top-0 h-10 w-10 items-center justify-center text-muted-foreground ${
                 isMobile
                   ? "flex"
-                  : "hidden opacity-0 group-hover:flex group-hover:opacity-100 group-focus-within:flex group-focus-within:opacity-100"
+                  : "invisible flex opacity-0 group-hover:visible group-hover:opacity-100 group-focus-within:visible group-focus-within:opacity-100 data-[state=open]:visible data-[state=open]:opacity-100"
               }`}
             >
               <MoreIcon className="h-4 w-4" />

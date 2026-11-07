@@ -1,19 +1,15 @@
+import { Hono } from "hono";
+import { admit, dispatch } from "../routing/admit";
+import type { ControlPlaneHonoEnv } from "../routing/hono-env";
+import { activeGlobal } from "./shared";
 import type { Env } from "../types";
 import { getGovernanceCatalogStatus, reconcileGovernanceCatalog } from "../governance/reconciler";
-import {
-  type Route,
-  SCM_AGNOSTIC_USER_OR_SERVICE_ROUTE,
-  defineRoutes,
-  type RequestContext,
-  parsePattern,
-  json,
-  error,
-} from "./shared";
+import { SCM_AGNOSTIC_USER_OR_SERVICE_ROUTE, type RequestContext, json, error } from "./shared";
 
 async function handleStatus(
   _request: Request,
   env: Env,
-  _match: RegExpMatchArray,
+  _params: object,
   ctx: RequestContext
 ): Promise<Response> {
   if (!ctx.db) return error("Database not configured", 503);
@@ -27,7 +23,7 @@ async function handleStatus(
 async function handleSync(
   _request: Request,
   env: Env,
-  _match: RegExpMatchArray,
+  _params: object,
   ctx: RequestContext
 ): Promise<Response> {
   if (!ctx.db) return error("Database not configured", 503);
@@ -39,16 +35,18 @@ async function handleSync(
   }
 }
 
-export const governanceCatalogRoutes: Route[] = defineRoutes(SCM_AGNOSTIC_USER_OR_SERVICE_ROUTE, [
-  {
-    method: "GET",
-    pattern: parsePattern("/governance/catalog"),
-    handler: handleStatus,
-  },
-  {
-    method: "POST",
-    pattern: parsePattern("/governance/catalog/sync"),
+export const governanceCatalogRoutes = new Hono<ControlPlaneHonoEnv>();
+governanceCatalogRoutes.get(
+  "/governance/catalog",
+  admit({ ...SCM_AGNOSTIC_USER_OR_SERVICE_ROUTE, authorization: activeGlobal() }),
+  (c) => dispatch(c, handleStatus)
+);
+governanceCatalogRoutes.post(
+  "/governance/catalog/sync",
+  admit({
+    ...SCM_AGNOSTIC_USER_OR_SERVICE_ROUTE,
+    authorization: activeGlobal(),
     requiredPermission: "catalog.write",
-    handler: handleSync,
-  },
-]);
+  }),
+  (c) => dispatch(c, handleSync)
+);

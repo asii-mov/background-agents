@@ -24,8 +24,8 @@ deny requests unless you route their hostname through an Access application with
 
 For local `next dev`, set `AUTH_DEV_BYPASS=1` and use a loopback hostname such as `localhost` or
 `127.0.0.1`. The bypass requires `NODE_ENV=development`; production and unknown environments refuse
-it, even when a valid assertion is supplied. Existing local `.env` files need this explicit setting
-or the two Access variables. Do not set the bypass in deployed environments.
+it, even when a valid assertion is supplied. Existing local `.env.web` files need this explicit
+setting or the two Access variables. Do not set the bypass in deployed environments.
 
 Keep the control-plane hostname outside the human Access gate. Bots, webhooks, sandboxes, and
 session WebSockets use their existing authentication there. The web service signs browser API

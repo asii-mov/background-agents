@@ -6,9 +6,14 @@ import { SessionSkillStore } from "../../src/db/session-skills";
 import { SkillConflictError, SkillStore } from "../../src/db/skills";
 import { EnvironmentStore } from "../../src/db/environments";
 import { resolveManagedSkills } from "../../src/session/skill-resolution";
-import { buildSkillRevision } from "../../src/skills/content-addressing";
+import {
+  buildSkillRevision,
+  hashSessionSkillManifest,
+  SKILL_RESOLVER_VERSION,
+} from "../../src/skills/content-addressing";
 import { cleanD1Tables } from "./cleanup";
-import { initNamedSessionDO, seedSandboxAuthHash, serviceFetch } from "./helpers";
+import { initNamedSessionDO, seedSandboxAuthHash, serviceFetch, sqlDatabase } from "./helpers";
+import { inheritedPin, resolvedPin } from "../../src/session/pinned";
 
 const content = {
   description: "Managed deployment instructions",
@@ -119,6 +124,8 @@ describe("managed skills persistence and resolution", () => {
 
     const base = {
       title: null,
+      ownerTeamId: null,
+      visibility: "workspace" as const,
       repoOwner: null,
       repoName: null,
       model: "anthropic/claude-haiku-4-5",
@@ -129,12 +136,16 @@ describe("managed skills persistence and resolution", () => {
       updatedAt: Date.now(),
     };
     const sessions = new SessionIndexStore(env.DB);
-    await sessions.create({ ...base, id: "required-parent", skillManifest: manifest });
+    await sessions.create({
+      ...base,
+      id: "required-parent",
+      managedSkills: resolvedPin(manifest),
+    });
     await sessions.create({
       ...base,
       id: "required-child",
       parentSessionId: "required-parent",
-      skillManifestSourceSessionId: "required-parent",
+      managedSkills: inheritedPin("required-parent"),
     });
     const installation = await new SessionSkillStore(env.DB).getSandboxInstallation(
       "required-child"
@@ -170,6 +181,8 @@ describe("managed skills persistence and resolution", () => {
     const sessions = new SessionIndexStore(env.DB);
     const base = {
       title: null,
+      ownerTeamId: null,
+      visibility: "workspace" as const,
       repoOwner: null,
       repoName: null,
       model: "anthropic/claude-haiku-4-5",
@@ -179,12 +192,12 @@ describe("managed skills persistence and resolution", () => {
       createdAt: Date.now(),
       updatedAt: Date.now(),
     };
-    await sessions.create({ ...base, id: "parent", skillManifest: manifest });
+    await sessions.create({ ...base, id: "parent", managedSkills: resolvedPin(manifest) });
     await sessions.create({
       ...base,
       id: "child",
       parentSessionId: "parent",
-      skillManifestSourceSessionId: "parent",
+      managedSkills: inheritedPin("parent"),
     });
 
     const store = new SessionSkillStore(env.DB);
@@ -257,6 +270,46 @@ describe("managed skills persistence and resolution", () => {
     await expect(store.getSandboxInstallation("child")).rejects.toThrow(
       `Missing files for session skill revision ${skill.currentRevisionId}`
     );
+  });
+
+  it("serves canonical empty skills for a legacy session without a manifest", async () => {
+    const createdAt = Date.now();
+    await new SessionIndexStore(env.DB).create({
+      id: "legacy-without-skills",
+      ownerTeamId: null,
+      visibility: "workspace",
+      title: null,
+      repoOwner: null,
+      repoName: null,
+      model: "anthropic/claude-haiku-4-5",
+      reasoningEffort: null,
+      baseBranch: null,
+      status: "created",
+      createdAt,
+      updatedAt: createdAt,
+    });
+
+    const manifestSha256 = await hashSessionSkillManifest({ mode: "all" }, []);
+    const store = new SessionSkillStore(env.DB);
+    await expect(store.getSandboxInstallation("legacy-without-skills")).resolves.toEqual({
+      schemaVersion: 1,
+      manifestSha256,
+      skills: [],
+      nextCursor: null,
+    });
+
+    const response = await serviceFetch("https://test.local/sessions/legacy-without-skills/skills");
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toEqual({
+      manifestSha256,
+      resolverVersion: SKILL_RESOLVER_VERSION,
+      selection: { mode: "all" },
+      resolvedAt: createdAt,
+      skills: [],
+    });
+
+    const missingResponse = await serviceFetch("https://test.local/sessions/missing/skills");
+    expect(missingResponse.status).toBe(404);
   });
 
   it("serves catalog and personal profile CRUD through authenticated routes", async () => {
@@ -429,6 +482,8 @@ describe("managed skills persistence and resolution", () => {
     const sessions = new SessionIndexStore(env.DB);
     await sessions.create({
       id: "wide",
+      ownerTeamId: null,
+      visibility: "workspace",
       title: null,
       repoOwner: null,
       repoName: null,
@@ -438,7 +493,7 @@ describe("managed skills persistence and resolution", () => {
       status: "created" as const,
       createdAt: Date.now(),
       updatedAt: Date.now(),
-      skillManifest: manifest,
+      managedSkills: resolvedPin(manifest),
     });
 
     // The installation query is keyed by session id, so manifest width costs no
@@ -478,6 +533,8 @@ describe("managed skills persistence and resolution", () => {
     );
     await new SessionIndexStore(env.DB).create({
       id: "paged",
+      ownerTeamId: null,
+      visibility: "workspace",
       title: null,
       repoOwner: null,
       repoName: null,
@@ -487,7 +544,7 @@ describe("managed skills persistence and resolution", () => {
       status: "created" as const,
       createdAt: Date.now(),
       updatedAt: Date.now(),
-      skillManifest: manifest,
+      managedSkills: resolvedPin(manifest),
     });
     const { stub } = await initNamedSessionDO("paged");
     await seedSandboxAuthHash(stub, { authToken: "paged-token", sandboxId: "sandbox-paged" });
@@ -532,6 +589,9 @@ describe("managed skills persistence and resolution", () => {
     await expect(fetchPage("?limit=0").then((r) => r.status)).resolves.toBe(400);
     await expect(fetchPage("?limit=201").then((r) => r.status)).resolves.toBe(400);
     await expect(fetchPage("?limit=25&cursor=nope").then((r) => r.status)).resolves.toBe(400);
+    await expect(
+      fetchPage(`?limit=25&cursor=${"9".repeat(400)}`).then((r) => r.status)
+    ).resolves.toBe(400);
   });
 
   it("maps typed profile validation and conflict failures", async () => {
@@ -641,20 +701,23 @@ describe("managed skills persistence and resolution", () => {
     // not be created at all.
     const environments = new EnvironmentStore(env.DB);
     const ids = Array.from({ length: 101 }, (_, index) => `env_${String(index).padStart(3, "0")}`);
-    for (const id of ids) {
-      await environments.create(
-        {
+    // Seed in one batch. One EnvironmentStore.create() per environment is 101
+    // sequential D1 round-trips, each its own transaction, which starves past the
+    // 5s test budget when every other integration file is contending for the pool.
+    await sqlDatabase(env.DB).batch(
+      ids.map((id) =>
+        environments.bindEnvironmentInsert({
           id,
+          owner_team_id: null,
           name: id,
           description: null,
           prebuild_enabled: 0,
           channel_associations: null,
           created_at: 1,
           updated_at: 1,
-        },
-        []
-      );
-    }
+        })
+      )
+    );
 
     const skills = new SkillStore(env.DB);
     const skill = await skills.create(
@@ -714,6 +777,7 @@ describe("managed skills persistence and resolution", () => {
     await environments.create(
       {
         id: "env_skill_generation",
+        owner_team_id: null,
         name: "Before",
         description: null,
         prebuild_enabled: 0,

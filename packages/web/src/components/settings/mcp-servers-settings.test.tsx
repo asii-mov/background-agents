@@ -12,6 +12,8 @@ expect.extend(matchers);
 
 const mocks = vi.hoisted(() => ({
   mutate: vi.fn(),
+  canManageMcp: true,
+  canWriteCatalog: true,
   updateMcpServer: vi.fn(),
   updateMcpServerCredentials: vi.fn(),
   governanceStatus: undefined as
@@ -23,6 +25,10 @@ const mocks = vi.hoisted(() => ({
       },
 }));
 
+vi.mock("@/hooks/use-current-user-authorization", () => ({
+  useCurrentUserAuthorization: () => ({ hasPermission: () => mocks.canManageMcp }),
+}));
+
 vi.mock("sonner", () => ({ toast: { success: vi.fn(), error: vi.fn() } }));
 vi.mock("@/hooks/use-repos", () => ({
   useRepos: () => ({ repos: [], loading: false }),
@@ -31,7 +37,7 @@ vi.mock("@/hooks/use-environments", () => ({
   useEnvironments: () => ({ environments: [], loading: false }),
 }));
 vi.mock("@/hooks/use-platform-role", () => ({
-  usePlatformRole: () => ({ canWriteCatalog: true }),
+  usePlatformRole: () => ({ canWriteCatalog: mocks.canWriteCatalog }),
 }));
 vi.mock("@/hooks/use-mcp-servers", () => ({
   useMcpServers: () => ({ servers, loading: false, mutate: mocks.mutate }),
@@ -82,10 +88,23 @@ afterEach(() => {
   cleanup();
   vi.clearAllMocks();
   mocks.governanceStatus = undefined;
+  mocks.canManageMcp = true;
+  mocks.canWriteCatalog = true;
   delete servers[0].sourceKind;
 });
 
 describe("McpServersSettings", () => {
+  it.each(["workspace", "catalog"])("withholds mutation controls without the %s grant", (grant) => {
+    mocks.canManageMcp = grant !== "workspace";
+    mocks.canWriteCatalog = grant !== "catalog";
+    render(<McpServersSettings />);
+    expect(screen.getByText("Server A")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Add Server" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /Server A/ })).toBeDisabled();
+    expect(screen.queryByRole("button", { name: "Delete" })).not.toBeInTheDocument();
+    for (const control of screen.getAllByRole("switch")) expect(control).toBeDisabled();
+  });
+
   it("renders environment-only scope instead of calling the server global", () => {
     render(<McpServersSettings />);
 

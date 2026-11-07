@@ -9,12 +9,15 @@
 
 import { computeHmacHex } from "@open-inspect/shared/auth";
 import {
+  automationCallbackContextSchema,
   linearCompletionCallbackPayloadSchema,
   linearToolCallCallbackPayloadSchema,
+  SLACK_ACTIVITY_REFRESH_KIND,
 } from "@open-inspect/shared/types/session-api";
 import { callbackSigningSecret, type CallbackDestination } from "../auth/service/callback-signing";
+import { slackPostGate, type SlackPostScope } from "../authorization/slack-post-gate";
 import type { Logger } from "../logger";
-import { deliverWithRetry } from "./callback-delivery";
+import { deliverWithRetry, retryDelivery } from "./callback-delivery";
 import { notifyLinearStarted } from "./linear-start-callback";
 import type { SessionRow } from "./types";
 import type { MessageRepository } from "./message-repository";
@@ -41,9 +44,7 @@ export interface CallbackServiceEnv {
   LINEAR_BOT?: FetchClient;
 }
 
-export type AutomationRunCompletionHandler = (
-  completion: AutomationRunCompletion
-) => Promise<Response>;
+export type AutomationRunCompletionHandler = (completion: AutomationRunCompletion) => Promise<void>;
 
 /**
  * Dependencies injected into CallbackNotificationService.
@@ -51,6 +52,7 @@ export type AutomationRunCompletionHandler = (
 export interface CallbackServiceDeps {
   repository: CallbackRepository;
   messageRepository: MessageRepository;
+  slackPostScope: SlackPostScope;
   env: CallbackServiceEnv;
   log: Logger;
   getSessionId: () => string;
@@ -67,6 +69,48 @@ export interface CallbackServiceDeps {
 const NOTIFIED_CALL_IDS_CAP = 500;
 const EMPTY_TOOL_ARGS: Record<string, unknown> = {};
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+function hasSlackThreadCoordinates(context: unknown): context is {
+  channel: string;
+  threadTs: string;
+} {
+  return (
+    isRecord(context) &&
+    typeof context.channel === "string" &&
+    !!context.channel &&
+    typeof context.threadTs === "string" &&
+    !!context.threadTs
+  );
+}
+
+/**
+ * How stale a Slack assistant-thread activity indicator may get before the
+ * next sandbox heartbeat refreshes it.
+ *
+ * Slack clears the indicator two minutes after the last `setStatus`. The
+ * sandbox bridge heartbeats every 30s while a turn is in flight, and the
+ * control plane declares a sandbox dead after 90s without one, so a sandbox
+ * the session still believes in has proven itself within the last 90s. One
+ * refresh per minute therefore lands with a full minute to spare, and costs
+ * nothing on a session that is already emitting tool calls.
+ *
+ * The window is per activation, so an evicted runtime refreshes on its first
+ * heartbeat back. That can only make a refresh earlier, never later, and the
+ * floor is the 30s heartbeat itself — well under what a single turn already
+ * spends on tool-call status updates.
+ */
+export const SLACK_ACTIVITY_REFRESH_INTERVAL_MS = 60_000;
+
+/**
+ * One bounded attempt per refresh. A retry would buy a second correlated shot
+ * at the same binding while widening the window in which a turn can terminate
+ * under an in-flight refresh; the next heartbeat is the better retry.
+ */
+const ACTIVITY_REFRESH_TIMEOUT_MS = 10_000;
+
 interface CallbackDeliveryResult {
   delivered: boolean;
   attempts: number;
@@ -77,17 +121,26 @@ interface CallbackDeliveryResult {
 export class CallbackNotificationService {
   private readonly repository: CallbackRepository;
   private readonly messageRepository: MessageRepository;
+  private readonly slackPostScope: SlackPostScope;
   private readonly env: CallbackServiceEnv;
   private readonly log: Logger;
   private readonly getSessionId: () => string;
   private readonly sleep: (ms: number) => Promise<void>;
   private readonly completeAutomationRun: AutomationRunCompletionHandler | undefined;
   private _lastToolCallCallbackTs = 0;
+  /**
+   * When Slack's activity indicator was last (re)asserted for this session, by
+   * any path that calls `setStatus` — tool-call progress or an explicit
+   * refresh. In memory on purpose: losing it on eviction costs one redundant
+   * refresh, never a missed one.
+   */
+  private _lastSlackActivityAt = 0;
   private readonly notifiedCallIds = new Set<string>();
 
   constructor(deps: CallbackServiceDeps) {
     this.repository = deps.repository;
     this.messageRepository = deps.messageRepository;
+    this.slackPostScope = deps.slackPostScope;
     this.env = deps.env;
     this.log = deps.log;
     this.getSessionId = deps.getSessionId;
@@ -108,6 +161,64 @@ export class CallbackNotificationService {
    */
   private async signPayload(data: object, secret: string): Promise<string> {
     return computeHmacHex(JSON.stringify(data), secret);
+  }
+
+  private async slackPostDenial(sessionId: string, context: unknown): Promise<string | null> {
+    if (!isRecord(context) || typeof context.channel !== "string" || !context.channel) {
+      return "invalid_callback_context";
+    }
+    const [session, binding] = await Promise.all([
+      this.slackPostScope.getSession(sessionId),
+      this.slackPostScope.getChannelBinding(context.channel),
+    ]);
+    return slackPostGate(session, binding);
+  }
+
+  /** Closure carries coordinates only, never session content or tool arguments. */
+  private async notifySlackThreadClosed(
+    sessionId: string,
+    context: unknown,
+    binding: FetchClient,
+    secret: string
+  ): Promise<CallbackDeliveryResult> {
+    if (!hasSlackThreadCoordinates(context)) {
+      return { delivered: false, attempts: 0 };
+    }
+    return deliverWithRetry(
+      (signal) => this.sendSlackThreadClosed(sessionId, context, binding, secret, signal),
+      this.sleep,
+      ({ attempt, response, error }) => {
+        this.log.warn("callback.thread_closed_delivery_attempt_failed", {
+          session_id: sessionId,
+          attempt,
+          ...(response ? { http_status: response.status } : {}),
+          ...(error !== undefined ? { error: error instanceof Error ? error : String(error) } : {}),
+        });
+      }
+    );
+  }
+
+  private async sendSlackThreadClosed(
+    sessionId: string,
+    context: { channel: string; threadTs: string },
+    binding: FetchClient,
+    secret: string,
+    signal: AbortSignal
+  ): Promise<Response> {
+    const unsigned = {
+      kind: "slack.thread_closed",
+      sessionId,
+      timestamp: Date.now(),
+      context: { channel: context.channel, threadTs: context.threadTs },
+    };
+    const signature = await this.signPayload(unsigned, secret);
+    signal.throwIfAborted();
+    return binding.fetch("https://internal/callbacks/thread_closed", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ...unsigned, signature }),
+      signal,
+    });
   }
 
   /**
@@ -186,19 +297,33 @@ export class CallbackNotificationService {
     let thrownError: unknown;
 
     try {
-      sessionId = this.getSessionId();
+      const callbackSessionId = this.getSessionId();
+      sessionId = callbackSessionId;
       const message = this.messageRepository.getMessageCallbackContext(messageId);
       if (!message?.callback_context) {
         result.rejectReason = "no_callback_context";
         return;
       }
 
-      const rawContext = JSON.parse(message.callback_context);
-      source = rawContext.source === "automation" ? "automation" : (message.source ?? null);
+      const rawContext: unknown = JSON.parse(message.callback_context);
+      source =
+        isRecord(rawContext) && rawContext.source === "automation"
+          ? "automation"
+          : (message.source ?? null);
 
       // Route automation callbacks to the scheduler's completion function.
       if (source === "automation") {
-        result = await this.notifyAutomationComplete(rawContext, success, error, messageId);
+        const automationContext = automationCallbackContextSchema.safeParse(rawContext);
+        if (!automationContext.success) {
+          result.rejectReason = "invalid_callback_context";
+          return;
+        }
+        result = await this.notifyAutomationComplete(
+          automationContext.data,
+          success,
+          error,
+          messageId
+        );
         return;
       }
 
@@ -230,30 +355,72 @@ export class CallbackNotificationService {
         return;
       }
       const payloadData = parsedCallback?.data ?? callbackData;
-      const signature = await this.signPayload(payloadData, secret);
-      const payload = { ...payloadData, signature };
-      result = await deliverWithRetry(
-        (signal) =>
-          binding.fetch("https://internal/callbacks/complete", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify(payload),
-            signal,
-          }),
+      let rejectReason: string | undefined;
+      const delivery = await retryDelivery<Response | null, Response>(
+        async (signal) => {
+          const denial =
+            rejectReason ??
+            (source === "linear"
+              ? null
+              : await this.slackPostDenial(callbackSessionId, rawContext));
+          // D1 reads cannot be canceled; an expired attempt must not reach the wire.
+          signal.throwIfAborted();
+          // The bot can tombstone the thread even when closure delivery fails.
+          rejectReason = denial ?? undefined;
+          let response: Response;
+          if (denial) {
+            if (!hasSlackThreadCoordinates(rawContext)) {
+              return { outcome: "delivered", value: null };
+            }
+            response = await this.sendSlackThreadClosed(
+              callbackSessionId,
+              rawContext,
+              binding,
+              secret,
+              signal
+            );
+          } else {
+            const signature = await this.signPayload(payloadData, secret);
+            signal.throwIfAborted();
+            response = await binding.fetch("https://internal/callbacks/complete", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ ...payloadData, signature }),
+              signal,
+            });
+          }
+          return response.ok
+            ? { outcome: "delivered", value: response }
+            : { outcome: "retryable_failure", failure: response };
+        },
         this.sleep,
-        ({ attempt, response, error: deliveryError }) => {
-          this.log.warn("callback.complete_delivery_attempt_failed", {
-            message_id: messageId,
-            session_id: sessionId,
-            source,
-            attempt,
-            ...(response ? { http_status: response.status } : {}),
-            ...(deliveryError !== undefined
-              ? { error: deliveryError instanceof Error ? deliveryError : String(deliveryError) }
-              : {}),
-          });
+        ({ attempt, failure: response, error: deliveryError }) => {
+          this.log.warn(
+            rejectReason
+              ? "callback.thread_closed_delivery_attempt_failed"
+              : "callback.complete_delivery_attempt_failed",
+            {
+              ...(!rejectReason ? { message_id: messageId, source } : {}),
+              session_id: sessionId,
+              attempt,
+              ...(response ? { http_status: response.status } : {}),
+              ...(deliveryError !== undefined
+                ? { error: deliveryError instanceof Error ? deliveryError : String(deliveryError) }
+                : {}),
+            }
+          );
         }
       );
+      const response = delivery.outcome === "delivered" ? delivery.value : delivery.failure;
+      result = {
+        delivered: delivery.outcome === "delivered" && delivery.value !== null,
+        attempts:
+          delivery.outcome === "delivered" && delivery.value === null && delivery.attempts === 1
+            ? 0
+            : delivery.attempts,
+        ...(response ? { httpStatus: response.status } : {}),
+        ...(rejectReason ? { rejectReason } : {}),
+      };
     } catch (caught) {
       thrownError = caught;
     } finally {
@@ -295,7 +462,8 @@ export class CallbackNotificationService {
     error: string | undefined,
     messageId: string
   ): Promise<CallbackDeliveryResult> {
-    if (!this.completeAutomationRun) {
+    const completeAutomationRun = this.completeAutomationRun;
+    if (!completeAutomationRun) {
       return { delivered: false, attempts: 0, rejectReason: "no_binding" };
     }
 
@@ -310,10 +478,13 @@ export class CallbackNotificationService {
       automationName: context.automationName,
     };
 
-    return deliverWithRetry(
-      () => this.completeAutomationRun!(payload),
+    const delivery = await retryDelivery<void, never>(
+      async () => ({
+        outcome: "delivered",
+        value: await completeAutomationRun(payload),
+      }),
       this.sleep,
-      ({ attempt, response, error: deliveryError }) => {
+      ({ attempt, error: deliveryError }) => {
         this.log.warn("callback.complete_delivery_attempt_failed", {
           message_id: messageId,
           session_id: this.getSessionId(),
@@ -321,7 +492,6 @@ export class CallbackNotificationService {
           automation_id: context.automationId,
           run_id: context.runId,
           attempt,
-          ...(response ? { http_status: response.status } : {}),
           ...(deliveryError !== undefined
             ? { error: deliveryError instanceof Error ? deliveryError : String(deliveryError) }
             : {}),
@@ -331,6 +501,146 @@ export class CallbackNotificationService {
       // while the first in-process completion can still be running.
       { attemptTimeoutMs: null }
     );
+
+    return {
+      delivered: delivery.outcome === "delivered",
+      attempts: delivery.attempts,
+    };
+  }
+
+  /**
+   * Re-assert Slack's assistant-thread activity indicator while a turn is
+   * still in flight.
+   *
+   * Driven by the sandbox heartbeat rather than by a timer. The heartbeat is
+   * the session's evidence that the agent is still occupied with this turn —
+   * the same evidence the inactivity watchdog renews `last_activity` from — so
+   * the indicator cannot outlive the thing it claims. A turn that emits tool
+   * calls keeps the indicator alive through `notifyToolCall` and never reaches
+   * delivery here.
+   *
+   * Best-effort: the bot acknowledges the callback before it calls Slack, so a
+   * delivered refresh is not proof the indicator was set. It is only proof the
+   * next one is a minute away.
+   */
+  async refreshSlackActivity(messageId: string, now: number): Promise<void> {
+    if (now - this._lastSlackActivityAt < SLACK_ACTIVITY_REFRESH_INTERVAL_MS) return;
+
+    // Web, Linear, automation and agent turns have no Slack indicator to hold
+    // open. Nothing to log — this is the ordinary shape of most sessions.
+    const message = this.messageRepository.getMessageCallbackContext(messageId);
+    if (!message?.callback_context || message.source !== "slack") return;
+
+    const { binding, secret } = this.resolveCallbackRoute("slack");
+    if (!secret || !binding) {
+      this.log.debug("callback.activity_refresh", {
+        message_id: messageId,
+        source: "slack",
+        outcome: "skipped",
+        skip_reason: secret ? "no_binding" : "no_secret",
+      });
+      return;
+    }
+
+    let context: unknown;
+    try {
+      context = JSON.parse(message.callback_context);
+    } catch (error) {
+      this.log.warn("callback.activity_refresh", {
+        message_id: messageId,
+        source: "slack",
+        outcome: "skipped",
+        skip_reason: "invalid_callback_context",
+        error: error instanceof Error ? error : new Error(String(error)),
+      });
+      return;
+    }
+
+    const sessionId = this.getSessionId();
+    try {
+      const denial = await this.slackPostDenial(sessionId, context);
+      if (denial) {
+        await this.notifySlackThreadClosed(sessionId, context, binding, secret);
+        this.log.info("callback.activity_refresh", {
+          message_id: messageId,
+          session_id: sessionId,
+          outcome: "rejected",
+          reject_reason: denial,
+        });
+        return;
+      }
+    } catch (error) {
+      this.log.warn("callback.activity_refresh", {
+        message_id: messageId,
+        session_id: sessionId,
+        outcome: "error",
+        error: error instanceof Error ? error : new Error(String(error)),
+      });
+      return;
+    }
+    const callbackData = {
+      kind: SLACK_ACTIVITY_REFRESH_KIND,
+      sessionId,
+      messageId,
+      timestamp: now,
+      context,
+    };
+    const signature = await this.signPayload(callbackData, secret);
+
+    // Last look before the wire. The turn can terminate between the heartbeat
+    // that asked for this refresh and here — completion posts the final reply
+    // and nothing clears the indicator afterwards, so a refresh that lands
+    // after it would re-assert `Working...` on a finished thread.
+    if (this.messageRepository.getProcessingMessageWithStartedAt()?.id !== messageId) {
+      this.log.debug("callback.activity_refresh", {
+        message_id: messageId,
+        session_id: sessionId,
+        source: "slack",
+        outcome: "skipped",
+        skip_reason: "no_longer_processing",
+      });
+      return;
+    }
+
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), ACTIVITY_REFRESH_TIMEOUT_MS);
+    try {
+      const response = await binding.fetch("https://internal/callbacks/activity", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ...callbackData, signature }),
+        signal: controller.signal,
+      });
+
+      const fields = {
+        message_id: messageId,
+        session_id: sessionId,
+        source: "slack",
+        outcome: response.ok ? "success" : "error",
+        http_status: response.status,
+        duration_ms: Date.now() - now,
+      };
+      if (response.ok) {
+        // `max` because a tool-call callback may have asserted the indicator
+        // while this refresh was in flight; that is the newer truth.
+        this._lastSlackActivityAt = Math.max(this._lastSlackActivityAt, now);
+        this.log.info("callback.activity_refresh", fields);
+      } else {
+        // The window stays open, so the next heartbeat retries in 30s.
+        this.log.warn("callback.activity_refresh", fields);
+      }
+    } catch (error) {
+      this.log.warn("callback.activity_refresh", {
+        message_id: messageId,
+        session_id: sessionId,
+        source: "slack",
+        outcome: "error",
+        error: error instanceof Error ? error : new Error(String(error)),
+        duration_ms: Date.now() - now,
+      });
+    } finally {
+      clearTimeout(timeout);
+    }
   }
 
   /**
@@ -409,7 +719,7 @@ export class CallbackNotificationService {
     }
 
     const sessionId = this.getSessionId();
-    const rawContext = JSON.parse(message.callback_context);
+    const rawContext: unknown = JSON.parse(message.callback_context);
 
     const callbackData = {
       sessionId,
@@ -438,6 +748,30 @@ export class CallbackNotificationService {
     if (now - this._lastToolCallCallbackTs < 3000) return;
     this._lastToolCallCallbackTs = now;
 
+    if (source !== "linear") {
+      try {
+        const denial = await this.slackPostDenial(sessionId, rawContext);
+        if (denial) {
+          await this.notifySlackThreadClosed(sessionId, rawContext, binding, secret);
+          this.log.info("callback.tool_call", {
+            message_id: messageId,
+            session_id: sessionId,
+            outcome: "rejected",
+            reject_reason: denial,
+          });
+          return;
+        }
+      } catch (error) {
+        this.log.warn("callback.tool_call", {
+          message_id: messageId,
+          session_id: sessionId,
+          outcome: "error",
+          error: error instanceof Error ? error : new Error(String(error)),
+        });
+        return;
+      }
+    }
+
     const payloadData = parsedPayload?.data ?? callbackData;
     const signature = await this.signPayload(payloadData, secret);
     const payload = { ...payloadData, signature };
@@ -454,6 +788,11 @@ export class CallbackNotificationService {
         // event for this callId (Anthropic's running and completed may be
         // seconds apart for long-running tools — the second event should retry).
         if (callId) this.markCallIdNotified(callId);
+        // The bot sets the Slack indicator from this callback, so it renews the
+        // same window `refreshSlackActivity` guards. A turn that keeps calling
+        // tools therefore never pays for a separate refresh.
+        if (source === "slack")
+          this._lastSlackActivityAt = Math.max(this._lastSlackActivityAt, now);
         this.log.info("callback.tool_call", {
           message_id: messageId,
           session_id: sessionId,

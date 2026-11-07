@@ -18,6 +18,13 @@ export const SERVICE_SIGNATURE_HEADER = "X-OpenInspect-Service-Signature";
 export const ACTOR_HEADER = "X-OpenInspect-Actor";
 export const SIG1_PREFIX = "sig1";
 
+/**
+ * Hard cap on a service-signed request body. The signature covers the body
+ * hash, so every signing and verification edge must buffer no more than this.
+ * The largest legitimate signed body is a session attachment upload.
+ */
+export const SERVICE_REQUEST_MAX_BODY_BYTES = 16 * 1024 * 1024;
+
 export const SERVICE_NAMES = ["web", "slack-bot", "github-bot", "linear-bot"] as const;
 export type ServiceName = (typeof SERVICE_NAMES)[number];
 
@@ -33,8 +40,7 @@ export type ServiceSignatureFailure = "format" | "expired" | "mismatch";
  * re-split the header (this module is the sole owner of the sig1 grammar).
  */
 export type ServiceSignatureResult =
-  | { ok: true; timestampMs: number; nonce: string }
-  | { ok: false; reason: ServiceSignatureFailure };
+  { ok: true; timestampMs: number; nonce: string } | { ok: false; reason: ServiceSignatureFailure };
 
 const NONCE_PATTERN = /^[0-9a-f]{1,64}$/;
 // Strict ASCII decimal. Number()'s wider grammar ("1e3", "0x10", padding)

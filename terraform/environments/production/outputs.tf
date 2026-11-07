@@ -18,6 +18,11 @@ output "d1_database_id" {
   value       = cloudflare_d1_database.main.id
 }
 
+output "d1_database_name" {
+  description = "The name of the D1 database used by operator CLI commands"
+  value       = cloudflare_d1_database.main.name
+}
+
 # Cloudflare Workers
 output "control_plane_url" {
   description = "Control plane worker URL"
@@ -32,6 +37,21 @@ output "control_plane_worker_name" {
 output "slack_bot_worker_name" {
   description = "Slack bot worker name"
   value       = var.enable_slack_bot ? module.slack_bot_worker[0].worker_name : null
+}
+
+output "slack_bot_worker_url" {
+  description = "Slack bot worker URL"
+  value       = var.enable_slack_bot ? module.slack_bot_worker[0].worker_url : null
+}
+
+output "slack_bot_events_url" {
+  description = "Slack Events API request URL"
+  value       = var.enable_slack_bot ? "${module.slack_bot_worker[0].worker_url}/events" : null
+}
+
+output "slack_bot_interactions_url" {
+  description = "Slack interactivity request and options load URL"
+  value       = var.enable_slack_bot ? "${module.slack_bot_worker[0].worker_url}/interactions" : null
 }
 
 output "linear_kv_id" {
@@ -122,4 +142,15 @@ output "verification_commands" {
     curl ${module.control_plane_worker.worker_url}/sessions
 
   EOF
+}
+
+# Documentation Site
+output "docs_site_project_id" {
+  description = "Vercel project ID for the documentation site; set it as the VERCEL_DOCS_PROJECT_ID repository variable so Deploy Docs can publish (null when docs_site_enabled = false)"
+  value       = var.docs_site_enabled ? module.docs_site[0].project_id : null
+}
+
+output "docs_site_url" {
+  description = "Documentation site URL (null when docs_site_enabled = false)"
+  value       = var.docs_site_enabled ? coalesce(local.docs_custom_domain_url, module.docs_site[0].production_url) : null
 }

@@ -1,4 +1,8 @@
-import type { RepositoryTokenTarget, SourceControlProvider } from "../source-control";
+import type {
+  CredentialScope,
+  RepositoryTokenTarget,
+  SourceControlProvider,
+} from "../source-control";
 import { SourceControlProviderError } from "../source-control/errors";
 import type { Logger } from "../logger";
 
@@ -22,12 +26,16 @@ export type ScmCredentialsResult =
 export class ScmCredentialsService {
   constructor(
     private readonly provider: SourceControlProvider,
-    private readonly log: Logger
+    private readonly log: Logger,
+    private readonly resolveCredentialScope: (
+      repository: RepositoryTokenTarget
+    ) => Promise<CredentialScope>
   ) {}
 
   async getCredentials(repository: RepositoryTokenTarget): Promise<ScmCredentialsResult> {
     try {
-      const auth = await this.provider.generateCredentialHelperAuth({ repositories: [repository] });
+      const scope = await this.resolveCredentialScope(repository);
+      const auth = await this.provider.generateCredentialHelperAuth(scope);
       if (
         !auth.username.trim() ||
         !auth.password.trim() ||

@@ -1,12 +1,13 @@
 # Sandbox network policy
 
-Sandbox settings let platform editors restrict outbound traffic for autonomous agents.
+Sandbox settings require upstream integration management permission. The legacy editor role alone
+does not grant it. Network policy writes also retain the fork catalog permission check.
 
 ## Browser-covered
 
 - TLS domain and CIDR allowlists.
 - A rejected save leaves the stored policy unchanged.
-- A member policy change surfaces the server denial.
+- Members without integration permission cannot open network controls.
 - Global policy.
 
 ## Backend-only
@@ -32,9 +33,10 @@ Run:
 npm run test:e2e -w @open-inspect/web -- --grep "outbound allowlist|sandbox policy"
 ```
 
-The allowlist test runs as an editor and saves `api.openai.com`, `*.github.com`, and `10.0.0.0/8`.
-The rejection test checks the UI shows a control-plane error without changing the saved unrestricted
-policy. A member Playwright test checks the server denial reaches the UI.
+The allowlist test runs as an administrator and saves `api.openai.com`, `*.github.com`, and
+`10.0.0.0/8`. The rejection test checks the UI shows a control-plane error without changing the
+saved unrestricted policy. A member Playwright test checks the permission shell withholds network
+controls.
 
 ## Gotchas
 
@@ -47,7 +49,7 @@ Pair policy changes with:
 - `packages/control-plane/test/integration/integration-settings.test.ts` for member ownership
   restrictions.
 - `packages/control-plane/src/sandbox/settings.test.ts` for validation and fail-closed parsing.
-- `packages/control-plane/src/sandbox/lifecycle/manager.test.ts` for provider capability checks and
-  current-policy resolution.
-- `packages/modal-infra/tests/test_sandbox_resources.py` for Modal's installed API and domain and
-  CIDR allowlist arguments.
+- `packages/control-plane/src/sandbox/lifecycle/governance.test.ts` for provider capability checks
+  and current-policy resolution.
+- `packages/modal-infra/tests/test_launch_policy.py` for Modal's installed API and domain and CIDR
+  allowlist arguments.

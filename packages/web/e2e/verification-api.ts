@@ -1,4 +1,6 @@
 import type { Page, Request, Route } from "@playwright/test";
+import { analyticsDashboard } from "../src/lib/analytics.test-fixture";
+import { permissionsForBuiltInRole } from "../../shared/src/rbac";
 
 type PlatformRole = "member" | "editor" | "admin";
 type NetworkPolicy =
@@ -212,6 +214,44 @@ async function handleApi(route: Route, state: VerificationApiState): Promise<voi
     });
     return;
   }
+  if (method === "GET" && url.pathname === "/api/me/authorization") {
+    const key = state.role === "admin" ? "administrator" : "member";
+    const authorization =
+      state.role === "editor"
+        ? {
+            userId,
+            suspendedAt: null,
+            role: { id: "role_fork_catalog_editor", key: null, name: "Catalog editor" },
+            permissions: [
+              ...permissionsForBuiltInRole("member"),
+              "skills.manage",
+              "mcp_servers.manage",
+            ],
+          }
+        : {
+            userId,
+            suspendedAt: null,
+            role: { id: `role_builtin_${key}`, key, name: key },
+            permissions: permissionsForBuiltInRole(key),
+          };
+    await json(route, authorization);
+    return;
+  }
+  if (
+    method === "GET" &&
+    ["/api/me/teams", "/api/teams", "/api/settings/teams"].includes(url.pathname)
+  ) {
+    await json(route, {
+      teams: [],
+      capabilities: { canListAllTeams: state.role === "admin" },
+      requireTeamOnCreate: false,
+    });
+    return;
+  }
+  if (method === "GET" && url.pathname === "/api/memory-preferences") {
+    await json(route, { includeMemories: true });
+    return;
+  }
   if (method === "GET" && url.pathname === "/api/keyboard-shortcuts") {
     await json(route, keyboardShortcuts);
     return;
@@ -274,7 +314,7 @@ async function handleApi(route: Route, state: VerificationApiState): Promise<voi
     return;
   }
   if (method === "POST" && url.pathname === "/api/sessions") {
-    await json(route, { sessionId: "session-verification" }, 201);
+    await json(route, { sessionId: "session-verification", status: "active" }, 201);
     return;
   }
   if (method === "POST" && url.pathname === "/api/sessions/session-verification/prompt") {
@@ -305,6 +345,24 @@ async function handleApi(route: Route, state: VerificationApiState): Promise<voi
           avatarUrl: null,
         },
       },
+    });
+    return;
+  }
+  if (
+    method === "GET" &&
+    url.pathname === "/api/sessions/session-verification/collaborator-candidates"
+  ) {
+    await json(route, []);
+    return;
+  }
+  if (method === "GET" && url.pathname === "/api/sessions/session-verification/memories") {
+    await json(route, {
+      includePersonalMemories: true,
+      directiveChars: 0,
+      catalogChars: 0,
+      estimatedTokens: 0,
+      omittedCount: 0,
+      items: [],
     });
     return;
   }
@@ -380,11 +438,11 @@ async function handleApi(route: Route, state: VerificationApiState): Promise<voi
   }
   if (method === "PATCH" && url.pathname === "/api/sessions/session-verification/read-state") {
     await json(route, {
-      readState: {
-        latestMessageId: "message-assistant-live-1",
-        latestMessageCreatedAt: now + 3_000,
-        latestMessageReadAt: now + 4_000,
-      },
+      sessionId: "session-verification",
+      outcome: "marked_read",
+      unread: false,
+      latestMessageId: "message-assistant-live-1",
+      version: 1,
     });
     return;
   }
@@ -405,6 +463,10 @@ async function handleApi(route: Route, state: VerificationApiState): Promise<voi
       automations: [
         {
           id: "automation-security-review",
+          harness: "opencode",
+          userId,
+          ownerTeamId: null,
+          capabilities: { canRead: true, canManage: true, canTrigger: true },
           name: "Nightly identity security review",
           instructions: "Review identity changes for security regressions.",
           triggerType: "schedule",
@@ -444,6 +506,16 @@ async function handleApi(route: Route, state: VerificationApiState): Promise<voi
   if (method === "POST" && url.pathname === "/api/automations/automation-security-review/trigger") {
     state.automation.triggered = true;
     await json(route, { invocationId: "invocation-manual-1" }, 202);
+    return;
+  }
+  if (method === "GET" && url.pathname === "/api/analytics/dashboard") {
+    const snapshot = analyticsDashboard();
+    const days = Number(url.searchParams.get("days"));
+    if (days !== 7 && days !== 14 && days !== 30 && days !== 90)
+      throw new Error("Unexpected analytics range");
+    snapshot.window.days = days;
+    snapshot.window.startAt = snapshot.window.endAt - days * 86_400_000;
+    await json(route, snapshot);
     return;
   }
   if (method === "GET" && url.pathname === "/api/analytics/summary") {

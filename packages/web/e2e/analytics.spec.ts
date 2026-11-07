@@ -4,28 +4,24 @@ test("analytics.dashboard-range-and-outcomes", async ({ page, api }) => {
   await page.goto("/");
   await page.getByRole("link", { name: "Analytics" }).click();
   await expect(page.getByRole("heading", { name: "Analytics" })).toBeVisible();
-  await expect(page.getByText("128 sessions in range", { exact: true })).toBeVisible();
-  await expect(page.getByRole("main").getByText("Verifier Admin", { exact: true })).toBeVisible();
-  await expect(page.getByText("acme/identity-service", { exact: true }).first()).toBeVisible();
-  await expect(page.getByRole("heading", { name: "Pull Requests", exact: true })).toBeVisible();
-  await expect(page.getByText("Total Cost", { exact: true }).first().locator("..")).toContainText(
-    "$84.50"
+  await expect(page.getByRole("tab", { name: "Overview", exact: true })).toHaveAttribute(
+    "aria-selected",
+    "true"
   );
-  await expect(page.getByText("Acceptance Rate", { exact: true }).locator("..")).toContainText(
-    "84%"
+  await expect(page.getByRole("list", { name: "Top repositories by sessions" })).toContainText(
+    "web"
   );
-
+  await expect(page.getByRole("region", { name: "Human sessions", exact: true })).toContainText(
+    "$12.50"
+  );
+  await page.getByRole("tab", { name: "Pull requests", exact: true }).click();
+  await expect(page.getByText("Merged", { exact: true }).first()).toBeVisible();
+  await page.getByRole("tab", { name: "People", exact: true }).click();
+  await expect(page.getByText("Zoe", { exact: true }).first()).toBeVisible();
   await page.getByRole("radio", { name: "7d" }).click();
-  const sevenDayRequests = [
-    "/api/analytics/summary?days=7",
-    "/api/analytics/timeseries?days=7",
-    "/api/analytics/breakdown?days=7&by=repo",
-    "/api/analytics/breakdown?days=7&by=user",
-    "/api/analytics/pull-requests?days=7",
-  ];
   await expect
     .poll(() =>
-      sevenDayRequests.every((path) => api.requests.some((request) => request.path === path))
+      api.requests.some((request) => request.path === "/api/analytics/dashboard?days=7&scope=human")
     )
     .toBe(true);
 });

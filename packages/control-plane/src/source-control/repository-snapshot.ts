@@ -1,3 +1,4 @@
+import type { CredentialScope } from "./types";
 import { SourceControlProviderError } from "./errors";
 import type {
   ReadRepositorySnapshotConfig,
@@ -10,9 +11,10 @@ const utf8Decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: false });
 
 export async function readRepositorySnapshot(
   reader: RepositoryReader,
-  config: ReadRepositorySnapshotConfig
+  config: ReadRepositorySnapshotConfig,
+  scope: CredentialScope
 ): Promise<RepositorySnapshot> {
-  const commit = await reader.resolveCommit(config);
+  const commit = await reader.resolveCommit(config, scope);
   if (!commit) {
     throw new SourceControlProviderError(
       `Repository ref ${config.ref} does not exist`,
@@ -20,12 +22,15 @@ export async function readRepositorySnapshot(
     );
   }
 
-  const tree = await reader.listTree({
-    owner: config.owner,
-    name: config.name,
-    commitSha: commit.sha,
-    path: config.path,
-  });
+  const tree = await reader.listTree(
+    {
+      owner: config.owner,
+      name: config.name,
+      commitSha: commit.sha,
+      path: config.path,
+    },
+    scope
+  );
   if (tree.truncated) {
     throw new SourceControlProviderError("Repository tree was truncated", "permanent");
   }
@@ -51,12 +56,15 @@ export async function readRepositorySnapshot(
   let totalBytes = 0;
   const files: RepositorySnapshotFile[] = [];
   for (const entry of entries) {
-    const bytes = await reader.readBlob({
-      owner: config.owner,
-      name: config.name,
-      blobId: entry.blobId,
-      maxBytes: config.maxBytes - totalBytes,
-    });
+    const bytes = await reader.readBlob(
+      {
+        owner: config.owner,
+        name: config.name,
+        blobId: entry.blobId,
+        maxBytes: config.maxBytes - totalBytes,
+      },
+      scope
+    );
     totalBytes += bytes.byteLength;
     if (totalBytes > config.maxBytes) {
       throw new SourceControlProviderError(

@@ -14,12 +14,14 @@ import { Switch } from "@/components/ui/switch";
 import { PlusIcon, SparkleIcon } from "@/components/ui/icons";
 import { SkillEditor } from "./skill-editor";
 import { SkillImport } from "./skill-import";
+import { SkillDetails } from "./skill-details";
 import { errorMessage } from "./utils";
 import { usePlatformRole } from "@/hooks/use-platform-role";
 import { useGovernanceCatalog } from "@/hooks/use-governance-catalog";
 
-export function SkillsCatalog() {
+export function SkillsCatalog({ canManage: canManageSkills }: { canManage: boolean }) {
   const { canWriteCatalog } = usePlatformRole();
+  const canManage = canManageSkills && canWriteCatalog;
   const { status: governance } = useGovernanceCatalog();
   const gitManaged = governance?.configured === true;
   const [cursorHistory, setCursorHistory] = useState<string[]>([]);
@@ -96,7 +98,7 @@ export function SkillsCatalog() {
       return <p className="text-sm text-destructive">Failed to load this managed skill.</p>;
     if (loadingSkill || !skill)
       return <p className="text-sm text-muted-foreground">Loading skill...</p>;
-    return (
+    return canManage && !gitManaged ? (
       <SkillEditor
         key={`${skill.id}:${skill.currentRevisionId}`}
         skill={skill}
@@ -106,6 +108,8 @@ export function SkillsCatalog() {
           await Promise.all([revalidateSkillCatalogPage(cursor), mutateSkill()]);
         }}
       />
+    ) : (
+      <SkillDetails skill={skill} onClose={() => setSelectedId(null)} />
     );
   }
 
@@ -118,7 +122,7 @@ export function SkillsCatalog() {
             Manage reusable instructions assigned to repositories and environments.
           </p>
         </div>
-        {canWriteCatalog && !gitManaged && (
+        {canManage && !gitManaged && (
           <div className="flex shrink-0 gap-2">
             <Button size="sm" variant="subtle" onClick={() => setImporting(true)}>
               Import from repository
@@ -156,9 +160,7 @@ export function SkillsCatalog() {
             <div key={item.id} className="flex items-start gap-3 p-4">
               <button
                 type="button"
-                onClick={() => {
-                  if (canWriteCatalog && !gitManaged) setSelectedId(item.id);
-                }}
+                onClick={() => setSelectedId(item.id)}
                 className="min-w-0 flex-1 text-left"
               >
                 <div className="flex items-center gap-2">
@@ -192,13 +194,15 @@ export function SkillsCatalog() {
                   <span>· Created by {item.creatorDisplayName || item.createdBy}</span>
                 </p>
               </button>
-              <Switch
-                checked={item.enabled}
-                onCheckedChange={(value) => toggleEnabled(item.id, value)}
-                disabled={!canWriteCatalog || gitManaged}
-                aria-label={`${item.enabled ? "Disable" : "Enable"} ${item.name}`}
-              />
-              {canWriteCatalog && !gitManaged && (
+              {canManage && (
+                <Switch
+                  checked={item.enabled}
+                  onCheckedChange={(value) => toggleEnabled(item.id, value)}
+                  disabled={gitManaged}
+                  aria-label={`${item.enabled ? "Disable" : "Enable"} ${item.name}`}
+                />
+              )}
+              {canManage && !gitManaged && (
                 <Button variant="ghost" size="xs" onClick={() => remove(item.id, item.name)}>
                   Delete
                 </Button>

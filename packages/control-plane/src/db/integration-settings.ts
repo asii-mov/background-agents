@@ -1,13 +1,17 @@
 import { DEFAULT_MENTIONS_POLICY } from "@open-inspect/shared/slack";
 import { parseRepositoryFullName } from "@open-inspect/shared/types/repositories";
 import { isEnvironmentId } from "@open-inspect/shared/types/environments";
+import { type z } from "zod";
 import {
   ENVIRONMENT_SETTINGS_INTEGRATION_IDS,
   INTEGRATION_DEFINITIONS,
   MAX_SESSION_INSTRUCTIONS_LENGTH,
   MAX_SLACK_ROUTING_RULES,
   MAX_SLACK_ROUTING_KEYWORD_LENGTH,
+  getIntegrationGlobalSettingsSchema,
+  getIntegrationRepoSettingsSchema,
   normalizeRoutingRules,
+  slackRoutingRuleSchema,
   type EnvironmentSettingsIntegrationId,
   type IntegrationId,
   type IntegrationSettingsMap,
@@ -20,11 +24,18 @@ import {
   type SlackMentionsPolicy,
   type SlackRoutingRule,
 } from "@open-inspect/shared/types/integrations";
+import { checkHarnessCompatibility, type HarnessId } from "@open-inspect/shared/harnesses";
 import { isValidModel, isValidReasoningEffort } from "@open-inspect/shared/models";
 import { normalizeSandboxSettings } from "../sandbox/settings";
 import type { SqlDatabase } from "./sql-database";
 
 type SettingsLevel = "global" | "repo";
+type IntegrationSettingsAtLevel<
+  K extends keyof IntegrationSettingsMap,
+  L extends SettingsLevel,
+> = L extends "global"
+  ? NonNullable<IntegrationSettingsMap[K]["global"]["defaults"]>
+  : IntegrationSettingsMap[K]["repo"];
 
 const SLACK_MENTIONS_POLICIES = ["allow", "escape", "strip"] as const;
 
@@ -42,6 +53,37 @@ export function isValidIntegrationId(id: string): id is IntegrationId {
 }
 
 const ENVIRONMENT_SETTINGS_INTEGRATIONS = new Set<string>(ENVIRONMENT_SETTINGS_INTEGRATION_IDS);
+
+function parseSettings<TSchema extends z.ZodType<object>>(
+  schema: TSchema,
+  value: unknown,
+  description: string
+): z.output<TSchema> {
+  const result = schema.safeParse(value);
+  if (!result.success) {
+    const issue = result.error.issues[0];
+    const detail =
+      issue?.code === "invalid_type" && issue.path.length > 0
+        ? `${issue.path.join(".")} must be ${issue.expected === "array" ? "an" : "a"} ${issue.expected}`
+        : (issue?.message ?? "invalid shape");
+    throw new IntegrationSettingsValidationError(`${description} are invalid: ${detail}`);
+  }
+  return result.data;
+}
+
+function parseStoredSettings<TSchema extends z.ZodType<object>>(
+  schema: TSchema,
+  raw: string,
+  description: string
+): z.output<TSchema> {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new IntegrationSettingsValidationError(`${description} are invalid: malformed JSON`);
+  }
+  return parseSettings(schema, parsed, description);
+}
 
 /** Whether an integration accepts environment-level setting overrides (design §13.5). */
 export function supportsEnvironmentSettings(
@@ -62,7 +104,11 @@ export class IntegrationSettingsStore {
       .first<{ settings: string }>();
 
     if (!row) return null;
-    const settings = JSON.parse(row.settings) as IntegrationSettingsMap[K]["global"];
+    const settings = parseStoredSettings(
+      getIntegrationGlobalSettingsSchema(integrationId),
+      row.settings,
+      "Stored global integration settings"
+    );
     return this.normalizeStoredGlobalSettings(integrationId, settings);
   }
 
@@ -70,7 +116,13 @@ export class IntegrationSettingsStore {
     integrationId: K,
     settings: IntegrationSettingsMap[K]["global"]
   ): Promise<void> {
-    if (settings.enabledRepos !== undefined) {
+    settings = parseSettings(
+      getIntegrationGlobalSettingsSchema(integrationId),
+      settings,
+      "Global integration settings"
+    );
+
+    if (settings.enabledRepos !== undefined && settings.enabledRepos !== null) {
       if (
         !Array.isArray(settings.enabledRepos) ||
         !settings.enabledRepos.every((r) => typeof r === "string")
@@ -122,7 +174,11 @@ export class IntegrationSettingsStore {
       .first<{ settings: string }>();
 
     if (!row) return null;
-    const settings = JSON.parse(row.settings) as IntegrationSettingsMap[K]["repo"];
+    const settings = parseStoredSettings(
+      getIntegrationRepoSettingsSchema(integrationId),
+      row.settings,
+      "Stored repo integration settings"
+    );
     return this.normalizeStoredRepoSettings(integrationId, settings);
   }
 
@@ -131,7 +187,12 @@ export class IntegrationSettingsStore {
     repo: string,
     settings: IntegrationSettingsMap[K]["repo"]
   ): Promise<void> {
-    const normalized = this.validateAndNormalizeSettings(integrationId, settings, "repo");
+    const structurallyValid = parseSettings(
+      getIntegrationRepoSettingsSchema(integrationId),
+      settings,
+      "Repo integration settings"
+    );
+    const normalized = this.validateAndNormalizeSettings(integrationId, structurallyValid, "repo");
 
     const now = Date.now();
     await this.db
@@ -168,7 +229,11 @@ export class IntegrationSettingsStore {
       repo: row.repo,
       settings: this.normalizeStoredRepoSettings(
         integrationId,
-        JSON.parse(row.settings) as IntegrationSettingsMap[K]["repo"]
+        parseStoredSettings(
+          getIntegrationRepoSettingsSchema(integrationId),
+          row.settings,
+          "Stored repo integration settings"
+        )
       ),
     }));
   }
@@ -191,7 +256,11 @@ export class IntegrationSettingsStore {
       .first<{ settings: string }>();
 
     if (!row) return null;
-    const settings = JSON.parse(row.settings) as IntegrationSettingsMap[K]["repo"];
+    const settings = parseStoredSettings(
+      getIntegrationRepoSettingsSchema(integrationId),
+      row.settings,
+      "Stored environment integration settings"
+    );
     return this.normalizeStoredRepoSettings(integrationId, settings);
   }
 
@@ -200,7 +269,12 @@ export class IntegrationSettingsStore {
     environmentId: string,
     settings: IntegrationSettingsMap[K]["repo"]
   ): Promise<void> {
-    const normalized = this.validateAndNormalizeSettings(integrationId, settings, "repo");
+    const structurallyValid = parseSettings(
+      getIntegrationRepoSettingsSchema(integrationId),
+      settings,
+      "Environment integration settings"
+    );
+    const normalized = this.validateAndNormalizeSettings(integrationId, structurallyValid, "repo");
 
     const now = Date.now();
     await this.db
@@ -297,18 +371,22 @@ export class IntegrationSettingsStore {
     if (integrationId !== "sandbox") return settings;
     return normalizeSandboxSettings(settings, {
       invalid: "omit",
+      partial: true,
     }) as IntegrationSettingsMap[K]["repo"];
   }
 
-  private validateAndNormalizeSettings<K extends keyof IntegrationSettingsMap>(
+  private validateAndNormalizeSettings<
+    K extends keyof IntegrationSettingsMap,
+    L extends SettingsLevel,
+  >(
     integrationId: K,
-    settings: IntegrationSettingsMap[K]["repo"],
-    level: SettingsLevel
-  ): IntegrationSettingsMap[K]["repo"] {
+    settings: IntegrationSettingsAtLevel<K, L>,
+    level: L
+  ): IntegrationSettingsAtLevel<K, L> {
     if (integrationId === "github") {
       return this.validateAndNormalizeGitHubSettings(
         settings as GitHubBotSettings
-      ) as IntegrationSettingsMap[K]["repo"];
+      ) as IntegrationSettingsAtLevel<K, L>;
     }
 
     if (integrationId === "linear") {
@@ -327,22 +405,41 @@ export class IntegrationSettingsStore {
       return normalizeSandboxSettings(settings, {
         invalid: "throw",
         createError: (message) => new IntegrationSettingsValidationError(message),
-      }) as IntegrationSettingsMap[K]["repo"];
+        partial: level !== "global",
+      }) as IntegrationSettingsAtLevel<K, L>;
     }
 
     if (integrationId === "slack") {
       return this.validateSlackSettings(
         settings as SlackGlobalSettings,
         level
-      ) as IntegrationSettingsMap[K]["repo"];
+      ) as IntegrationSettingsAtLevel<K, L>;
     }
 
     return settings;
   }
 
-  private validateModelAndEffort(settings: { model?: string; reasoningEffort?: string }): void {
+  /**
+   * Model, reasoning effort and (where the integration has one) harness, checked
+   * together. A harness and model saved at the same level must be compatible,
+   * like an automation on save; values merged from other levels can still
+   * disagree, so launchers resolve that with `resolveHarnessForModel`.
+   */
+  private validateAgentSelection(settings: {
+    model?: string;
+    reasoningEffort?: string;
+    harness?: HarnessId;
+  }): void {
     if (settings.model !== undefined && !isValidModel(settings.model)) {
       throw new IntegrationSettingsValidationError(`Invalid model ID: ${settings.model}`);
+    }
+
+    const harnessIncompatibility =
+      settings.harness !== undefined && settings.model !== undefined
+        ? checkHarnessCompatibility(settings.harness, settings.model)
+        : null;
+    if (harnessIncompatibility) {
+      throw new IntegrationSettingsValidationError(harnessIncompatibility.message);
     }
 
     if (
@@ -357,7 +454,7 @@ export class IntegrationSettingsStore {
   }
 
   private validateAndNormalizeGitHubSettings(settings: GitHubBotSettings): GitHubBotSettings {
-    this.validateModelAndEffort(settings);
+    this.validateAgentSelection(settings);
 
     if (
       settings.codeReviewInstructions !== undefined &&
@@ -430,17 +527,6 @@ export class IntegrationSettingsStore {
     }
 
     const maxAttempts = settings.maxAttemptsPerPrPer24Hours;
-    if (
-      maxAttempts !== undefined &&
-      (typeof maxAttempts !== "number" ||
-        !Number.isInteger(maxAttempts) ||
-        maxAttempts < 1 ||
-        maxAttempts > 50)
-    ) {
-      throw new IntegrationSettingsValidationError(
-        "autofix.maxAttemptsPerPrPer24Hours must be an integer from 1 to 50"
-      );
-    }
 
     const normalized: GitHubAutofixSettings = {};
     for (const key of booleanKeys) {
@@ -451,14 +537,14 @@ export class IntegrationSettingsStore {
         new Set(allowedReviewBots.map((login) => login.trim().toLowerCase()).filter(Boolean))
       );
     }
-    if (typeof maxAttempts === "number") {
+    if (typeof maxAttempts === "number" || maxAttempts === null) {
       normalized.maxAttemptsPerPrPer24Hours = maxAttempts;
     }
     return normalized;
   }
 
   private validateLinearSettings(settings: LinearBotSettings): void {
-    this.validateModelAndEffort(settings);
+    this.validateAgentSelection(settings);
 
     if (
       settings.allowUserPreferenceOverride !== undefined &&
@@ -520,6 +606,7 @@ export class IntegrationSettingsStore {
             "agentNotificationsEnabled",
             "model",
             "mentionsPolicy",
+            "unboundChannels",
             "routingRules",
             "sessionInstructions",
           ])
@@ -538,7 +625,7 @@ export class IntegrationSettingsStore {
       throw new IntegrationSettingsValidationError("agentNotificationsEnabled must be a boolean");
     }
 
-    this.validateModelAndEffort(settings);
+    this.validateAgentSelection(settings);
 
     if (
       settings.mentionsPolicy !== undefined &&
@@ -585,16 +672,17 @@ export class IntegrationSettingsStore {
         `routingRules cannot exceed ${MAX_SLACK_ROUTING_RULES} entries`
       );
     }
+    const parsedRules: SlackRoutingRule[] = [];
     for (const rule of rules) {
       if (typeof rule !== "object" || rule === null) {
         throw new IntegrationSettingsValidationError("each routing rule must be an object");
       }
-      const { keyword, target, targetType } = rule as {
-        keyword?: unknown;
-        target?: unknown;
-        targetType?: unknown;
-      };
-      if (typeof keyword !== "string" || keyword.trim() === "") {
+      const parsedRule = slackRoutingRuleSchema.safeParse(rule);
+      if (!parsedRule.success) {
+        throw new IntegrationSettingsValidationError("each routing rule must be an object");
+      }
+      const { keyword, target, targetType } = parsedRule.data;
+      if (keyword.trim() === "") {
         throw new IntegrationSettingsValidationError(
           "routing rule keyword must be a non-empty string"
         );
@@ -604,14 +692,9 @@ export class IntegrationSettingsStore {
           `routing rule keyword must be ${MAX_SLACK_ROUTING_KEYWORD_LENGTH} characters or fewer`
         );
       }
-      if (targetType !== undefined && targetType !== "repository" && targetType !== "environment") {
-        throw new IntegrationSettingsValidationError(
-          'routing rule targetType must be "repository" or "environment"'
-        );
-      }
       if (targetType === "environment") {
         // The stable environment id, never the rename-able display name.
-        if (typeof target !== "string" || !isEnvironmentId(target.trim())) {
+        if (!isEnvironmentId(target.trim())) {
           throw new IntegrationSettingsValidationError(
             "routing rule target must be an environment id (env_…) when targetType is environment"
           );
@@ -619,8 +702,7 @@ export class IntegrationSettingsStore {
         // The owner segment excludes ":" (GitHub forbids it) so a repository
         // target can never collide with the bots' "env:<id>" value encoding.
       } else {
-        const repository =
-          typeof target === "string" ? parseRepositoryFullName(target.trim()) : null;
+        const repository = parseRepositoryFullName(target.trim());
         if (
           !repository ||
           /[\s:]/.test(repository.repoOwner) ||
@@ -631,8 +713,9 @@ export class IntegrationSettingsStore {
           );
         }
       }
+      parsedRules.push(parsedRule.data);
     }
-    return normalizeRoutingRules(rules as SlackRoutingRule[]);
+    return normalizeRoutingRules(parsedRules);
   }
 }
 

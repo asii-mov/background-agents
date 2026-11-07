@@ -1,31 +1,35 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { GitHubSourceControlProvider } from "./github-provider";
 import { SourceControlProviderError } from "../errors";
-import { readRepositorySnapshot } from "../repository-snapshot";
+import type { CredentialScope } from "../types";
 
 // Mock the upstream GitHub App auth functions
 vi.mock("../../auth/github-app", () => ({
-  createScopedInstallationTokenWithExpiry: vi.fn(),
   getCachedInstallationToken: vi.fn(),
+  getCachedInstallationTokenWithExpiry: vi.fn(),
+  getInstallationTokenCacheKey: vi.fn(),
+  invalidateInstallationTokenCache: vi.fn(),
   getInstallationRepository: vi.fn(),
   listInstallationRepositories: vi.fn(),
   fetchWithTimeout: vi.fn(),
 }));
 
 import {
-  createScopedInstallationTokenWithExpiry,
   fetchWithTimeout,
   getCachedInstallationToken,
+  getCachedInstallationTokenWithExpiry,
+  getInstallationTokenCacheKey,
+  invalidateInstallationTokenCache,
   getInstallationRepository,
   listInstallationRepositories,
 } from "../../auth/github-app";
 
 const mockGetInstallationRepository = vi.mocked(getInstallationRepository);
 const mockListInstallationRepositories = vi.mocked(listInstallationRepositories);
-const mockCreateScopedInstallationTokenWithExpiry = vi.mocked(
-  createScopedInstallationTokenWithExpiry
-);
+const mockGetCachedInstallationTokenWithExpiry = vi.mocked(getCachedInstallationTokenWithExpiry);
 const mockGetCachedInstallationToken = vi.mocked(getCachedInstallationToken);
+const mockGetInstallationTokenCacheKey = vi.mocked(getInstallationTokenCacheKey);
+const mockInvalidateInstallationTokenCache = vi.mocked(invalidateInstallationTokenCache);
 const mockFetchWithTimeout = vi.mocked(fetchWithTimeout);
 
 function makeResponse(body: unknown, status = 200): Response {
@@ -53,9 +57,7 @@ const fakeAppConfig = {
   installationId: "456",
 };
 
-const fakeRepositoryCredentialConfig = {
-  repositories: [{ owner: "acme", name: "web", providerRepoId: 1 }] as const,
-};
+const repositoryScope: CredentialScope = { kind: "repositories", repositoryIds: [9001] };
 
 describe("GitHubSourceControlProvider", () => {
   beforeEach(() => {
@@ -71,7 +73,10 @@ describe("GitHubSourceControlProvider", () => {
       const provider = new GitHubSourceControlProvider({ appConfig: fakeAppConfig });
 
       await expect(
-        provider.getBranchHead({ owner: "acme", name: "web", branch: "feature/test" })
+        provider.getBranchHead(
+          { owner: "acme", name: "web", branch: "feature/test" },
+          repositoryScope
+        )
       ).resolves.toBe("abc123");
       expect(mockFetchWithTimeout).toHaveBeenCalledWith(
         expect.stringContaining("heads/feature%2Ftest"),
@@ -85,7 +90,7 @@ describe("GitHubSourceControlProvider", () => {
       const provider = new GitHubSourceControlProvider({ appConfig: fakeAppConfig });
 
       await expect(
-        provider.getBranchHead({ owner: "acme", name: "web", branch: "missing" })
+        provider.getBranchHead({ owner: "acme", name: "web", branch: "missing" }, repositoryScope)
       ).resolves.toBeNull();
     });
 
@@ -95,7 +100,7 @@ describe("GitHubSourceControlProvider", () => {
       const provider = new GitHubSourceControlProvider({ appConfig: fakeAppConfig });
 
       const err = await provider
-        .getBranchHead({ owner: "acme", name: "web", branch: "main" })
+        .getBranchHead({ owner: "acme", name: "web", branch: "main" }, repositoryScope)
         .catch((e: unknown) => e);
 
       expect(err).toBeInstanceOf(SourceControlProviderError);
@@ -103,94 +108,6 @@ describe("GitHubSourceControlProvider", () => {
         "Failed to resolve branch head: unexpected response shape (object.sha)"
       );
       expect((err as SourceControlProviderError).errorType).toBe("permanent");
-    });
-  });
-
-  describe("readRepositorySnapshot", () => {
-    it("resolves the ref once and returns bounded UTF-8 files from that commit", async () => {
-      mockGetCachedInstallationToken.mockResolvedValue("installation-token");
-      mockFetchWithTimeout
-        .mockResolvedValueOnce(new Response("commit-sha"))
-        .mockResolvedValueOnce(
-          makeJsonResponse({
-            tree: [
-              {
-                path: ".openinspect",
-                type: "tree",
-                mode: "040000",
-                sha: "governance-tree",
-              },
-            ],
-          })
-        )
-        .mockResolvedValueOnce(
-          makeJsonResponse({
-            truncated: false,
-            tree: [
-              {
-                path: "catalog.yaml",
-                type: "blob",
-                mode: "100644",
-                sha: "blob-sha",
-                size: 16,
-              },
-            ],
-          })
-        )
-        .mockResolvedValueOnce(new Response("schemaVersion: 1"));
-      const provider = new GitHubSourceControlProvider({ appConfig: fakeAppConfig });
-
-      await expect(
-        readRepositorySnapshot(provider, {
-          owner: "acme",
-          name: "governance",
-          ref: "main",
-          path: ".openinspect",
-          maxFiles: 10,
-          maxBytes: 1024,
-        })
-      ).resolves.toEqual({
-        commitSha: "commit-sha",
-        files: [
-          {
-            path: ".openinspect/catalog.yaml",
-            content: "schemaVersion: 1",
-            sha: "blob-sha",
-          },
-        ],
-      });
-      expect(mockFetchWithTimeout).toHaveBeenCalledTimes(4);
-      expect(mockFetchWithTimeout.mock.calls[2][0]).toContain("/git/trees/governance-tree");
-    });
-
-    it("fails closed when GitHub truncates the recursive tree", async () => {
-      mockGetCachedInstallationToken.mockResolvedValue("installation-token");
-      mockFetchWithTimeout
-        .mockResolvedValueOnce(new Response("commit-sha"))
-        .mockResolvedValueOnce(
-          makeJsonResponse({
-            tree: [
-              {
-                path: ".openinspect",
-                type: "tree",
-                mode: "040000",
-                sha: "governance-tree",
-              },
-            ],
-          })
-        )
-        .mockResolvedValueOnce(makeJsonResponse({ truncated: true, tree: [] }));
-      const provider = new GitHubSourceControlProvider({ appConfig: fakeAppConfig });
-      await expect(
-        readRepositorySnapshot(provider, {
-          owner: "acme",
-          name: "governance",
-          ref: "main",
-          path: ".openinspect",
-          maxFiles: 10,
-          maxBytes: 1024,
-        })
-      ).rejects.toThrow(/truncated/);
     });
   });
 
@@ -362,48 +279,6 @@ describe("GitHubSourceControlProvider", () => {
       const result = await provider.checkRepositoryAccess({ owner: "old-owner", name: "old-repo" });
 
       expect(result).toMatchObject({ repoOwner: "new-owner", repoName: "renamed-repo" });
-    });
-  });
-
-  describe("checkRepositoryUserAccess", () => {
-    it("returns the verified user permission", async () => {
-      mockGetCachedInstallationToken.mockResolvedValueOnce("installation-token");
-      mockFetchWithTimeout.mockResolvedValueOnce(makeResponse({ permission: "write" }));
-      const provider = new GitHubSourceControlProvider({ appConfig: fakeAppConfig });
-
-      await expect(
-        provider.checkRepositoryUserAccess({
-          owner: "acme",
-          name: "web",
-          userLogin: "ada",
-        })
-      ).resolves.toEqual({ permission: "write" });
-      expect(mockFetchWithTimeout).toHaveBeenCalledWith(
-        "https://api.github.com/repos/acme/web/collaborators/ada/permission",
-        expect.objectContaining({
-          headers: expect.objectContaining({ Authorization: "Bearer installation-token" }),
-        })
-      );
-    });
-
-    it("returns null when GitHub confirms no access", async () => {
-      mockGetCachedInstallationToken.mockResolvedValueOnce("installation-token");
-      mockFetchWithTimeout.mockResolvedValueOnce(makeResponse({ message: "Not Found" }, 404));
-      const provider = new GitHubSourceControlProvider({ appConfig: fakeAppConfig });
-
-      await expect(
-        provider.checkRepositoryUserAccess({ owner: "acme", name: "web", userLogin: "ada" })
-      ).resolves.toBeNull();
-    });
-
-    it("treats an explicit none permission as denied", async () => {
-      mockGetCachedInstallationToken.mockResolvedValueOnce("installation-token");
-      mockFetchWithTimeout.mockResolvedValueOnce(makeResponse({ permission: "none" }));
-      const provider = new GitHubSourceControlProvider({ appConfig: fakeAppConfig });
-
-      await expect(
-        provider.checkRepositoryUserAccess({ owner: "acme", name: "web", userLogin: "ada" })
-      ).resolves.toBeNull();
     });
   });
 
@@ -593,11 +468,49 @@ describe("GitHubSourceControlProvider", () => {
     });
   });
 
+  describe("checkRepositoryUserAccess", () => {
+    it("returns the verified user permission", async () => {
+      mockGetCachedInstallationToken.mockResolvedValueOnce("installation-token");
+      mockFetchWithTimeout.mockResolvedValueOnce(makeResponse({ permission: "write" }));
+      const provider = new GitHubSourceControlProvider({ appConfig: fakeAppConfig });
+
+      await expect(
+        provider.checkRepositoryUserAccess({ owner: "acme", name: "web", userLogin: "ada" })
+      ).resolves.toEqual({ permission: "write" });
+      expect(mockFetchWithTimeout).toHaveBeenCalledWith(
+        "https://api.github.com/repos/acme/web/collaborators/ada/permission",
+        expect.objectContaining({
+          headers: expect.objectContaining({ Authorization: "Bearer installation-token" }),
+        })
+      );
+    });
+
+    it("returns null when GitHub confirms no access", async () => {
+      mockGetCachedInstallationToken.mockResolvedValueOnce("installation-token");
+      mockFetchWithTimeout.mockResolvedValueOnce(makeResponse({ message: "Not Found" }, 404));
+      const provider = new GitHubSourceControlProvider({ appConfig: fakeAppConfig });
+
+      await expect(
+        provider.checkRepositoryUserAccess({ owner: "acme", name: "web", userLogin: "ada" })
+      ).resolves.toBeNull();
+    });
+
+    it("treats an explicit none permission as denied", async () => {
+      mockGetCachedInstallationToken.mockResolvedValueOnce("installation-token");
+      mockFetchWithTimeout.mockResolvedValueOnce(makeResponse({ permission: "none" }));
+      const provider = new GitHubSourceControlProvider({ appConfig: fakeAppConfig });
+
+      await expect(
+        provider.checkRepositoryUserAccess({ owner: "acme", name: "web", userLogin: "ada" })
+      ).resolves.toBeNull();
+    });
+  });
+
   describe("generateCredentialHelperAuth", () => {
     it("throws a permanent error when the App is not configured", async () => {
       const provider = new GitHubSourceControlProvider();
       const err = await provider
-        .generateCredentialHelperAuth(fakeRepositoryCredentialConfig)
+        .generateCredentialHelperAuth(repositoryScope)
         .catch((e: unknown) => e);
 
       expect(err).toBeInstanceOf(SourceControlProviderError);
@@ -607,35 +520,32 @@ describe("GitHubSourceControlProvider", () => {
 
     it("forwards a fresh installation token with its expiry and x-access-token username", async () => {
       const expiresAtEpochMs = Date.now() + 60 * 60 * 1000;
-      mockCreateScopedInstallationTokenWithExpiry.mockResolvedValueOnce({
+      mockGetCachedInstallationTokenWithExpiry.mockResolvedValueOnce({
         token: "ghs_fresh",
         expiresAtEpochMs,
       });
 
       const provider = new GitHubSourceControlProvider({ appConfig: fakeAppConfig });
-      const auth = await provider.generateCredentialHelperAuth(fakeRepositoryCredentialConfig);
+      const auth = await provider.generateCredentialHelperAuth(repositoryScope);
 
       expect(auth).toEqual({
         username: "x-access-token",
         password: "ghs_fresh",
         expiresAtEpochMs,
       });
-      expect(mockCreateScopedInstallationTokenWithExpiry).toHaveBeenCalledWith(
+      expect(mockGetCachedInstallationTokenWithExpiry).toHaveBeenCalledWith(
         fakeAppConfig,
-        {
-          repositoryIds: [1],
-          permissions: { contents: "read" },
-        },
-        expect.objectContaining({ userAgent: expect.any(String) })
+        expect.objectContaining({ userAgent: expect.any(String) }),
+        { scope: repositoryScope, permissions: { contents: "read" } }
       );
     });
 
     it("wraps upstream errors as SourceControlProviderError", async () => {
-      mockCreateScopedInstallationTokenWithExpiry.mockRejectedValueOnce(new Error("GitHub 500"));
+      mockGetCachedInstallationTokenWithExpiry.mockRejectedValueOnce(new Error("GitHub 500"));
 
       const provider = new GitHubSourceControlProvider({ appConfig: fakeAppConfig });
       const err = await provider
-        .generateCredentialHelperAuth(fakeRepositoryCredentialConfig)
+        .generateCredentialHelperAuth(repositoryScope)
         .catch((e: unknown) => e);
 
       expect(err).toBeInstanceOf(SourceControlProviderError);
@@ -646,11 +556,11 @@ describe("GitHubSourceControlProvider", () => {
       const httpError = Object.assign(new Error("Failed to get installation token: 500 down"), {
         status: 500,
       });
-      mockCreateScopedInstallationTokenWithExpiry.mockRejectedValueOnce(httpError);
+      mockGetCachedInstallationTokenWithExpiry.mockRejectedValueOnce(httpError);
 
       const provider = new GitHubSourceControlProvider({ appConfig: fakeAppConfig });
       const err = await provider
-        .generateCredentialHelperAuth(fakeRepositoryCredentialConfig)
+        .generateCredentialHelperAuth(repositoryScope)
         .catch((e: unknown) => e);
 
       expect(err).toBeInstanceOf(SourceControlProviderError);
@@ -927,7 +837,7 @@ describe("getPullRequest", () => {
   it("throws a permanent error when the App is not configured", async () => {
     const provider = new GitHubSourceControlProvider();
     const err = await provider
-      .getPullRequest({ owner: "acme", name: "web", number: 7 })
+      .getPullRequest({ owner: "acme", name: "web", number: 7 }, repositoryScope)
       .catch((e: unknown) => e);
 
     expect(err).toBeInstanceOf(SourceControlProviderError);
@@ -940,7 +850,10 @@ describe("getPullRequest", () => {
     );
 
     const provider = new GitHubSourceControlProvider({ appConfig: fakeAppConfig });
-    const snapshot = await provider.getPullRequest({ owner: "acme", name: "web", number: 7 });
+    const snapshot = await provider.getPullRequest(
+      { owner: "acme", name: "web", number: 7 },
+      repositoryScope
+    );
 
     expect(snapshot).toEqual({
       number: 7,
@@ -971,7 +884,10 @@ describe("getPullRequest", () => {
     );
 
     const provider = new GitHubSourceControlProvider({ appConfig: fakeAppConfig });
-    const snapshot = await provider.getPullRequest({ owner: "acme", name: "web", number: 7 });
+    const snapshot = await provider.getPullRequest(
+      { owner: "acme", name: "web", number: 7 },
+      repositoryScope
+    );
 
     expect(snapshot.lifecycleState).toBe("merged");
     expect(snapshot.isDraft).toBe(false);
@@ -983,7 +899,10 @@ describe("getPullRequest", () => {
     );
 
     const provider = new GitHubSourceControlProvider({ appConfig: fakeAppConfig });
-    const snapshot = await provider.getPullRequest({ owner: "acme", name: "web", number: 7 });
+    const snapshot = await provider.getPullRequest(
+      { owner: "acme", name: "web", number: 7 },
+      repositoryScope
+    );
 
     expect(snapshot.lifecycleState).toBe("closed");
   });
@@ -1001,7 +920,10 @@ describe("getPullRequest", () => {
     );
 
     const provider = new GitHubSourceControlProvider({ appConfig: fakeAppConfig });
-    const snapshot = await provider.getPullRequest({ owner: "acme", name: "web", number: 7 });
+    const snapshot = await provider.getPullRequest(
+      { owner: "acme", name: "web", number: 7 },
+      repositoryScope
+    );
 
     expect(snapshot.providerCreatedAt).toBe(Date.parse("2026-07-08T09:00:00Z"));
     expect(snapshot.mergedAt).toBe(Date.parse("2026-07-10T12:00:00Z"));
@@ -1019,7 +941,10 @@ describe("getPullRequest", () => {
     );
 
     const provider = new GitHubSourceControlProvider({ appConfig: fakeAppConfig });
-    const snapshot = await provider.getPullRequest({ owner: "acme", name: "web", number: 7 });
+    const snapshot = await provider.getPullRequest(
+      { owner: "acme", name: "web", number: 7 },
+      repositoryScope
+    );
 
     expect(snapshot.providerCreatedAt).toBe(Date.parse("2026-07-08T09:00:00Z"));
     expect(snapshot.mergedAt).toBeUndefined();
@@ -1054,12 +979,10 @@ describe("getPullRequest", () => {
       );
 
     const provider = new GitHubSourceControlProvider({ appConfig: fakeAppConfig });
-    const snapshot = await provider.getPullRequest({
-      owner: "acme",
-      name: "web",
-      number: 7,
-      repositoryExternalId: "9001",
-    });
+    const snapshot = await provider.getPullRequest(
+      { owner: "acme", name: "web", number: 7, repositoryExternalId: "9001" },
+      repositoryScope
+    );
 
     expect(snapshot.repoName).toBe("web-renamed");
     expect(mockFetchWithTimeout).toHaveBeenNthCalledWith(
@@ -1079,7 +1002,7 @@ describe("getPullRequest", () => {
 
     const provider = new GitHubSourceControlProvider({ appConfig: fakeAppConfig });
     const err = await provider
-      .getPullRequest({ owner: "acme", name: "web", number: 7 })
+      .getPullRequest({ owner: "acme", name: "web", number: 7 }, repositoryScope)
       .catch((e: unknown) => e);
 
     expect(err).toBeInstanceOf(SourceControlProviderError);
@@ -1094,7 +1017,10 @@ describe("getPullRequest", () => {
 
     const provider = new GitHubSourceControlProvider({ appConfig: fakeAppConfig });
     const err = await provider
-      .getPullRequest({ owner: "acme", name: "web", number: 7, repositoryExternalId: "9001" })
+      .getPullRequest(
+        { owner: "acme", name: "web", number: 7, repositoryExternalId: "9001" },
+        repositoryScope
+      )
       .catch((e: unknown) => e);
 
     expect(err).toBeInstanceOf(SourceControlProviderError);
@@ -1121,12 +1047,15 @@ describe("getPullRequestFeedback", () => {
     );
 
     const provider = new GitHubSourceControlProvider({ appConfig: fakeAppConfig });
-    const feedback = await provider.getPullRequestFeedback({
-      owner: "acme",
-      name: "web",
-      pullRequestNumber: 7,
-      providerObject: { kind: "pr_comment", id: "1234" },
-    });
+    const feedback = await provider.getPullRequestFeedback(
+      {
+        owner: "acme",
+        name: "web",
+        pullRequestNumber: 7,
+        providerObject: { kind: "pr_comment", id: "1234" },
+      },
+      repositoryScope
+    );
 
     expect(feedback).toEqual({
       kind: "pr_comment",
@@ -1156,12 +1085,15 @@ describe("getPullRequestFeedback", () => {
 
     const provider = new GitHubSourceControlProvider({ appConfig: fakeAppConfig });
     await expect(
-      provider.getPullRequestFeedback({
-        owner: "acme",
-        name: "web",
-        pullRequestNumber: 7,
-        providerObject: { kind: "pr_comment", id: "1234" },
-      })
+      provider.getPullRequestFeedback(
+        {
+          owner: "acme",
+          name: "web",
+          pullRequestNumber: 7,
+          providerObject: { kind: "pr_comment", id: "1234" },
+        },
+        repositoryScope
+      )
     ).rejects.toMatchObject({
       errorType: "permanent",
       message: "Pull request comment does not belong to the requested pull request",
@@ -1184,17 +1116,21 @@ describe("getPullRequestFeedback", () => {
         makeJsonResponse([
           {
             id: 9001,
+            in_reply_to_id: null,
             body: "Handle null here.",
             html_url: "https://github.com/acme/web/pull/7#discussion_r9001",
             path: "src/input.ts",
             line: 12,
             start_line: null,
+            original_line: 11,
+            original_start_line: null,
             side: "RIGHT",
             start_side: null,
             diff_hunk: "@@ -10,2 +10,3 @@",
           },
           {
             id: 9002,
+            in_reply_to_id: 8002,
             body: "Add a regression test.",
             html_url: "https://github.com/acme/web/pull/7#discussion_r9002",
             path: "test/input.test.ts",
@@ -1208,12 +1144,15 @@ describe("getPullRequestFeedback", () => {
       );
 
     const provider = new GitHubSourceControlProvider({ appConfig: fakeAppConfig });
-    const feedback = await provider.getPullRequestFeedback({
-      owner: "acme",
-      name: "web",
-      pullRequestNumber: 7,
-      providerObject: { kind: "review", id: "5678" },
-    });
+    const feedback = await provider.getPullRequestFeedback(
+      {
+        owner: "acme",
+        name: "web",
+        pullRequestNumber: 7,
+        providerObject: { kind: "review", id: "5678" },
+      },
+      repositoryScope
+    );
 
     expect(feedback).toMatchObject({
       kind: "review",
@@ -1224,12 +1163,16 @@ describe("getPullRequestFeedback", () => {
       comments: [
         {
           id: "9001",
+          inReplyToId: null,
           body: "Handle null here.",
           path: "src/input.ts",
           line: 12,
+          originalLine: 11,
+          originalStartLine: null,
         },
         {
           id: "9002",
+          inReplyToId: "8002",
           body: "Add a regression test.",
           path: "test/input.test.ts",
           startLine: 20,
@@ -1260,12 +1203,15 @@ describe("getPullRequestFeedback", () => {
       .mockResolvedValueOnce(makeJsonResponse([]));
 
     const provider = new GitHubSourceControlProvider({ appConfig: fakeAppConfig });
-    const feedback = await provider.getPullRequestFeedback({
-      owner: "acme",
-      name: "web",
-      pullRequestNumber: 7,
-      providerObject: { kind: "review", id: "5678" },
-    });
+    const feedback = await provider.getPullRequestFeedback(
+      {
+        owner: "acme",
+        name: "web",
+        pullRequestNumber: 7,
+        providerObject: { kind: "review", id: "5678" },
+      },
+      repositoryScope
+    );
 
     expect(feedback.kind === "review" ? feedback.comments : []).toHaveLength(100);
     expect(mockFetchWithTimeout).toHaveBeenNthCalledWith(
@@ -1289,12 +1235,15 @@ describe("getPullRequestFeedback", () => {
 
     const provider = new GitHubSourceControlProvider({ appConfig: fakeAppConfig });
     await expect(
-      provider.getPullRequestFeedback({
-        owner: "acme",
-        name: "web",
-        pullRequestNumber: 7,
-        providerObject: { kind: "review", id: "5678" },
-      })
+      provider.getPullRequestFeedback(
+        {
+          owner: "acme",
+          name: "web",
+          pullRequestNumber: 7,
+          providerObject: { kind: "review", id: "5678" },
+        },
+        repositoryScope
+      )
     ).rejects.toMatchObject({
       errorType: "permanent",
       message: "Pull request review does not belong to the requested pull request",
@@ -1320,12 +1269,15 @@ describe("getPullRequestFeedback", () => {
 
     const provider = new GitHubSourceControlProvider({ appConfig: fakeAppConfig });
     const error = await provider
-      .getPullRequestFeedback({
-        owner: "acme",
-        name: "web",
-        pullRequestNumber: 7,
-        providerObject: { kind: "review", id: "5678" },
-      })
+      .getPullRequestFeedback(
+        {
+          owner: "acme",
+          name: "web",
+          pullRequestNumber: 7,
+          providerObject: { kind: "review", id: "5678" },
+        },
+        repositoryScope
+      )
       .catch((caught: unknown) => caught);
 
     expect(error).toBeInstanceOf(SourceControlProviderError);
@@ -1347,11 +1299,10 @@ describe("hasPullRequestWritePermission", () => {
       const provider = new GitHubSourceControlProvider({ appConfig: fakeAppConfig });
 
       await expect(
-        provider.hasPullRequestWritePermission({
-          owner: "acme",
-          name: "web",
-          authorLogin: "alice",
-        })
+        provider.hasPullRequestWritePermission(
+          { owner: "acme", name: "web", authorLogin: "alice" },
+          repositoryScope
+        )
       ).resolves.toBe(true);
       expect(mockFetchWithTimeout).toHaveBeenCalledWith(
         "https://api.github.com/repos/acme/web/collaborators/alice/permission",
@@ -1367,11 +1318,10 @@ describe("hasPullRequestWritePermission", () => {
       const provider = new GitHubSourceControlProvider({ appConfig: fakeAppConfig });
 
       await expect(
-        provider.hasPullRequestWritePermission({
-          owner: "acme",
-          name: "web",
-          authorLogin: "alice",
-        })
+        provider.hasPullRequestWritePermission(
+          { owner: "acme", name: "web", authorLogin: "alice" },
+          repositoryScope
+        )
       ).resolves.toBe(false);
     }
   );
@@ -1381,11 +1331,10 @@ describe("hasPullRequestWritePermission", () => {
     const provider = new GitHubSourceControlProvider({ appConfig: fakeAppConfig });
 
     await expect(
-      provider.hasPullRequestWritePermission({
-        owner: "acme",
-        name: "web",
-        authorLogin: "alice",
-      })
+      provider.hasPullRequestWritePermission(
+        { owner: "acme", name: "web", authorLogin: "alice" },
+        repositoryScope
+      )
     ).resolves.toBe(false);
   });
 
@@ -1393,11 +1342,10 @@ describe("hasPullRequestWritePermission", () => {
     mockFetchWithTimeout.mockResolvedValueOnce(makeJsonResponse({ permission: "write" }));
     const provider = new GitHubSourceControlProvider({ appConfig: fakeAppConfig });
 
-    await provider.hasPullRequestWritePermission({
-      owner: "acme org",
-      name: "web api",
-      authorLogin: "alice/bob",
-    });
+    await provider.hasPullRequestWritePermission(
+      { owner: "acme org", name: "web api", authorLogin: "alice/bob" },
+      repositoryScope
+    );
 
     expect(mockFetchWithTimeout).toHaveBeenCalledWith(
       "https://api.github.com/repos/acme%20org/web%20api/collaborators/alice%2Fbob/permission",
@@ -1493,7 +1441,7 @@ describe("response validation (zod boundary)", () => {
 
     const provider = new GitHubSourceControlProvider({ appConfig: fakeAppConfig });
     const err = await provider
-      .getPullRequest({ owner: "acme", name: "web", number: 7 })
+      .getPullRequest({ owner: "acme", name: "web", number: 7 }, repositoryScope)
       .catch((e: unknown) => e);
 
     expect(err).toBeInstanceOf(SourceControlProviderError);
@@ -1508,7 +1456,7 @@ describe("response validation (zod boundary)", () => {
 
     const provider = new GitHubSourceControlProvider({ appConfig: fakeAppConfig });
     const err = await provider
-      .getPullRequest({ owner: "acme", name: "web", number: 7 })
+      .getPullRequest({ owner: "acme", name: "web", number: 7 }, repositoryScope)
       .catch((e: unknown) => e);
 
     expect(err).toBeInstanceOf(SourceControlProviderError);
@@ -1525,7 +1473,7 @@ describe("response validation (zod boundary)", () => {
 
     const provider = new GitHubSourceControlProvider({ appConfig: fakeAppConfig });
     const err = await provider
-      .getPullRequest({ owner: "acme", name: "web", number: 7 })
+      .getPullRequest({ owner: "acme", name: "web", number: 7 }, repositoryScope)
       .catch((e: unknown) => e);
 
     expect(err).toBeInstanceOf(SourceControlProviderError);
@@ -1539,7 +1487,10 @@ describe("response validation (zod boundary)", () => {
 
     const provider = new GitHubSourceControlProvider({ appConfig: fakeAppConfig });
     const err = await provider
-      .getPullRequest({ owner: "acme", name: "web", number: 7, repositoryExternalId: "9001" })
+      .getPullRequest(
+        { owner: "acme", name: "web", number: 7, repositoryExternalId: "9001" },
+        repositoryScope
+      )
       .catch((e: unknown) => e);
 
     expect(err).toBeInstanceOf(SourceControlProviderError);
@@ -1589,7 +1540,10 @@ describe("managed-skill repository reads", () => {
     const provider = new GitHubSourceControlProvider({ appConfig: fakeAppConfig });
 
     await expect(
-      provider.resolveCommit({ owner: "acme", name: "skills", ref: "feature/test" })
+      provider.resolveCommit(
+        { owner: "acme", name: "skills", ref: "feature/test" },
+        repositoryScope
+      )
     ).resolves.toEqual({ sha: "abc123" });
     expect(mockFetchWithTimeout).toHaveBeenCalledWith(
       expect.stringContaining("commits/feature%2Ftest"),
@@ -1604,7 +1558,7 @@ describe("managed-skill repository reads", () => {
     const provider = new GitHubSourceControlProvider({ appConfig: fakeAppConfig });
 
     await expect(
-      provider.resolveCommit({ owner: "acme", name: "skills", ref: "missing" })
+      provider.resolveCommit({ owner: "acme", name: "skills", ref: "missing" }, repositoryScope)
     ).resolves.toBeNull();
   });
 
@@ -1621,7 +1575,10 @@ describe("managed-skill repository reads", () => {
     );
     const provider = new GitHubSourceControlProvider({ appConfig: fakeAppConfig });
 
-    const tree = await provider.listTree({ owner: "acme", name: "skills", commitSha: "abc" });
+    const tree = await provider.listTree(
+      { owner: "acme", name: "skills", commitSha: "abc" },
+      repositoryScope
+    );
 
     expect(tree.entries.map(({ type, executable }) => ({ type, executable }))).toEqual([
       { type: "file", executable: false },
@@ -1650,12 +1607,10 @@ describe("managed-skill repository reads", () => {
       );
     const provider = new GitHubSourceControlProvider({ appConfig: fakeAppConfig });
 
-    const tree = await provider.listTree({
-      owner: "acme",
-      name: "skills",
-      commitSha: "abc",
-      path: "skills/deploy",
-    });
+    const tree = await provider.listTree(
+      { owner: "acme", name: "skills", commitSha: "abc", path: "skills/deploy" },
+      repositoryScope
+    );
 
     expect(tree.entries[0]?.path).toBe("skills/deploy/SKILL.md");
     expect(mockFetchWithTimeout.mock.calls.map(([url]) => String(url))).toEqual([
@@ -1670,7 +1625,10 @@ describe("managed-skill repository reads", () => {
     const provider = new GitHubSourceControlProvider({ appConfig: fakeAppConfig });
 
     await expect(
-      provider.listTree({ owner: "acme", name: "skills", commitSha: "abc", path: "missing" })
+      provider.listTree(
+        { owner: "acme", name: "skills", commitSha: "abc", path: "missing" },
+        repositoryScope
+      )
     ).resolves.toEqual({ entries: [], truncated: false });
     expect(mockFetchWithTimeout).toHaveBeenCalledTimes(1);
   });
@@ -1690,11 +1648,101 @@ describe("managed-skill repository reads", () => {
     const provider = new GitHubSourceControlProvider({ appConfig: fakeAppConfig });
 
     const error = await provider
-      .readBlob({ owner: "acme", name: "skills", blobId: "big", maxBytes: 4 })
+      .readBlob({ owner: "acme", name: "skills", blobId: "big", maxBytes: 4 }, repositoryScope)
       .catch((thrown: unknown) => thrown);
 
     expect(error).toBeInstanceOf(SourceControlProviderError);
     expect((error as SourceControlProviderError).httpStatus).toBe(413);
     expect(cancelled).toBe(true);
+  });
+});
+
+describe("credential scopes", () => {
+  beforeEach(() => {
+    vi.resetAllMocks();
+    mockGetCachedInstallationToken.mockResolvedValue("installation-token");
+    mockGetInstallationTokenCacheKey.mockResolvedValue("scoped-cache-key");
+  });
+
+  it("uses each call's scope on a shared provider without retaining prior scopes", async () => {
+    const provider = new GitHubSourceControlProvider({ appConfig: fakeAppConfig });
+    const scopes: CredentialScope[] = [
+      repositoryScope,
+      { kind: "all" },
+      { kind: "repositories", repositoryIds: [42, 99] },
+    ];
+
+    for (const scope of scopes) {
+      await provider.generatePushAuth(scope);
+    }
+
+    expect(mockGetCachedInstallationToken.mock.calls.map(([, , options]) => options)).toEqual(
+      scopes.map((scope) => ({
+        scope,
+        permissions: { contents: "write", pull_requests: "write" },
+      }))
+    );
+  });
+
+  it("invalidates the scoped cache key and retries a 401 once with a refreshed token", async () => {
+    const env = { cacheStore: { get: vi.fn(), put: vi.fn(), delete: vi.fn() }, userAgent: "Bot" };
+    const provider = new GitHubSourceControlProvider({ appConfig: fakeAppConfig, ...env });
+    mockGetCachedInstallationToken
+      .mockResolvedValueOnce("expired-token")
+      .mockResolvedValueOnce("refreshed-token");
+    mockFetchWithTimeout
+      .mockResolvedValueOnce(makeJsonResponse({ message: "Bad credentials" }, 401))
+      .mockResolvedValueOnce(makeJsonResponse({ object: { sha: "abc123" } }));
+
+    await expect(
+      provider.getBranchHead({ owner: "acme", name: "web", branch: "main" }, repositoryScope)
+    ).resolves.toBe("abc123");
+
+    expect(mockGetInstallationTokenCacheKey).toHaveBeenCalledWith(fakeAppConfig, repositoryScope);
+    expect(mockInvalidateInstallationTokenCache).toHaveBeenCalledWith(env, "scoped-cache-key");
+    expect(mockGetCachedInstallationToken.mock.calls.map(([, , options]) => options)).toEqual([
+      { scope: repositoryScope },
+      { scope: repositoryScope, forceRefresh: true },
+    ]);
+    expect(mockFetchWithTimeout.mock.calls[1][1]?.headers).toMatchObject({
+      Authorization: "Bearer refreshed-token",
+    });
+  });
+
+  it("surfaces a second 401 without retrying again", async () => {
+    mockFetchWithTimeout
+      .mockResolvedValueOnce(new Response("expired", { status: 401 }))
+      .mockResolvedValueOnce(new Response("still expired", { status: 401 }));
+    const provider = new GitHubSourceControlProvider({ appConfig: fakeAppConfig });
+
+    await expect(
+      provider.resolveCommit({ owner: "acme", name: "web", ref: "main" }, repositoryScope)
+    ).rejects.toMatchObject({ httpStatus: 401, errorType: "permanent" });
+    expect(mockFetchWithTimeout).toHaveBeenCalledTimes(2);
+  });
+
+  it("surfaces a 403 without refreshing credentials", async () => {
+    mockFetchWithTimeout.mockResolvedValueOnce(makeJsonResponse({ message: "Forbidden" }, 403));
+    const provider = new GitHubSourceControlProvider({ appConfig: fakeAppConfig });
+
+    await expect(
+      provider.listTree({ owner: "acme", name: "web", commitSha: "abc123" }, repositoryScope)
+    ).rejects.toMatchObject({ httpStatus: 403, errorType: "permanent" });
+    expect(mockInvalidateInstallationTokenCache).not.toHaveBeenCalled();
+  });
+
+  it("surfaces token refresh failures as provider errors", async () => {
+    mockFetchWithTimeout.mockResolvedValueOnce(new Response("expired", { status: 401 }));
+    mockGetCachedInstallationToken
+      .mockResolvedValueOnce("expired-token")
+      .mockRejectedValueOnce(
+        Object.assign(new Error("token service unavailable"), { status: 502 })
+      );
+    const provider = new GitHubSourceControlProvider({ appConfig: fakeAppConfig });
+
+    await expect(
+      provider.getPullRequest({ owner: "acme", name: "web", number: 7 }, repositoryScope)
+    ).rejects.toMatchObject({ httpStatus: 502, errorType: "transient" });
+    expect(mockFetchWithTimeout).toHaveBeenCalledTimes(1);
   });
 });

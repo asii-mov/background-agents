@@ -1,3 +1,8 @@
+import { parseJsonBody } from "./body";
+import { Hono } from "hono";
+import { admit, dispatch } from "../routing/admit";
+import type { ControlPlaneHonoEnv } from "../routing/hono-env";
+import { activeGlobal, NO_AUTHORIZATION } from "./shared";
 import {
   adoptApprovedComponentSchema,
   createApprovedComponentSchema,
@@ -10,16 +15,11 @@ import {
 } from "../db/approved-components";
 import type { Env } from "../types";
 import {
-  defineRoute,
-  defineRoutes,
   error,
   json,
-  parseJsonBody,
-  parsePattern,
   SCM_AGNOSTIC_SANDBOX_ROUTE,
   SCM_AGNOSTIC_USER_OR_SERVICE_ROUTE,
   type RequestContext,
-  type Route,
   type SandboxRouteContext,
 } from "./shared";
 
@@ -31,14 +31,14 @@ function actorUserId(ctx: RequestContext): string {
   return "system";
 }
 
-function idFromMatch(match: RegExpMatchArray): string | null {
-  return match.groups?.componentId ?? null;
+function idFromMatch(match: Record<string, string>): string | null {
+  return match.componentId ?? null;
 }
 
 async function listComponents(
   _request: Request,
   _env: Env,
-  _match: RegExpMatchArray,
+  _params: object,
   ctx: RequestContext
 ): Promise<Response> {
   return json(await new ApprovedComponentStore(ctx.db).list());
@@ -47,10 +47,10 @@ async function listComponents(
 async function createComponent(
   request: Request,
   _env: Env,
-  _match: RegExpMatchArray,
+  _params: object,
   ctx: RequestContext
 ): Promise<Response> {
-  const body = await parseJsonBody<unknown>(request);
+  const body = await parseJsonBody(request);
   if (body instanceof Response) return body;
   const parsed = createApprovedComponentSchema.safeParse(body);
   if (!parsed.success) return error(parsed.error.issues[0]?.message ?? "Invalid component", 400);
@@ -68,12 +68,12 @@ async function createComponent(
 async function updateComponent(
   request: Request,
   _env: Env,
-  match: RegExpMatchArray,
+  match: Record<string, string>,
   ctx: RequestContext
 ): Promise<Response> {
   const id = idFromMatch(match);
   if (!id) return error("Component ID required", 400);
-  const body = await parseJsonBody<unknown>(request);
+  const body = await parseJsonBody(request);
   if (body instanceof Response) return body;
   const parsed = updateApprovedComponentSchema.safeParse(body);
   if (!parsed.success) return error(parsed.error.issues[0]?.message ?? "Invalid component", 400);
@@ -96,7 +96,7 @@ async function updateComponent(
 async function deleteComponent(
   _request: Request,
   _env: Env,
-  match: RegExpMatchArray,
+  match: Record<string, string>,
   ctx: RequestContext
 ): Promise<Response> {
   const id = idFromMatch(match);
@@ -113,7 +113,7 @@ async function deleteComponent(
 async function listConsumers(
   _request: Request,
   _env: Env,
-  match: RegExpMatchArray,
+  match: Record<string, string>,
   ctx: RequestContext
 ): Promise<Response> {
   const id = idFromMatch(match);
@@ -126,10 +126,10 @@ async function listConsumers(
 async function listSessionComponents(
   request: Request,
   _env: Env,
-  match: RegExpMatchArray,
+  match: Record<string, string>,
   ctx: SandboxRouteContext
 ): Promise<Response> {
-  const sessionId = match.groups?.id;
+  const sessionId = match.id;
   if (!sessionId) return error("Session ID required", 400);
   const query = new URL(request.url).searchParams.get("query")?.trim() ?? "";
   if (query.length > 500) return error("Query is too long", 400);
@@ -139,13 +139,13 @@ async function listSessionComponents(
 async function adoptSessionComponent(
   request: Request,
   _env: Env,
-  match: RegExpMatchArray,
+  match: Record<string, string>,
   ctx: SandboxRouteContext
 ): Promise<Response> {
-  const sessionId = match.groups?.id;
+  const sessionId = match.id;
   const componentId = idFromMatch(match);
   if (!sessionId || !componentId) return error("Session and component IDs are required", 400);
-  const body = await parseJsonBody<unknown>(request);
+  const body = await parseJsonBody(request);
   if (body instanceof Response) return body;
   const parsed = adoptApprovedComponentSchema.safeParse(body);
   if (!parsed.success) return error("Invalid repository", 400);
@@ -162,43 +162,51 @@ async function adoptSessionComponent(
   }
 }
 
-const managementRoutes = defineRoutes(SCM_AGNOSTIC_USER_OR_SERVICE_ROUTE, [
-  { method: "GET", pattern: parsePattern("/approved-components"), handler: listComponents },
-  {
-    method: "POST",
-    pattern: parsePattern("/approved-components"),
+export const approvedComponentRoutes = new Hono<ControlPlaneHonoEnv>();
+approvedComponentRoutes.get(
+  "/approved-components",
+  admit({ ...SCM_AGNOSTIC_USER_OR_SERVICE_ROUTE, authorization: activeGlobal() }),
+  (c) => dispatch(c, listComponents)
+);
+approvedComponentRoutes.post(
+  "/approved-components",
+  admit({
+    ...SCM_AGNOSTIC_USER_OR_SERVICE_ROUTE,
+    authorization: activeGlobal(),
     requiredPermission: "catalog.write",
-    handler: createComponent,
-  },
-  {
-    method: "PUT",
-    pattern: parsePattern("/approved-components/:componentId"),
-    requiredPermission: "catalog.write",
-    handler: updateComponent,
-  },
-  {
-    method: "DELETE",
-    pattern: parsePattern("/approved-components/:componentId"),
-    requiredPermission: "catalog.write",
-    handler: deleteComponent,
-  },
-  {
-    method: "GET",
-    pattern: parsePattern("/approved-components/:componentId/consumers"),
-    handler: listConsumers,
-  },
-]);
-
-export const approvedComponentRoutes: Route[] = [
-  ...managementRoutes,
-  defineRoute(SCM_AGNOSTIC_SANDBOX_ROUTE, {
-    method: "GET",
-    pattern: parsePattern("/sessions/:id/approved-components"),
-    handler: listSessionComponents,
   }),
-  defineRoute(SCM_AGNOSTIC_SANDBOX_ROUTE, {
-    method: "POST",
-    pattern: parsePattern("/sessions/:id/approved-components/:componentId/adopt"),
-    handler: adoptSessionComponent,
+  (c) => dispatch(c, createComponent)
+);
+approvedComponentRoutes.put(
+  "/approved-components/:componentId",
+  admit({
+    ...SCM_AGNOSTIC_USER_OR_SERVICE_ROUTE,
+    authorization: activeGlobal(),
+    requiredPermission: "catalog.write",
   }),
-];
+  (c) => dispatch(c, updateComponent)
+);
+approvedComponentRoutes.delete(
+  "/approved-components/:componentId",
+  admit({
+    ...SCM_AGNOSTIC_USER_OR_SERVICE_ROUTE,
+    authorization: activeGlobal(),
+    requiredPermission: "catalog.write",
+  }),
+  (c) => dispatch(c, deleteComponent)
+);
+approvedComponentRoutes.get(
+  "/approved-components/:componentId/consumers",
+  admit({ ...SCM_AGNOSTIC_USER_OR_SERVICE_ROUTE, authorization: activeGlobal() }),
+  (c) => dispatch(c, listConsumers)
+);
+approvedComponentRoutes.get(
+  "/sessions/:id/approved-components",
+  admit({ ...SCM_AGNOSTIC_SANDBOX_ROUTE, authorization: NO_AUTHORIZATION }),
+  (c) => dispatch(c, listSessionComponents)
+);
+approvedComponentRoutes.post(
+  "/sessions/:id/approved-components/:componentId/adopt",
+  admit({ ...SCM_AGNOSTIC_SANDBOX_ROUTE, authorization: NO_AUTHORIZATION }),
+  (c) => dispatch(c, adoptSessionComponent)
+);

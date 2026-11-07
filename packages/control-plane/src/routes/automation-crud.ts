@@ -1,0 +1,844 @@
+/**
+ * Automation create, read, update, and delete routes.
+ */
+
+import {
+  isValidTimeZone,
+  nextCronOccurrence,
+  validateAutomationCron,
+} from "@open-inspect/shared/cron";
+import {
+  conditionRegistry,
+  normalizeSlackChannelConditions,
+  validateTriggerConditions,
+  type TriggerConfig,
+} from "@open-inspect/shared/triggers";
+import type { AutomationTriggerType } from "@open-inspect/shared/triggers";
+import {
+  MAX_AUTOMATION_INSTRUCTIONS_LENGTH,
+  MAX_AUTOMATION_NAME_LENGTH,
+  updateAutomationRequestSchema,
+} from "@open-inspect/shared/types/automations";
+import type { ModelProviderSelections } from "@open-inspect/shared/types/provider-accounts";
+import {
+  checkHarnessCompatibility,
+  getValidHarnessOrDefault,
+  selectedProviderAuthModes,
+} from "@open-inspect/shared/harnesses";
+import { getValidModelOrDefault, isValidModel } from "@open-inspect/shared/models";
+import {
+  AutomationStore,
+  parseAutomationTriggerFields,
+  type AutomationRow,
+  type AutomationRepositoryInsert,
+} from "../db/automation-store";
+import { SlackChannelStore } from "../db/slack-channel-store";
+import { resolveCreationOwnerTeam } from "./team-ownership";
+import { resourceViewer } from "../authorization/resource-viewer";
+import {
+  AutomationModelProviderAuthStore,
+  toProviderSelections,
+} from "../db/automation-model-provider-auth";
+import {
+  AutomationProviderSelectionError,
+  parseAndValidateAutomationProviderSelections,
+} from "../model-provider-accounts/automation-provider-selection";
+import { generateId } from "../auth/crypto";
+import {
+  applyIdentityEnforcement,
+  requireAdmittedCanonicalUserId,
+} from "../routing/identity-enforcement";
+import { generateWebhookApiKey, hashApiKey, encryptSentrySecret } from "../auth/webhook-key";
+import { Hono } from "hono";
+import { admit, dispatch } from "../routing/admit";
+import type { ControlPlaneHonoEnv } from "../routing/hono-env";
+import {
+  type RequestContext,
+  GITHUB_USER_OR_SERVICE_ROUTE,
+  json,
+  error,
+  permissionRequirement,
+  requireAll,
+} from "./shared";
+import { parseJsonBody } from "./body";
+import type { Env } from "../types";
+import type { SqlDatabase, SqlStatement } from "../db/sql-database";
+import { ProviderAccountSelectionPolicyError } from "../model-provider-accounts/selection-policy";
+import { createLogger } from "../logger";
+import {
+  AUTOMATION_READ,
+  AUTOMATION_MANAGE,
+  admittedAutomation,
+  hydrateAutomationResponse,
+} from "./automation-shared";
+import {
+  type CreateAutomationBody,
+  FAR_FUTURE_THRESHOLD_MS,
+  TargetSelectionError,
+  createAutomationBodySchema,
+  extractSlackChannels,
+  formatAutomationRequestError,
+  getEnvironmentSelection,
+  getRepositorySelection,
+  getTriggerEventTypeError,
+  resolveEnvironmentSelection,
+  resolveReasoningEffort,
+  resolveRepositorySelection,
+  validateSlackTriggerConfig,
+  validateTargetCounts,
+  validateTeamExecutor,
+} from "./automation-validation";
+import { isAutomationExecutionAuthorized } from "../automation/authorization-guard";
+import { authorizeSessionTarget } from "./session-target-authorization";
+import { authorizeTeamRepositories } from "./workspace-repository-authorization";
+
+const logger = createLogger("router:automations");
+
+async function handleCreateAutomation(
+  request: Request,
+  env: Env,
+  _params: object,
+  ctx: RequestContext
+): Promise<Response> {
+  const rawBody = await parseJsonBody(request);
+  if (rawBody instanceof Response) return rawBody;
+
+  // Automation attribution comes from the verified principal. The stored
+  // values are replayed by the scheduler as session identity at fire time,
+  // so this is where they become trustworthy.
+  const enforcement = applyIdentityEnforcement(ctx, "automation-create", rawBody);
+  if (enforcement.rejection) return enforcement.rejection;
+  const enforced = enforcement.enforced;
+
+  const parsedBody = createAutomationBodySchema.safeParse(rawBody);
+  if (!parsedBody.success) {
+    return error(formatAutomationRequestError(parsedBody.error, rawBody), 400);
+  }
+  const body: CreateAutomationBody = parsedBody.data;
+
+  // Validate required fields
+  if (!body.name || typeof body.name !== "string" || body.name.trim().length === 0) {
+    return error("name is required", 400);
+  }
+  if (body.name.length > MAX_AUTOMATION_NAME_LENGTH) {
+    return error(`name must be at most ${MAX_AUTOMATION_NAME_LENGTH} characters`, 400);
+  }
+  if (
+    !body.instructions ||
+    typeof body.instructions !== "string" ||
+    body.instructions.trim().length === 0
+  ) {
+    return error("instructions is required", 400);
+  }
+  if (body.instructions.length > MAX_AUTOMATION_INSTRUCTIONS_LENGTH) {
+    return error(
+      `instructions must be at most ${MAX_AUTOMATION_INSTRUCTIONS_LENGTH} characters`,
+      400
+    );
+  }
+
+  // The scheduler replays only the canonical subject admitted before RBAC.
+  const resolution = requireAdmittedCanonicalUserId(ctx, enforced);
+  if (resolution instanceof Response) return resolution;
+  const resolvedUserId = resolution;
+  const ownerTeam = await resolveCreationOwnerTeam(ctx, body.teamId ?? null);
+  if (ownerTeam instanceof Response) return ownerTeam;
+  const ownerTeamId = ownerTeam?.id ?? null;
+  if (ownerTeamId !== null) {
+    const executorError = await validateTeamExecutor(ctx.db, ownerTeamId, resolvedUserId);
+    if (executorError) return executorError;
+  }
+  const viewer = await resourceViewer(ctx);
+
+  const selection = getRepositorySelection(body);
+  const requestedRepositories = selection.kind === "replace" ? selection.repositories : [];
+
+  // Validate trigger type
+  const triggerType: AutomationTriggerType = body.triggerType || "schedule";
+  const validTriggerTypes: AutomationTriggerType[] = [
+    "schedule",
+    "sentry",
+    "webhook",
+    "github_event",
+    "linear_event",
+    "slack_event",
+  ];
+  if (!validTriggerTypes.includes(triggerType)) {
+    return error(`triggerType must be one of: ${validTriggerTypes.join(", ")}`, 400);
+  }
+  let requestedEnvironmentIds: string[];
+  try {
+    const environmentSelection = getEnvironmentSelection(body);
+    requestedEnvironmentIds =
+      environmentSelection.kind === "replace" ? environmentSelection.environmentIds : [];
+    validateTargetCounts(triggerType, requestedRepositories.length, requestedEnvironmentIds.length);
+  } catch (e) {
+    if (e instanceof TargetSelectionError) return e.response();
+    throw e;
+  }
+  const repositoryAuthorizationError = await authorizeSessionTarget(ctx, {
+    teamId: null,
+    repositories: requestedRepositories.map((repository) => ({
+      owner: repository.repoOwner,
+      name: repository.repoName,
+    })),
+  });
+  if (repositoryAuthorizationError) return repositoryAuthorizationError;
+  const environmentAuthorizationError = await authorizeSessionTarget(ctx, {
+    teamId: null,
+    environmentId: requestedEnvironmentIds[0],
+  });
+  if (environmentAuthorizationError) return environmentAuthorizationError;
+  let environmentRepositories;
+  try {
+    environmentRepositories = await resolveEnvironmentSelection(
+      ctx.db,
+      requestedEnvironmentIds,
+      ownerTeamId,
+      viewer
+    );
+  } catch (e) {
+    if (e instanceof TargetSelectionError) return e.response();
+    throw e;
+  }
+
+  const isSchedule = triggerType === "schedule";
+
+  // Schedule-specific validation
+  if (isSchedule) {
+    const cronError = validateAutomationCron(body.scheduleCron ?? "");
+    if (cronError) return error(cronError, 400);
+    if (!body.scheduleTz || !isValidTimeZone(body.scheduleTz)) {
+      return error("scheduleTz must be a valid IANA timezone", 400);
+    }
+  } else {
+    // Reject schedule fields for non-schedule types
+    if (body.scheduleCron || body.scheduleTz) {
+      return error("scheduleCron and scheduleTz are only valid for schedule triggers", 400);
+    }
+  }
+
+  const eventTypeError = getTriggerEventTypeError(triggerType, body.eventType);
+  if (eventTypeError) return error(eventTypeError, 400);
+
+  // Validate conditions
+  if (body.triggerConfig) {
+    const conditionErrors = validateTriggerConditions(
+      { type: triggerType, conditions: body.triggerConfig.conditions, eventType: body.eventType },
+      conditionRegistry
+    );
+    if (conditionErrors.length > 0) {
+      return error(conditionErrors.join("; "), 400);
+    }
+  }
+
+  // Slack triggers require explicit scoping (at least one watched channel).
+  if (triggerType === "slack_event") {
+    const slackError = validateSlackTriggerConfig(body.triggerConfig);
+    if (slackError) return error(slackError, 400);
+    body.triggerConfig = {
+      ...body.triggerConfig!,
+      conditions: normalizeSlackChannelConditions(body.triggerConfig!.conditions),
+    };
+    if (
+      !(await new SlackChannelStore(ctx.db).hasCompatibleBindings(
+        extractSlackChannels(body.triggerConfig),
+        ownerTeamId
+      ))
+    ) {
+      return json(
+        {
+          error: "Slack channels must belong to the automation's team",
+          code: "channel_team_mismatch",
+        },
+        409
+      );
+    }
+  }
+
+  // Validate harness and model
+  const harness = getValidHarnessOrDefault(body.harness);
+  const model = getValidModelOrDefault(body.model);
+  const harnessIncompatibility = checkHarnessCompatibility(harness, model);
+  if (harnessIncompatibility) return error(harnessIncompatibility.message, 400);
+  const reasoningEffort = resolveReasoningEffort(model, body.reasoningEffort);
+  if (body.reasoningEffort !== undefined && body.reasoningEffort !== null && !reasoningEffort) {
+    return error("Invalid reasoning effort for selected model", 400);
+  }
+
+  const newRepositories = await resolveRepositorySelection(
+    env,
+    requestedRepositories,
+    ctx,
+    ownerTeamId
+  );
+  if (newRepositories instanceof Response) return newRepositories;
+  const environmentGrantError = await authorizeTeamRepositories(ctx, {
+    teamId: ownerTeamId,
+    repositories: environmentRepositories,
+  });
+  if (environmentGrantError) return environmentGrantError;
+
+  let providerSelections: ModelProviderSelections;
+  try {
+    providerSelections = await parseAndValidateAutomationProviderSelections(
+      ctx.db,
+      body.providerSelections ?? {}
+    );
+  } catch (e) {
+    if (e instanceof AutomationProviderSelectionError) return error(e.message, 400);
+    if (e instanceof ProviderAccountSelectionPolicyError) return error(e.message, e.status);
+    throw e;
+  }
+  // The auth half of the harness rule: an explicit selection the harness
+  // cannot use must not be saved for every future run to trip over.
+  const harnessAuthIncompatibility = checkHarnessCompatibility(
+    harness,
+    model,
+    selectedProviderAuthModes(providerSelections)
+  );
+  if (harnessAuthIncompatibility) return error(harnessAuthIncompatibility.message, 400);
+
+  // Compute next run (only for schedule triggers)
+  const nextRunAt = isSchedule
+    ? nextCronOccurrence(body.scheduleCron!, body.scheduleTz!).getTime()
+    : null;
+
+  const id = generateId();
+  const now = Date.now();
+
+  // Generate auth data for trigger types that need it
+  let webhookApiKey: string | undefined;
+  let triggerAuthData: string | null = null;
+  if (triggerType === "webhook") {
+    webhookApiKey = generateWebhookApiKey();
+    triggerAuthData = await hashApiKey(webhookApiKey);
+  } else if (triggerType === "sentry") {
+    const sentrySecret = body.sentryClientSecret;
+    if (!sentrySecret || typeof sentrySecret !== "string" || sentrySecret.trim().length === 0) {
+      return error("sentryClientSecret is required for sentry triggers", 400);
+    }
+    if (!env.REPO_SECRETS_ENCRYPTION_KEY) {
+      return error("Encryption key not configured", 503);
+    }
+    triggerAuthData = await encryptSentrySecret(sentrySecret, env.REPO_SECRETS_ENCRYPTION_KEY);
+  }
+
+  const db: SqlDatabase = ctx.db;
+  const store = new AutomationStore(db);
+  const providerAuthStore = new AutomationModelProviderAuthStore(db);
+  const row: AutomationRow = {
+    owner_team_id: ownerTeamId,
+    id,
+    name: body.name.trim(),
+    instructions: body.instructions,
+    trigger_type: triggerType,
+    schedule_cron: body.scheduleCron ?? null,
+    schedule_tz: body.scheduleTz ?? "UTC",
+    harness,
+    model,
+    reasoning_effort: reasoningEffort,
+    enabled: 1,
+    next_run_at: nextRunAt,
+    consecutive_failures: 0,
+    created_by: enforced.participantUserId,
+    user_id: resolvedUserId,
+    created_at: now,
+    updated_at: now,
+    deleted_at: null,
+    event_type: body.eventType ?? null,
+    trigger_config: body.triggerConfig ? JSON.stringify(body.triggerConfig) : null,
+    trigger_auth_data: triggerAuthData,
+  };
+
+  // Persist the automation, its repository selection, and (for slack_event)
+  // its watched-channel index in a single atomic write, so none of the three
+  // can drift apart on a partial failure. The batch composes the single-table
+  // stores' prepared statements.
+  const createStatements = [
+    store.bindAutomationInsert(row),
+    ...store.bindRepositoryInserts(id, newRepositories, now),
+    ...store.bindEnvironmentInserts(id, requestedEnvironmentIds, now),
+    ...providerAuthStore.bindInserts(id, providerSelections, now),
+  ];
+  if (triggerType === "slack_event") {
+    const slackStore = new SlackChannelStore(db);
+    createStatements.push(
+      ...slackStore.bindChannelStatements(row.id, extractSlackChannels(body.triggerConfig))
+    );
+  }
+  await ctx.db.batch(createStatements);
+
+  const automation = await hydrateAutomationResponse(ctx, (await store.getById(id))!, viewer);
+
+  logger.info("automation.created", {
+    event: "automation.created",
+    automation_id: id,
+    repo: newRepositories.map((repo) => `${repo.repo_owner}/${repo.repo_name}`).join(",") || null,
+    environments: requestedEnvironmentIds.join(",") || null,
+    trigger_type: triggerType,
+    request_id: ctx.request_id,
+    trace_id: ctx.trace_id,
+  });
+
+  const workerUrl = env.WORKER_URL || "";
+  const result: {
+    automation: typeof automation;
+    warning?: string;
+    webhookApiKey?: string;
+    webhookUrl?: string;
+    sentryWebhookUrl?: string;
+  } = { automation };
+
+  if (webhookApiKey) {
+    result.webhookApiKey = webhookApiKey;
+    result.webhookUrl = `${workerUrl}/webhooks/automation/${id}`;
+  }
+
+  if (triggerType === "sentry") {
+    result.sentryWebhookUrl = `${workerUrl}/webhooks/sentry/${id}`;
+  }
+
+  if (nextRunAt && nextRunAt - now > FAR_FUTURE_THRESHOLD_MS) {
+    result.warning = "Next scheduled run is more than 31 days away";
+  }
+
+  return json(result, 201);
+}
+
+async function handleGetAutomation(
+  _request: Request,
+  env: Env,
+  params: { id: string },
+  ctx: RequestContext
+): Promise<Response> {
+  const { automation, viewer } = admittedAutomation(ctx);
+  return json({ automation: await hydrateAutomationResponse(ctx, automation, viewer) });
+}
+
+async function handleUpdateAutomation(
+  request: Request,
+  env: Env,
+  params: { id: string },
+  ctx: RequestContext
+): Promise<Response> {
+  const id = params.id;
+
+  const db: SqlDatabase = ctx.db;
+  const store = new AutomationStore(db);
+  const providerAuthStore = new AutomationModelProviderAuthStore(db);
+  const admission = admittedAutomation(ctx);
+  const { automation: existing } = admission;
+
+  const rawBody = await parseJsonBody(request);
+  if (rawBody instanceof Response) return rawBody;
+  const parsedBody = updateAutomationRequestSchema.safeParse(rawBody);
+  if (!parsedBody.success) {
+    return error(formatAutomationRequestError(parsedBody.error, rawBody), 400);
+  }
+  const body = parsedBody.data;
+
+  let existingTriggerFields: ReturnType<typeof parseAutomationTriggerFields>;
+  try {
+    existingTriggerFields = parseAutomationTriggerFields(existing);
+  } catch {
+    if (body.triggerConfig === undefined) {
+      return error("Stored automation trigger fields are invalid", 500);
+    }
+    // A full replacement may repair corrupt config, but cannot repair the
+    // immutable trigger type or grant legacy-condition exemptions.
+    try {
+      existingTriggerFields = parseAutomationTriggerFields({ ...existing, trigger_config: null });
+    } catch {
+      return error("Stored automation trigger fields are invalid", 500);
+    }
+  }
+  const { triggerType: existingTriggerType, triggerConfig: existingTriggerConfig } =
+    existingTriggerFields;
+
+  if (body.triggerConfig !== undefined && existingTriggerType === "schedule") {
+    return error("Cannot set triggerConfig on schedule automations", 400);
+  }
+
+  let replacementProviderSelections: ModelProviderSelections | null = null;
+  if (body.providerSelections !== undefined) {
+    try {
+      replacementProviderSelections = await parseAndValidateAutomationProviderSelections(
+        ctx.db,
+        body.providerSelections
+      );
+    } catch (e) {
+      if (e instanceof AutomationProviderSelectionError) return error(e.message, 400);
+      if (e instanceof ProviderAccountSelectionPolicyError) return error(e.message, e.status);
+      throw e;
+    }
+  }
+
+  // Validate fields if provided
+  if (body.name !== undefined) {
+    if (typeof body.name !== "string" || body.name.trim().length === 0) {
+      return error("name cannot be empty", 400);
+    }
+    if (body.name.length > MAX_AUTOMATION_NAME_LENGTH) {
+      return error(`name must be at most ${MAX_AUTOMATION_NAME_LENGTH} characters`, 400);
+    }
+  }
+
+  if (body.instructions !== undefined) {
+    if (typeof body.instructions !== "string" || body.instructions.trim().length === 0) {
+      return error("instructions cannot be empty", 400);
+    }
+    if (body.instructions.length > MAX_AUTOMATION_INSTRUCTIONS_LENGTH) {
+      return error(
+        `instructions must be at most ${MAX_AUTOMATION_INSTRUCTIONS_LENGTH} characters`,
+        400
+      );
+    }
+  }
+
+  if (body.scheduleCron !== undefined) {
+    const cronError = validateAutomationCron(body.scheduleCron);
+    if (cronError) return error(cronError, 400);
+  }
+
+  if (body.scheduleTz !== undefined && !isValidTimeZone(body.scheduleTz)) {
+    return error("scheduleTz must be a valid IANA timezone", 400);
+  }
+
+  if (body.model !== undefined && !isValidModel(body.model)) {
+    return error("Invalid model", 400);
+  }
+
+  const nextModel = body.model !== undefined ? getValidModelOrDefault(body.model) : existing.model;
+  const nextHarness =
+    body.harness !== undefined ? body.harness : getValidHarnessOrDefault(existing.harness);
+  // The selections the automation will have after this write: the replacement
+  // when one is given, else the stored pins whenever harness or model moves.
+  const nextProviderSelections =
+    replacementProviderSelections ??
+    (body.harness !== undefined || body.model !== undefined
+      ? toProviderSelections(await providerAuthStore.list(id))
+      : null);
+  const harnessIncompatibility = checkHarnessCompatibility(
+    nextHarness,
+    nextModel,
+    nextProviderSelections ? selectedProviderAuthModes(nextProviderSelections) : undefined
+  );
+  if (harnessIncompatibility) return error(harnessIncompatibility.message, 400);
+  const requestedReasoningEffort = body.reasoningEffort;
+  const resolvedReasoningEffort =
+    requestedReasoningEffort !== undefined
+      ? resolveReasoningEffort(nextModel, requestedReasoningEffort)
+      : body.model !== undefined && existing.reasoning_effort !== null
+        ? resolveReasoningEffort(nextModel, existing.reasoning_effort)
+        : existing.reasoning_effort;
+
+  if (
+    requestedReasoningEffort !== undefined &&
+    requestedReasoningEffort !== null &&
+    resolvedReasoningEffort === null
+  ) {
+    return error("Invalid reasoning effort for selected model", 400);
+  }
+
+  // Build update fields
+  const updateFields: Record<string, unknown> = {};
+  if (body.name !== undefined) updateFields.name = body.name.trim();
+  if (body.instructions !== undefined) updateFields.instructions = body.instructions;
+  if (body.scheduleCron !== undefined) updateFields.schedule_cron = body.scheduleCron;
+  if (body.scheduleTz !== undefined) updateFields.schedule_tz = body.scheduleTz;
+  if (body.harness !== undefined) updateFields.harness = nextHarness;
+  if (body.model !== undefined) updateFields.model = nextModel;
+  if (body.reasoningEffort !== undefined || body.model !== undefined) {
+    updateFields.reasoning_effort = resolvedReasoningEffort;
+  }
+
+  // Repository-set edits are UNCONDITIONAL — no cardinality freeze and no
+  // active-invocation guard. In-flight invocations already materialized their
+  // children from their firing-time snapshot, so an edit cannot corrupt them;
+  // it simply applies from the next invocation.
+  const selection = getRepositorySelection(body);
+  const environmentSelection = getEnvironmentSelection(body);
+  const repositoryAuthorizationError = await authorizeSessionTarget(ctx, {
+    teamId: null,
+    repositories:
+      selection.kind === "replace"
+        ? selection.repositories.map((repository) => ({
+            owner: repository.repoOwner,
+            name: repository.repoName,
+          }))
+        : undefined,
+  });
+  if (repositoryAuthorizationError) return repositoryAuthorizationError;
+  const environmentAuthorizationError = await authorizeSessionTarget(ctx, {
+    teamId: null,
+    environmentId:
+      environmentSelection.kind === "replace" ? environmentSelection.environmentIds[0] : undefined,
+  });
+  if (environmentAuthorizationError) return environmentAuthorizationError;
+
+  // The count rules span both selections, so when EITHER is replaced they are
+  // validated against the automation's FINAL state (the replacement plus the
+  // other side's existing rows). Edits that touch neither selection skip this
+  // — count rules stay write-time so a stored selection predating a rule can
+  // never brick unrelated edits.
+  let replacementRepositories: AutomationRepositoryInsert[] | null = null;
+  const replacementEnvironmentIds: string[] | null =
+    environmentSelection.kind === "replace" ? environmentSelection.environmentIds : null;
+  if (selection.kind === "replace" || replacementEnvironmentIds !== null) {
+    const finalRepositories =
+      selection.kind === "replace" ? [] : await store.getRepositoriesForAutomation(id);
+    const finalEnvironmentIds =
+      replacementEnvironmentIds ??
+      (await store.getEnvironmentsForAutomation(id)).map(
+        (environment) => environment.environment_id
+      );
+    let environmentRepositories;
+    try {
+      const finalRepositoryCount =
+        selection.kind === "replace" ? selection.repositories.length : finalRepositories.length;
+      validateTargetCounts(existingTriggerType, finalRepositoryCount, finalEnvironmentIds.length);
+      environmentRepositories = await resolveEnvironmentSelection(
+        ctx.db,
+        finalEnvironmentIds,
+        existing.owner_team_id,
+        admission.viewer,
+        replacementEnvironmentIds !== null
+      );
+    } catch (e) {
+      if (e instanceof TargetSelectionError) return e.response();
+      throw e;
+    }
+    if (selection.kind === "replace") {
+      const resolved = await resolveRepositorySelection(
+        env,
+        selection.repositories,
+        ctx,
+        existing.owner_team_id
+      );
+      if (resolved instanceof Response) return resolved;
+      replacementRepositories = resolved;
+    }
+    // Stored targets are revalidated too: grants may have been revoked since they were saved.
+    const grantError = await authorizeTeamRepositories(ctx, {
+      teamId: existing.owner_team_id,
+      repositories: [
+        ...finalRepositories.map((repository) => ({
+          owner: repository.repo_owner,
+          name: repository.repo_name,
+          repoId: repository.repo_id,
+        })),
+        ...environmentRepositories,
+      ],
+    });
+    if (grantError) return grantError;
+    // Target edits must leave the automation runnable by its current executor.
+    if (
+      !(await isAutomationExecutionAuthorized(ctx.db, {
+        automationId: id,
+        ...(existing.user_id ? { executionUserId: existing.user_id } : {}),
+        requiresRepositoryUse: (replacementRepositories ?? finalRepositories).length > 0,
+        requiresEnvironmentUse: finalEnvironmentIds.length > 0,
+      }))
+    ) {
+      return json(
+        {
+          error: "The automation's executor cannot launch these targets",
+          code: "automation_executor_unauthorized",
+          reason_code: "execution_authorization_denied",
+        },
+        409
+      );
+    }
+  }
+
+  // Update event type — only for non-schedule types
+  if (body.eventType !== undefined) {
+    if (existingTriggerType === "schedule") {
+      return error("Cannot set eventType on schedule automations", 400);
+    }
+    updateFields.event_type = body.eventType;
+  }
+
+  const effectiveEventType =
+    body.eventType !== undefined ? body.eventType : (existing.event_type ?? undefined);
+  const eventTypeError = getTriggerEventTypeError(existingTriggerType, effectiveEventType);
+  if (eventTypeError) return error(eventTypeError, 400);
+
+  let triggerConfigToValidate = body.triggerConfig;
+  if (
+    body.eventType !== undefined &&
+    triggerConfigToValidate === undefined &&
+    existingTriggerConfig !== null
+  ) {
+    triggerConfigToValidate = existingTriggerConfig;
+  }
+
+  // A slack_event's trigger_config holds its required channel scope. Clearing it
+  // would leave the automation enabled but untriggerable.
+  if (body.triggerConfig === null && existingTriggerType === "slack_event") {
+    return error(
+      "Cannot clear triggerConfig on slack_event automations; pause or delete instead",
+      400
+    );
+  }
+  if (body.triggerConfig && existingTriggerType === "slack_event") {
+    const slackError = validateSlackTriggerConfig(body.triggerConfig);
+    if (slackError) return error(slackError, 400);
+    body.triggerConfig = {
+      ...body.triggerConfig,
+      conditions: normalizeSlackChannelConditions(body.triggerConfig.conditions),
+    };
+    triggerConfigToValidate = body.triggerConfig;
+  }
+
+  if (
+    existingTriggerType === "slack_event" &&
+    !(await new SlackChannelStore(ctx.db).hasCompatibleBindings(
+      extractSlackChannels(body.triggerConfig ?? existingTriggerConfig ?? undefined),
+      existing.owner_team_id
+    ))
+  ) {
+    return json(
+      {
+        error: "Slack channels must belong to the automation's team",
+        code: "channel_team_mismatch",
+      },
+      409
+    );
+  }
+
+  if (triggerConfigToValidate) {
+    let previousConfig: TriggerConfig | undefined;
+    if (existingTriggerType === "github_event" && existingTriggerConfig !== null) {
+      previousConfig = existingTriggerConfig;
+    }
+    const conditionErrors = validateTriggerConditions(
+      {
+        type: existingTriggerType,
+        conditions: triggerConfigToValidate.conditions,
+        eventType: effectiveEventType,
+      },
+      conditionRegistry,
+      previousConfig && {
+        type: existingTriggerType,
+        conditions: previousConfig.conditions,
+        eventType: existing.event_type ?? undefined,
+      }
+    );
+    if (conditionErrors.length > 0) {
+      return error(conditionErrors.join("; "), 400);
+    }
+  }
+
+  // trigger_config is a single source-interpreted JSON blob (the conditions),
+  // so a PUT replaces it wholesale (null clears it). The caller owns the full
+  // blob; the web form always re-submits the conditions within triggerConfig.
+  if (body.triggerConfig === null) {
+    updateFields.trigger_config = null;
+  } else if (body.triggerConfig !== undefined) {
+    updateFields.trigger_config = JSON.stringify(body.triggerConfig);
+  }
+
+  // Recompute next_run_at if schedule changed (only for schedule types)
+  if (
+    existingTriggerType === "schedule" &&
+    (body.scheduleCron !== undefined || body.scheduleTz !== undefined)
+  ) {
+    const cron = body.scheduleCron ?? existing.schedule_cron;
+    const tz = body.scheduleTz ?? existing.schedule_tz;
+    if (!cron) {
+      return error("Cannot compute schedule: no cron expression", 400);
+    }
+    updateFields.next_run_at = nextCronOccurrence(cron, tz).getTime();
+  }
+
+  // Apply the field update, the repository-selection replacement (which
+  // carries the transitional scalar-mirror dual-write), and any slack
+  // watched-channel re-sync in ONE atomic batch so none of them can drift
+  // apart on a partial failure. Tolerates a null update statement (e.g. a
+  // repositories-only edit).
+  const resyncSlackChannels =
+    existingTriggerType === "slack_event" && body.triggerConfig !== undefined;
+  const statements: SqlStatement[] = [];
+  const updateStatement = store.bindAutomationUpdate(id, updateFields);
+  if (updateStatement) statements.push(updateStatement);
+  if (replacementRepositories !== null) {
+    statements.push(...store.bindReplaceRepositories(id, replacementRepositories, Date.now()));
+  }
+  if (replacementEnvironmentIds !== null) {
+    statements.push(...store.bindReplaceEnvironments(id, replacementEnvironmentIds, Date.now()));
+  }
+  if (replacementProviderSelections !== null) {
+    statements.push(
+      ...providerAuthStore.bindReplace(id, replacementProviderSelections, Date.now())
+    );
+  }
+  if (resyncSlackChannels) {
+    const slackStore = new SlackChannelStore(db);
+    statements.push(
+      ...slackStore.bindChannelStatements(id, extractSlackChannels(body.triggerConfig))
+    );
+  }
+  if (statements.length > 0) {
+    await ctx.db.batch(statements);
+  }
+  const updated = await store.getById(id);
+  if (!updated) return error("Automation not found", 404);
+
+  logger.info("automation.updated", {
+    event: "automation.updated",
+    automation_id: id,
+    request_id: ctx.request_id,
+    trace_id: ctx.trace_id,
+  });
+
+  return json({ automation: await hydrateAutomationResponse(ctx, updated, admission.viewer) });
+}
+
+async function handleDeleteAutomation(
+  _request: Request,
+  env: Env,
+  params: { id: string },
+  ctx: RequestContext
+): Promise<Response> {
+  const id = params.id;
+
+  const store = new AutomationStore(ctx.db);
+  const result = await ctx.db.batch([store.bindSoftDelete(id)]);
+  const deleted = result[0]?.meta.changes === 1;
+  if (!deleted) return error("Automation not found", 404);
+
+  logger.info("automation.deleted", {
+    event: "automation.deleted",
+    automation_id: id,
+    request_id: ctx.request_id,
+    trace_id: ctx.trace_id,
+  });
+
+  return json({ status: "deleted", automationId: id });
+}
+
+export const automationCrudRoutes = new Hono<ControlPlaneHonoEnv>();
+
+automationCrudRoutes.post(
+  "/automations",
+  admit({
+    ...GITHUB_USER_OR_SERVICE_ROUTE,
+    // The creator becomes the executor, whose runs create sessions under its authority.
+    authorization: requireAll(
+      permissionRequirement("automations.create"),
+      permissionRequirement("sessions.create")
+    ),
+  }),
+  (c) => dispatch(c, handleCreateAutomation)
+);
+automationCrudRoutes.get("/automations/:id", AUTOMATION_READ, (c) =>
+  dispatch(c, handleGetAutomation)
+);
+automationCrudRoutes.put("/automations/:id", AUTOMATION_MANAGE, (c) =>
+  dispatch(c, handleUpdateAutomation)
+);
+automationCrudRoutes.delete("/automations/:id", AUTOMATION_MANAGE, (c) =>
+  dispatch(c, handleDeleteAutomation)
+);

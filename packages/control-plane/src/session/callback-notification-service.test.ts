@@ -2,16 +2,20 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import type { Logger } from "../logger";
 import {
   CallbackNotificationService,
+  SLACK_ACTIVITY_REFRESH_INTERVAL_MS,
   type CallbackRepository,
   type CallbackServiceEnv,
   type CallbackServiceDeps,
 } from "./callback-notification-service";
 import type { MessageRepository } from "./message-repository";
 import type { FetchClient } from "../platform-ports";
+import type { SlackPostScope } from "../authorization/slack-post-gate";
 import { verifyCallbackSignature } from "@open-inspect/shared/auth";
 import {
   linearCompletionCallbackSchema,
   linearToolCallCallbackSchema,
+  slackCallbackContextSchema,
+  SLACK_ACTIVITY_REFRESH_KIND,
 } from "@open-inspect/shared/types/session-api";
 
 const LINEAR_CALLBACK_CONTEXT = {
@@ -20,6 +24,13 @@ const LINEAR_CALLBACK_CONTEXT = {
   issueIdentifier: "ENG-1",
   issueUrl: "https://linear.app/acme/issue/ENG-1",
   model: "anthropic/claude-haiku-4-5",
+};
+
+const SLACK_CALLBACK_CONTEXT = {
+  channel: "C123",
+  threadTs: "1234.5678",
+  repoFullName: "secret/repository",
+  model: "private-model",
 };
 
 // ---- Mock factories ----
@@ -37,6 +48,9 @@ function createMockLogger(): Logger {
 function createMockRepository() {
   return {
     getMessageCallbackContext: vi.fn<MessageRepository["getMessageCallbackContext"]>(() => null),
+    getProcessingMessageWithStartedAt: vi.fn<
+      MessageRepository["getProcessingMessageWithStartedAt"]
+    >(() => null),
     getSession: vi.fn(() => null),
   };
 }
@@ -56,6 +70,15 @@ function createTestHarness(overrides?: {
   const slackBot = createMockFetcher();
   const linearBot = createMockFetcher();
   const sleep = vi.fn(async () => {});
+  const slackPostScope = {
+    getSession: vi.fn<SlackPostScope["getSession"]>().mockResolvedValue({
+      ownerTeamId: "team-a",
+      visibility: "workspace",
+    }),
+    getChannelBinding: vi.fn<SlackPostScope["getChannelBinding"]>().mockResolvedValue({
+      teamId: "team-a",
+    }),
+  };
 
   const env: CallbackServiceEnv = {
     SERVICE_AUTH_SECRET_SLACK_BOT: "test-secret",
@@ -68,6 +91,7 @@ function createTestHarness(overrides?: {
   const deps: CallbackServiceDeps = {
     repository: repository as CallbackRepository,
     messageRepository: repository as unknown as MessageRepository,
+    slackPostScope,
     env,
     log,
     getSessionId: overrides?.getSessionId ?? (() => "session-123"),
@@ -83,6 +107,7 @@ function createTestHarness(overrides?: {
     slackBot,
     linearBot,
     sleep,
+    slackPostScope,
   };
 }
 
@@ -93,6 +118,39 @@ describe("CallbackNotificationService", () => {
 
   beforeEach(() => {
     harness = createTestHarness();
+  });
+
+  describe.each(["tool_call", "activity"] as const)("Slack post gate: %s", (path) => {
+    it.each(["getSession", "getChannelBinding"] as const)(
+      "fails closed when %s fails",
+      async (lookup) => {
+        harness.repository.getMessageCallbackContext.mockReturnValue({
+          callback_context: JSON.stringify(SLACK_CALLBACK_CONTEXT),
+          source: "slack",
+        });
+        harness.repository.getProcessingMessageWithStartedAt.mockReturnValue({
+          id: "msg-1",
+          started_at: 1,
+        });
+        harness.slackBot.fetch.mockResolvedValue(new Response("ok"));
+        harness.slackPostScope[lookup].mockRejectedValue(new Error("D1 unavailable"));
+        if (path === "tool_call") {
+          await harness.service.notifyToolCall("msg-1", {
+            type: "tool_call",
+            tool: "bash",
+            args: { command: "secret command" },
+            callId: "call-1",
+          });
+        } else {
+          await harness.service.refreshSlackActivity("msg-1", Date.now());
+        }
+        expect(harness.repository.getSession).not.toHaveBeenCalled();
+        expect(harness.slackPostScope.getSession).toHaveBeenCalledWith("session-123");
+        expect(harness.slackPostScope.getChannelBinding).toHaveBeenCalledWith("C123");
+        expect(harness.slackBot.fetch).not.toHaveBeenCalled();
+        expect(harness.linearBot.fetch).not.toHaveBeenCalled();
+      }
+    );
   });
 
   describe("notifyComplete", () => {
@@ -179,6 +237,8 @@ describe("CallbackNotificationService", () => {
       await h.service.notifyComplete("msg-1", true);
 
       expect(h.slackBot.fetch).not.toHaveBeenCalled();
+      expect(h.slackPostScope.getSession).not.toHaveBeenCalled();
+      expect(h.sleep).not.toHaveBeenCalled();
     });
 
     it("skips when no binding for source", async () => {
@@ -203,9 +263,19 @@ describe("CallbackNotificationService", () => {
           duration_ms: expect.any(Number),
         })
       );
+      expect(h.slackPostScope.getSession).not.toHaveBeenCalled();
+      expect(h.sleep).not.toHaveBeenCalled();
     });
 
-    it("calls binding with signed payload on success", async () => {
+    it.each([
+      { ownerTeamId: null, binding: null },
+      { ownerTeamId: "team-a", binding: { teamId: "team-a" } },
+    ])("calls binding with signed payload on success: %j", async ({ ownerTeamId, binding }) => {
+      harness.slackPostScope.getSession.mockResolvedValue({
+        ownerTeamId,
+        visibility: "workspace",
+      });
+      harness.slackPostScope.getChannelBinding.mockResolvedValue(binding);
       vi.mocked(harness.repository.getMessageCallbackContext).mockReturnValue({
         callback_context: JSON.stringify({ channel: "C123", threadTs: "1234.5678" }),
         source: "slack",
@@ -255,23 +325,285 @@ describe("CallbackNotificationService", () => {
       );
     });
 
-    it("retries once on fetch failure", async () => {
-      vi.mocked(harness.repository.getMessageCallbackContext).mockReturnValue({
-        callback_context: JSON.stringify({ channel: "C123" }),
-        source: "slack",
+    it.each(["fetch", "getSession", "getChannelBinding"] as const)(
+      "retries once on %s failure",
+      async (failure) => {
+        vi.mocked(harness.repository.getMessageCallbackContext).mockReturnValue({
+          callback_context: JSON.stringify(SLACK_CALLBACK_CONTEXT),
+          source: "slack",
+        });
+
+        const fetchMock = vi.mocked(harness.slackBot.fetch);
+        fetchMock.mockResolvedValue(new Response("ok"));
+        (failure === "fetch" ? fetchMock : harness.slackPostScope[failure]).mockRejectedValueOnce(
+          new Error("delivery unavailable")
+        );
+
+        await harness.service.notifyComplete("msg-1", true);
+
+        expect(fetchMock).toHaveBeenCalledTimes(failure === "fetch" ? 2 : 1);
+        expect(fetchMock).toHaveBeenLastCalledWith(
+          "https://internal/callbacks/complete",
+          expect.anything()
+        );
+        const body = JSON.parse(String(fetchMock.mock.calls.at(-1)?.[1]?.body));
+        expect(body).toMatchObject({
+          messageId: "msg-1",
+          success: true,
+          context: SLACK_CALLBACK_CONTEXT,
+        });
+        expect(await verifyCallbackSignature(body, "test-secret")).toBe(true);
+        expect(harness.slackPostScope.getSession).toHaveBeenCalledTimes(2);
+        expect(harness.slackPostScope.getChannelBinding).toHaveBeenCalledTimes(2);
+        expect(harness.sleep).toHaveBeenCalledExactlyOnceWith(1000);
+        expect(harness.log.info).toHaveBeenCalledWith(
+          "callback.complete_delivery",
+          expect.objectContaining({
+            session_id: "session-123",
+            message_id: "msg-1",
+            outcome: "success",
+            attempts: 2,
+            retries: 1,
+          })
+        );
+      }
+    );
+
+    describe("Slack publication preparation retries", () => {
+      beforeEach(() => {
+        harness.repository.getMessageCallbackContext.mockReturnValue({
+          callback_context: JSON.stringify(SLACK_CALLBACK_CONTEXT),
+          source: "slack",
+        });
+        harness.slackBot.fetch.mockResolvedValue(new Response("ok"));
       });
 
-      const fetchMock = vi.mocked(harness.slackBot.fetch);
-      fetchMock
-        .mockRejectedValueOnce(new Error("network error"))
-        .mockResolvedValueOnce(new Response("ok", { status: 200 }));
+      it.each([
+        { visibility: "private", binding: null, reason: "private_session" },
+        { visibility: "workspace", binding: null, reason: "channel_team_mismatch" },
+        {
+          visibility: "workspace",
+          binding: { teamId: "team-b" },
+          reason: "channel_team_mismatch",
+        },
+      ] as const)(
+        "selects only closure on recovered $reason without nested transport retries",
+        async ({ visibility, binding, reason }) => {
+          harness.slackPostScope.getSession
+            .mockRejectedValueOnce(new Error("D1 unavailable"))
+            .mockResolvedValue({ ownerTeamId: "team-a", visibility });
+          harness.slackPostScope.getChannelBinding.mockResolvedValue(binding);
+          harness.slackBot.fetch.mockResolvedValue(new Response("unavailable", { status: 503 }));
 
-      await harness.service.notifyComplete("msg-1", true);
+          await harness.service.notifyComplete("msg-1", false, "secret error");
 
-      expect(fetchMock).toHaveBeenCalledTimes(2);
-      expect(harness.log.info).toHaveBeenCalledWith(
-        "callback.complete_delivery",
-        expect.objectContaining({ message_id: "msg-1", attempts: 2, retries: 1 })
+          expect(harness.slackPostScope.getSession).toHaveBeenCalledTimes(2);
+          expect(harness.sleep).toHaveBeenCalledExactlyOnceWith(1000);
+          expect(harness.slackBot.fetch).toHaveBeenCalledOnce();
+          expect(harness.slackBot.fetch.mock.calls[0][0]).toBe(
+            "https://internal/callbacks/thread_closed"
+          );
+          const body = JSON.parse(String(harness.slackBot.fetch.mock.calls[0][1]?.body));
+          expect(body).toEqual({
+            kind: "slack.thread_closed",
+            sessionId: "session-123",
+            timestamp: expect.any(Number),
+            context: { channel: "C123", threadTs: "1234.5678" },
+            signature: expect.any(String),
+          });
+          expect(await verifyCallbackSignature(body, "test-secret")).toBe(true);
+          expect(harness.log.info).toHaveBeenCalledWith(
+            "callback.complete_delivery",
+            expect.objectContaining({
+              outcome: "rejected",
+              reject_reason: reason,
+              attempts: 2,
+              retries: 1,
+              http_status: 503,
+            })
+          );
+        }
+      );
+
+      it.each([null, { teamId: "team-b" }])(
+        "rechecks scope after transport failure and replaces completion with closure: %j",
+        async (binding) => {
+          harness.slackPostScope.getChannelBinding
+            .mockResolvedValueOnce({ teamId: "team-a" })
+            .mockResolvedValue(binding);
+          harness.slackBot.fetch
+            .mockResolvedValueOnce(new Response("unavailable", { status: 503 }))
+            .mockResolvedValueOnce(new Response("ok"));
+
+          await harness.service.notifyComplete("msg-1", false, "secret error");
+
+          expect(harness.slackBot.fetch.mock.calls.map(([url]) => url)).toEqual([
+            "https://internal/callbacks/complete",
+            "https://internal/callbacks/thread_closed",
+          ]);
+          expect(harness.slackPostScope.getSession).toHaveBeenCalledTimes(2);
+          expect(harness.slackPostScope.getChannelBinding).toHaveBeenCalledTimes(2);
+          expect(harness.sleep).toHaveBeenCalledExactlyOnceWith(1000);
+          const closure = JSON.parse(String(harness.slackBot.fetch.mock.calls[1][1]?.body));
+          expect(closure.context).toEqual({ channel: "C123", threadTs: "1234.5678" });
+          expect(closure).not.toHaveProperty("error");
+          expect(closure).not.toHaveProperty("messageId");
+          expect(harness.log.info).toHaveBeenCalledWith(
+            "callback.complete_delivery",
+            expect.objectContaining({
+              outcome: "rejected",
+              reject_reason: "channel_team_mismatch",
+              attempts: 2,
+              retries: 1,
+            })
+          );
+        }
+      );
+
+      it.each([
+        { visibility: "private", binding: { teamId: "team-a" }, reason: "private_session" },
+        { visibility: "workspace", binding: null, reason: "channel_team_mismatch" },
+        {
+          visibility: "workspace",
+          binding: { teamId: "team-b" },
+          reason: "channel_team_mismatch",
+        },
+      ] as const)(
+        "retains closure and denied outcome after $reason even when current scope allows completion",
+        async ({ visibility, binding, reason }) => {
+          harness.slackPostScope.getSession.mockResolvedValue({
+            ownerTeamId: "team-a",
+            visibility,
+          });
+          harness.slackPostScope.getChannelBinding.mockResolvedValue(binding);
+          harness.slackBot.fetch
+            .mockImplementationOnce(async () => {
+              harness.slackPostScope.getSession.mockResolvedValue({
+                ownerTeamId: "team-a",
+                visibility: "workspace",
+              });
+              harness.slackPostScope.getChannelBinding.mockResolvedValue({ teamId: "team-a" });
+              return new Response("unavailable", { status: 503 });
+            })
+            .mockResolvedValueOnce(new Response("ok"));
+
+          await harness.service.notifyComplete("msg-1", false, "secret error");
+
+          expect(harness.slackBot.fetch.mock.calls.map(([url]) => url)).toEqual([
+            "https://internal/callbacks/thread_closed",
+            "https://internal/callbacks/thread_closed",
+          ]);
+          for (const [, init] of harness.slackBot.fetch.mock.calls) {
+            const body = JSON.parse(String(init?.body));
+            expect(body).toEqual({
+              kind: "slack.thread_closed",
+              sessionId: "session-123",
+              timestamp: expect.any(Number),
+              context: { channel: "C123", threadTs: "1234.5678" },
+              signature: expect.any(String),
+            });
+            expect(await verifyCallbackSignature(body, "test-secret")).toBe(true);
+          }
+          expect(harness.slackPostScope.getSession).toHaveBeenCalledOnce();
+          expect(harness.slackPostScope.getChannelBinding).toHaveBeenCalledOnce();
+          expect(harness.sleep).toHaveBeenCalledExactlyOnceWith(1000);
+          expect(harness.log.warn).toHaveBeenCalledExactlyOnceWith(
+            "callback.thread_closed_delivery_attempt_failed",
+            expect.objectContaining({ attempt: 1, http_status: 503 })
+          );
+          expect(harness.log.info).toHaveBeenCalledWith(
+            "callback.complete_delivery",
+            expect.objectContaining({
+              outcome: "rejected",
+              reject_reason: reason,
+              attempts: 2,
+              retries: 1,
+              http_status: 200,
+            })
+          );
+        }
+      );
+
+      it.each(["getSession", "getChannelBinding"] as const)(
+        "exhausts %s reads without sending content or closure",
+        async (lookup) => {
+          harness.slackPostScope[lookup].mockRejectedValue(new Error("D1 unavailable"));
+
+          await expect(harness.service.notifyComplete("msg-1", true)).resolves.toBeUndefined();
+
+          expect(harness.slackPostScope.getSession).toHaveBeenCalledTimes(2);
+          expect(harness.slackPostScope.getChannelBinding).toHaveBeenCalledTimes(2);
+          expect(harness.slackBot.fetch).not.toHaveBeenCalled();
+          expect(harness.sleep).toHaveBeenCalledExactlyOnceWith(1000);
+          expect(harness.log.error).toHaveBeenCalledWith(
+            "callback.complete_delivery",
+            expect.objectContaining({ outcome: "error", attempts: 2, retries: 1 })
+          );
+        }
+      );
+
+      it.each(["workspace", "private"] as const)(
+        "does not transport a timed-out %s attempt after its uncancelable scope read finishes",
+        async (visibility) => {
+          vi.useFakeTimers();
+          try {
+            let release!: (session: Awaited<ReturnType<SlackPostScope["getSession"]>>) => void;
+            const pendingRead = new Promise<Awaited<ReturnType<SlackPostScope["getSession"]>>>(
+              (resolve) => {
+                release = resolve;
+              }
+            );
+            harness.slackPostScope.getSession.mockReturnValueOnce(pendingRead);
+            const completion = harness.service.notifyComplete("msg-1", true);
+
+            await vi.advanceTimersByTimeAsync(10_000);
+            release({ ownerTeamId: "team-a", visibility });
+            await completion;
+
+            expect(harness.slackPostScope.getSession).toHaveBeenCalledTimes(2);
+            expect(harness.slackBot.fetch).toHaveBeenCalledOnce();
+            expect(harness.slackBot.fetch.mock.calls[0][0]).toBe(
+              "https://internal/callbacks/complete"
+            );
+            expect(harness.slackBot.fetch.mock.calls[0][1]?.signal?.aborted).toBe(false);
+            expect(harness.sleep).toHaveBeenCalledExactlyOnceWith(1000);
+            const terminalEvent = vi.mocked(harness.log.info).mock.calls.at(-1)?.[1];
+            expect(terminalEvent).toMatchObject({ outcome: "success", attempts: 2, retries: 1 });
+            expect(terminalEvent).not.toHaveProperty("reject_reason");
+          } finally {
+            vi.useRealTimers();
+          }
+        }
+      );
+
+      it.each([false, true])(
+        "keeps invalid closure coordinates a rejected no-op after a transient read: %s",
+        async (retryRead) => {
+          harness.repository.getMessageCallbackContext.mockReturnValue({
+            callback_context: JSON.stringify({ channel: "C123" }),
+            source: "slack",
+          });
+          harness.slackPostScope.getSession.mockResolvedValue({
+            ownerTeamId: "team-a",
+            visibility: "private",
+          });
+          if (retryRead) {
+            harness.slackPostScope.getSession.mockRejectedValueOnce(new Error("D1 unavailable"));
+          }
+
+          await harness.service.notifyComplete("msg-1", true);
+
+          expect(harness.slackBot.fetch).not.toHaveBeenCalled();
+          expect(harness.sleep).toHaveBeenCalledTimes(retryRead ? 1 : 0);
+          expect(harness.log.info).toHaveBeenCalledWith(
+            "callback.complete_delivery",
+            expect.objectContaining({
+              outcome: "rejected",
+              reject_reason: "private_session",
+              attempts: retryRead ? 2 : 0,
+            })
+          );
+        }
       );
     });
 
@@ -348,6 +680,45 @@ describe("CallbackNotificationService", () => {
       expect(body.context.issueId).toBe("issue-1");
       expect(linearCompletionCallbackSchema.safeParse(body).success).toBe(true);
       expect(await verifyCallbackSignature(body, "test-secret")).toBe(true);
+    });
+
+    it("preserves signed Linear completion retries without Slack authority reads", async () => {
+      harness.repository.getMessageCallbackContext.mockReturnValue({
+        callback_context: JSON.stringify(LINEAR_CALLBACK_CONTEXT),
+        source: "linear",
+      });
+      harness.linearBot.fetch
+        .mockResolvedValueOnce(new Response("unavailable", { status: 503 }))
+        .mockResolvedValueOnce(new Response("ok"));
+
+      await harness.service.notifyComplete("msg-1", true);
+
+      expect(harness.linearBot.fetch).toHaveBeenCalledTimes(2);
+      expect(harness.slackPostScope.getSession).not.toHaveBeenCalled();
+      expect(harness.slackPostScope.getChannelBinding).not.toHaveBeenCalled();
+      expect(harness.sleep).toHaveBeenCalledExactlyOnceWith(1000);
+      for (const [, init] of harness.linearBot.fetch.mock.calls) {
+        const body = JSON.parse(String(init?.body));
+        expect(linearCompletionCallbackSchema.safeParse(body).success).toBe(true);
+        expect(await verifyCallbackSignature(body, "test-secret")).toBe(true);
+      }
+    });
+
+    it("rejects invalid Linear completion payloads without retrying", async () => {
+      harness.repository.getMessageCallbackContext.mockReturnValue({
+        callback_context: JSON.stringify({ source: "linear" }),
+        source: "linear",
+      });
+
+      await harness.service.notifyComplete("msg-1", true);
+
+      expect(harness.linearBot.fetch).not.toHaveBeenCalled();
+      expect(harness.sleep).not.toHaveBeenCalled();
+      expect(harness.slackPostScope.getSession).not.toHaveBeenCalled();
+      expect(harness.log.info).toHaveBeenCalledWith(
+        "callback.complete_delivery",
+        expect.objectContaining({ reject_reason: "invalid_payload", attempts: 0 })
+      );
     });
   });
 
@@ -503,8 +874,269 @@ describe("CallbackNotificationService", () => {
     );
   });
 
+  describe("refreshSlackActivity", () => {
+    // The real shape the slack-bot stores and its own route re-validates —
+    // a thinner fixture would sign a body the route rejects.
+    const SLACK_CONTEXT = {
+      source: "slack",
+      channel: "C123",
+      threadTs: "111.222",
+      repoFullName: "acme/app",
+      model: "anthropic/claude-haiku-4-5",
+    };
+    // `now` is a wall-clock reading taken by the sandbox-event router.
+    const NOW = 1_700_000_000_000;
+
+    function withSlackMessage(processingId: string | null = "msg-1") {
+      vi.mocked(harness.repository.getMessageCallbackContext).mockReturnValue({
+        callback_context: JSON.stringify(SLACK_CONTEXT),
+        source: "slack",
+      });
+      vi.mocked(harness.repository.getProcessingMessageWithStartedAt).mockReturnValue(
+        processingId === null ? null : { id: processingId, started_at: NOW - 1000 }
+      );
+      const fetchMock = vi.mocked(harness.slackBot.fetch);
+      fetchMock.mockResolvedValue(new Response("ok", { status: 200 }));
+      return fetchMock;
+    }
+
+    it.each([
+      { ownerTeamId: null, binding: null, denied: false },
+      { ownerTeamId: "team-a", binding: null, denied: true },
+      { ownerTeamId: "team-a", binding: { teamId: "team-a" }, denied: false },
+      { ownerTeamId: "team-a", binding: { teamId: "team-b" }, denied: true },
+    ])(
+      "posts a signed refresh or safe closure for a slack message: %j",
+      async ({ ownerTeamId, binding, denied }) => {
+        harness.slackPostScope.getSession.mockResolvedValue({
+          ownerTeamId,
+          visibility: "workspace",
+        });
+        harness.slackPostScope.getChannelBinding.mockResolvedValue(binding);
+        const fetchMock = withSlackMessage();
+
+        await harness.service.refreshSlackActivity("msg-1", NOW);
+
+        expect(fetchMock).toHaveBeenCalledTimes(1);
+        expect(fetchMock).toHaveBeenCalledWith(
+          `https://internal/callbacks/${denied ? "thread_closed" : "activity"}`,
+          expect.objectContaining({ method: "POST" })
+        );
+        const body = JSON.parse(String(fetchMock.mock.calls[0][1]?.body));
+        if (denied) {
+          expect(body).toEqual({
+            kind: "slack.thread_closed",
+            sessionId: "session-123",
+            timestamp: expect.any(Number),
+            context: { channel: "C123", threadTs: "111.222" },
+            signature: expect.any(String),
+          });
+          expect(harness.log.info).toHaveBeenCalledWith(
+            "callback.activity_refresh",
+            expect.objectContaining({ outcome: "rejected", reject_reason: "channel_team_mismatch" })
+          );
+        } else {
+          expect(body).toMatchObject({
+            kind: SLACK_ACTIVITY_REFRESH_KIND,
+            sessionId: "session-123",
+            messageId: "msg-1",
+            timestamp: NOW,
+          });
+          // The route re-parses the context it is handed, so the producer must
+          // already satisfy the canonical contract.
+          expect(slackCallbackContextSchema.safeParse(body.context).success).toBe(true);
+        }
+        expect(await verifyCallbackSignature(body, "test-secret")).toBe(true);
+        expect(harness.linearBot.fetch).not.toHaveBeenCalled();
+      }
+    );
+
+    it("does not refresh a message that is no longer processing", async () => {
+      const fetchMock = withSlackMessage(null);
+
+      await harness.service.refreshSlackActivity("msg-1", NOW);
+
+      expect(fetchMock).not.toHaveBeenCalled();
+    });
+
+    it("does not refresh once a different message owns the turn", async () => {
+      const fetchMock = withSlackMessage("msg-2");
+
+      await harness.service.refreshSlackActivity("msg-1", NOW);
+
+      expect(fetchMock).not.toHaveBeenCalled();
+    });
+
+    it("holds the next refresh until the interval has passed", async () => {
+      const fetchMock = withSlackMessage();
+
+      await harness.service.refreshSlackActivity("msg-1", NOW);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+
+      await harness.service.refreshSlackActivity(
+        "msg-1",
+        NOW + SLACK_ACTIVITY_REFRESH_INTERVAL_MS - 1
+      );
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+
+      await harness.service.refreshSlackActivity("msg-1", NOW + SLACK_ACTIVITY_REFRESH_INTERVAL_MS);
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+    });
+
+    it("refreshes on the first heartbeat after a runtime is rebuilt", async () => {
+      const fetchMock = withSlackMessage();
+      await harness.service.refreshSlackActivity("msg-1", NOW);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+
+      // An evicted Durable Object reconstructs the service, so the window is
+      // gone. Losing it can only make a refresh earlier, never later.
+      const rebuilt = createTestHarness();
+      vi.mocked(rebuilt.repository.getMessageCallbackContext).mockReturnValue({
+        callback_context: JSON.stringify(SLACK_CONTEXT),
+        source: "slack",
+      });
+      vi.mocked(rebuilt.repository.getProcessingMessageWithStartedAt).mockReturnValue({
+        id: "msg-1",
+        started_at: NOW - 1000,
+      });
+      vi.mocked(rebuilt.slackBot.fetch).mockResolvedValue(new Response("ok", { status: 200 }));
+
+      await rebuilt.service.refreshSlackActivity("msg-1", NOW + 30_000);
+      expect(rebuilt.slackBot.fetch).toHaveBeenCalledTimes(1);
+    });
+
+    it("sends one bounded attempt and leaves the window open when it fails", async () => {
+      const fetchMock = withSlackMessage();
+      fetchMock.mockResolvedValue(new Response("nope", { status: 500 }));
+
+      await harness.service.refreshSlackActivity("msg-1", NOW);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(fetchMock.mock.calls[0][1]?.signal).toBeInstanceOf(AbortSignal);
+
+      // A heartbeat well inside the interval still retries: nothing was
+      // delivered, so nothing moved the window.
+      await harness.service.refreshSlackActivity("msg-1", NOW + 30_000);
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+    });
+
+    it("swallows a delivery that throws", async () => {
+      const fetchMock = withSlackMessage();
+      fetchMock.mockRejectedValue(new Error("binding exploded"));
+
+      await expect(harness.service.refreshSlackActivity("msg-1", NOW)).resolves.toBeUndefined();
+      expect(harness.log.warn).toHaveBeenCalled();
+    });
+
+    it("skips a non-slack message without calling any bot", async () => {
+      vi.mocked(harness.repository.getMessageCallbackContext).mockReturnValue({
+        callback_context: JSON.stringify(LINEAR_CALLBACK_CONTEXT),
+        source: "linear",
+      });
+
+      await harness.service.refreshSlackActivity("msg-1", NOW);
+
+      expect(harness.slackBot.fetch).not.toHaveBeenCalled();
+      expect(harness.linearBot.fetch).not.toHaveBeenCalled();
+      expect(harness.slackPostScope.getSession).not.toHaveBeenCalled();
+      expect(harness.slackPostScope.getChannelBinding).not.toHaveBeenCalled();
+    });
+
+    it("skips a slack message that carries no callback context", async () => {
+      vi.mocked(harness.repository.getMessageCallbackContext).mockReturnValue({
+        callback_context: null,
+        source: "slack",
+      });
+
+      await harness.service.refreshSlackActivity("msg-1", NOW);
+
+      expect(harness.slackBot.fetch).not.toHaveBeenCalled();
+    });
+
+    it("skips when the slack binding is absent", async () => {
+      harness = createTestHarness({ env: { SLACK_BOT: undefined } });
+      vi.mocked(harness.repository.getMessageCallbackContext).mockReturnValue({
+        callback_context: JSON.stringify(SLACK_CONTEXT),
+        source: "slack",
+      });
+
+      await expect(harness.service.refreshSlackActivity("msg-1", NOW)).resolves.toBeUndefined();
+      expect(harness.slackBot.fetch).not.toHaveBeenCalled();
+    });
+
+    it("is renewed by a delivered tool-call callback, so a busy turn pays nothing", async () => {
+      const fetchMock = withSlackMessage();
+      const toolCallAt = Date.now();
+
+      await harness.service.notifyToolCall("msg-1", { type: "tool_call", tool: "bash" });
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+
+      // That callback set the Slack indicator, so a heartbeat arriving inside
+      // the interval has nothing left to do.
+      await harness.service.refreshSlackActivity("msg-1", toolCallAt + 30_000);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    });
+
+    it("does not let an in-flight refresh rewind the window past a newer tool call", async () => {
+      vi.useFakeTimers();
+      try {
+        const fetchMock = withSlackMessage();
+        let release!: (response: Response) => void;
+        let markOnWire!: () => void;
+        // Park the refresh on the wire, keyed on its route rather than on call
+        // order — the refresh awaits HMAC signing first, so the tool call can
+        // otherwise reach `fetch` before it does.
+        const refreshOnWire = new Promise<void>((resolve) => {
+          markOnWire = resolve;
+        });
+        fetchMock.mockImplementation((url) => {
+          if (!String(url).endsWith("/callbacks/activity")) {
+            return Promise.resolve(new Response("ok", { status: 200 }));
+          }
+          markOnWire();
+          return new Promise<Response>((resolve) => {
+            release = resolve;
+          });
+        });
+
+        vi.setSystemTime(NOW);
+        const refresh = harness.service.refreshSlackActivity("msg-1", NOW);
+        await refreshOnWire;
+
+        // A tool call asserts the indicator two intervals later, while the
+        // refresh minted at NOW is still in flight.
+        vi.setSystemTime(NOW + 2 * SLACK_ACTIVITY_REFRESH_INTERVAL_MS);
+        await harness.service.notifyToolCall("msg-1", { type: "tool_call", tool: "bash" });
+
+        release(new Response("ok", { status: 200 }));
+        await refresh;
+
+        // Back to a plain responder so the probe below fails on the assertion
+        // rather than by parking on the wire.
+        fetchMock.mockResolvedValue(new Response("ok", { status: 200 }));
+        const sent = fetchMock.mock.calls.length;
+        // The tool call's assertion is the newer truth. If the resolved
+        // refresh had rewound the window to NOW, this would re-send.
+        await harness.service.refreshSlackActivity(
+          "msg-1",
+          NOW + 2 * SLACK_ACTIVITY_REFRESH_INTERVAL_MS + 1_000
+        );
+        expect(fetchMock.mock.calls).toHaveLength(sent);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+  });
+
   describe("notifyToolCall", () => {
-    it("skips when throttled (< 3s since last call)", async () => {
+    it.each([
+      { ownerTeamId: null, binding: null },
+      { ownerTeamId: "team-a", binding: { teamId: "team-a" } },
+    ])("skips when throttled (< 3s since last call): %j", async ({ ownerTeamId, binding }) => {
+      harness.slackPostScope.getSession.mockResolvedValue({
+        ownerTeamId,
+        visibility: "workspace",
+      });
+      harness.slackPostScope.getChannelBinding.mockResolvedValue(binding);
       vi.mocked(harness.repository.getMessageCallbackContext).mockReturnValue({
         callback_context: JSON.stringify({ channel: "C123" }),
         source: "slack",
@@ -516,10 +1148,57 @@ describe("CallbackNotificationService", () => {
       // First call should go through
       await harness.service.notifyToolCall("msg-1", { type: "tool_call", tool: "bash" });
       expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(fetchMock).toHaveBeenCalledWith(
+        "https://internal/callbacks/tool_call",
+        expect.anything()
+      );
 
       // Second call within 3s should be throttled
       await harness.service.notifyToolCall("msg-1", { type: "tool_call", tool: "read" });
       expect(fetchMock).toHaveBeenCalledTimes(1); // still 1
+      expect(harness.slackPostScope.getSession).toHaveBeenCalledOnce();
+      expect(harness.slackPostScope.getChannelBinding).toHaveBeenCalledOnce();
+    });
+
+    it("throttles denied tool events without repeated reads or closure callbacks", async () => {
+      vi.useFakeTimers();
+      try {
+        const now = 1_700_000_000_000;
+        vi.setSystemTime(now);
+        harness.repository.getMessageCallbackContext.mockReturnValue({
+          callback_context: JSON.stringify({ channel: "C123", threadTs: "111.222" }),
+          source: "slack",
+        });
+        harness.slackPostScope.getSession.mockResolvedValue({
+          ownerTeamId: "team-a",
+          visibility: "private",
+        });
+        harness.slackBot.fetch.mockResolvedValue(new Response("ok"));
+        await harness.service.notifyToolCall("msg-1", { type: "tool_call", tool: "bash" });
+        expect(harness.slackBot.fetch).toHaveBeenLastCalledWith(
+          "https://internal/callbacks/thread_closed",
+          expect.anything()
+        );
+        vi.setSystemTime(now + 1000);
+        await harness.service.notifyToolCall("msg-1", { type: "tool_call", tool: "read" });
+        expect(harness.slackPostScope.getSession).toHaveBeenCalledOnce();
+        expect(harness.slackPostScope.getChannelBinding).toHaveBeenCalledOnce();
+        expect(harness.slackBot.fetch).toHaveBeenCalledOnce();
+        harness.slackPostScope.getSession.mockResolvedValue({
+          ownerTeamId: "team-a",
+          visibility: "workspace",
+        });
+        vi.setSystemTime(now + 3000);
+        await harness.service.notifyToolCall("msg-1", { type: "tool_call", tool: "read" });
+        expect(harness.slackPostScope.getSession).toHaveBeenCalledTimes(2);
+        expect(harness.slackBot.fetch).toHaveBeenCalledTimes(2);
+        expect(harness.slackBot.fetch).toHaveBeenLastCalledWith(
+          "https://internal/callbacks/tool_call",
+          expect.anything()
+        );
+      } finally {
+        vi.useRealTimers();
+      }
     });
 
     it("fires callback on first call", async () => {
@@ -557,6 +1236,8 @@ describe("CallbackNotificationService", () => {
       expect(body.signature).toEqual(expect.any(String));
       expect(linearToolCallCallbackSchema.safeParse(body).success).toBe(true);
       expect(await verifyCallbackSignature(body, "test-secret")).toBe(true);
+      expect(harness.slackPostScope.getSession).not.toHaveBeenCalled();
+      expect(harness.slackPostScope.getChannelBinding).not.toHaveBeenCalled();
     });
 
     it("skips Linear callbacks whose tool arguments are missing", async () => {
@@ -843,7 +1524,7 @@ describe("CallbackNotificationService", () => {
 
   describe("notifyComplete — automation callback", () => {
     it("routes automation callbacks to the injected completion function", async () => {
-      const completeAutomationRun = vi.fn(async () => new Response("ok"));
+      const completeAutomationRun = vi.fn(async () => undefined);
       const h = createTestHarness({
         completeAutomationRun,
       });
@@ -873,7 +1554,7 @@ describe("CallbackNotificationService", () => {
     });
 
     it("sends failure details for failed automation runs", async () => {
-      const completeAutomationRun = vi.fn(async () => new Response("ok"));
+      const completeAutomationRun = vi.fn(async () => undefined);
       const h = createTestHarness({
         completeAutomationRun,
       });
@@ -935,7 +1616,7 @@ describe("CallbackNotificationService", () => {
       const completeAutomationRun = vi
         .fn()
         .mockRejectedValueOnce(new Error("network error"))
-        .mockResolvedValueOnce(new Response("ok"));
+        .mockResolvedValueOnce(undefined);
       const h = createTestHarness({
         completeAutomationRun,
       });
@@ -959,8 +1640,34 @@ describe("CallbackNotificationService", () => {
       );
     });
 
+    it("rejects malformed persisted automation context before scheduler completion", async () => {
+      const completeAutomationRun = vi.fn(async () => undefined);
+      const h = createTestHarness({ completeAutomationRun });
+      vi.mocked(h.repository.getMessageCallbackContext).mockReturnValue({
+        callback_context: JSON.stringify({
+          source: "automation",
+          automationId: "auto-1",
+          automationName: "Daily sync",
+        }),
+        source: "automation",
+      });
+
+      await h.service.notifyComplete("msg-1", true);
+
+      expect(completeAutomationRun).not.toHaveBeenCalled();
+      expect(h.log.info).toHaveBeenCalledWith(
+        "callback.complete_delivery",
+        expect.objectContaining({
+          source: "automation",
+          outcome: "rejected",
+          reject_reason: "invalid_callback_context",
+          attempts: 0,
+        })
+      );
+    });
+
     it("does not route automation callbacks to SLACK_BOT", async () => {
-      const completeAutomationRun = vi.fn(async () => new Response("ok"));
+      const completeAutomationRun = vi.fn(async () => undefined);
       const h = createTestHarness({
         completeAutomationRun,
       });

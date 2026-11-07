@@ -1,5 +1,8 @@
 import { describe, expect, it, vi } from "vitest";
-import { buildBaseSnapshotSandboxName, buildVercelBaseSnapshot } from "./base-snapshot";
+import {
+  buildBaseSnapshotSandboxName,
+  buildVercelBaseSnapshot,
+} from "../../../../../vercel-infra/src/base-snapshot";
 import type {
   VercelCreateSandboxResponse,
   VercelRunCommandRequest,
@@ -42,18 +45,42 @@ function createMockClient(
     createSandbox: vi.fn(async () => createSessionResponse()),
     runCommandAndWait: vi.fn(async () => ({ commandId: "cmd-1", exitCode: 0 })),
     writeFileArchive: vi.fn(async () => {}),
-    snapshotSession: vi.fn(
-      async (): Promise<VercelSnapshotResponse> => ({
-        snapshot: { id: "snap-base-1", status: "created", createdAt: 456 },
-        session: createSessionResponse().session,
-      })
-    ),
+    snapshotSession: vi.fn(async (): Promise<VercelSnapshotResponse> => ({
+      snapshot: { id: "snap-base-1", status: "created", createdAt: 456 },
+      session: createSessionResponse().session,
+    })),
     stopSession: vi.fn(async () => {}),
     ...overrides,
   } as unknown as VercelSandboxClient;
 }
 
 describe("buildVercelBaseSnapshot", () => {
+  it("rejects a candidate when a fresh restore fails verification and stops both sessions", async () => {
+    const client = createMockClient({
+      createSandbox: vi
+        .fn()
+        .mockResolvedValueOnce(createSessionResponse("builder"))
+        .mockResolvedValueOnce(createSessionResponse("verifier")),
+      runCommandAndWait: vi
+        .fn()
+        .mockResolvedValueOnce({ commandId: "prepare", exitCode: 0 })
+        .mockResolvedValueOnce({ commandId: "install", exitCode: 0 })
+        .mockResolvedValueOnce({ commandId: "verify", exitCode: 1 }),
+    });
+    await expect(
+      buildVercelBaseSnapshot(client, {
+        runtimeArchive: new Uint8Array([1]),
+      })
+    ).rejects.toThrow("verification failed");
+    expect(client.createSandbox).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        sourceSnapshotId: "snap-base-1",
+      }),
+      undefined
+    );
+    expect(client.stopSession).toHaveBeenCalledWith("builder", undefined);
+    expect(client.stopSession).toHaveBeenCalledWith("verifier", undefined);
+  });
   it("bootstraps, snapshots, and stops a temporary Vercel sandbox", async () => {
     const client = createMockClient();
 
@@ -116,7 +143,7 @@ describe("buildVercelBaseSnapshot", () => {
       undefined
     );
     expect(vi.mocked(client.stopSession)).toHaveBeenCalledWith("session-1", undefined);
-    expect(result).toEqual({
+    expect(result).toMatchObject({
       snapshotId: "snap-base-1",
       sandboxName: "openinspect-base-managed",
       sessionId: "session-1",
@@ -132,7 +159,9 @@ describe("buildVercelBaseSnapshot", () => {
     });
 
     await expect(
-      buildVercelBaseSnapshot(client, { runtimeArchive: new Uint8Array([1]) })
+      buildVercelBaseSnapshot(client, {
+        runtimeArchive: new Uint8Array([1]),
+      })
     ).rejects.toThrow("Vercel base runtime bootstrap failed");
     expect(vi.mocked(client.stopSession)).toHaveBeenCalledWith("session-1", undefined);
     expect(vi.mocked(client.snapshotSession)).not.toHaveBeenCalled();

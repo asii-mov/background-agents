@@ -9,7 +9,8 @@ test("imports the OpenAI Playwright skill after reviewing moving-ref provenance"
 
   await expect(page.getByRole("heading", { name: "Skills", exact: true })).toBeVisible();
   await page.getByRole("button", { name: "Import from repository" }).click();
-  await page.getByLabel("Repository").selectOption("openai/skills");
+  await page.getByLabel("Repository").click();
+  await page.getByRole("option", { name: "openai/skills" }).click();
   await page.getByLabel("Branch, tag, or commit (optional)").fill("main");
   await page.getByLabel("Subdirectory (optional)").fill("skills/.curated/playwright");
   await page.getByRole("button", { name: "Preview import" }).click();
@@ -92,7 +93,7 @@ test("shows Git-governed MCP metadata to members without editable row controls",
   await expect(page.getByText(/resolved 0\.0\.42/)).toBeVisible();
   await expect(page.getByRole("button", { name: "Add Server" })).toHaveCount(0);
   await expect(page.getByRole("switch", { name: "Disable" })).toBeDisabled();
-  await page.getByRole("button", { name: /Browser verifier/ }).click();
+  await expect(page.getByRole("button", { name: /Browser verifier/ })).toBeDisabled();
   await expect(page.getByRole("button", { name: "Save Credentials" })).toHaveCount(0);
   await expect(page.getByPlaceholder("KEY_NAME")).toHaveCount(0);
 });
@@ -106,10 +107,11 @@ test("lets an administrator assign a role, create a pipeline, and save repositor
 
   await expect(page.getByRole("heading", { name: "Platform ownership" })).toBeVisible();
   const staffRole = page.getByRole("combobox", { name: "Role for Staff Engineer" });
-  await expect(staffRole).toHaveValue("member");
-  await staffRole.selectOption("editor");
+  await expect(staffRole).toContainText("Member");
+  await staffRole.click();
+  await page.getByRole("option", { name: "Editor", exact: true }).click();
   await expect(page.getByText("Platform role updated")).toBeVisible();
-  await expect(staffRole).toHaveValue("editor");
+  await expect(staffRole).toContainText("Editor");
   await page.getByRole("button", { name: /Add pipeline/ }).click();
   await page.getByPlaceholder("AppSec baseline").fill("Corporate AppSec baseline");
   await page.getByRole("button", { name: "Save pipeline" }).click();
@@ -119,7 +121,8 @@ test("lets an administrator assign a role, create a pipeline, and save repositor
   const riskSection = page.getByRole("heading", { name: "Repository criticality" }).locator("..");
   await riskSection.getByPlaceholder("acme").fill("acme");
   await riskSection.getByPlaceholder("identity-service").fill("identity-service");
-  await riskSection.getByRole("combobox").selectOption("high");
+  await riskSection.getByRole("combobox").click();
+  await page.getByRole("option", { name: "High", exact: true }).click();
   await riskSection
     .getByPlaceholder("Production identity boundary")
     .fill("Authentication boundary");
@@ -150,10 +153,11 @@ test("hides AppSec catalogue writes from members", async ({ page, api }) => {
 });
 
 test("saves a supported outbound allowlist", async ({ page, api }) => {
-  api.role = "editor";
+  api.role = "admin";
   await page.goto("/settings?tab=sandbox");
 
-  await page.getByLabel("Egress policy").selectOption("allowlist");
+  await page.getByLabel("Egress policy").click();
+  await page.getByRole("option", { name: "Allowlist only" }).click();
   await page.getByLabel("TLS domains").fill("api.openai.com\n*.github.com");
   await page.getByLabel("CIDR ranges").fill("10.0.0.0/8");
   await page.getByRole("button", { name: "Save Settings" }).click();
@@ -168,29 +172,28 @@ test("saves a supported outbound allowlist", async ({ page, api }) => {
 
 test("preserves the existing sandbox policy when a save is rejected", async ({ page, api }) => {
   const rejection = "The control plane rejected this policy update.";
-  api.role = "editor";
+  api.role = "admin";
   api.sandboxWriteError = rejection;
   await page.goto("/settings?tab=sandbox");
 
-  await page.getByLabel("Egress policy").selectOption("blocked");
+  await page.getByLabel("Egress policy").click();
+  await page.getByRole("option", { name: "Block all outbound traffic" }).click();
   await page.getByRole("button", { name: "Save Settings" }).click();
 
   await expect(page.getByText(rejection)).toBeVisible();
   expect(api.sandboxNetworkPolicy).toEqual({ mode: "unrestricted" });
 });
 
-test("shows the server denial when a member changes sandbox network policy", async ({
+test("withholds sandbox management from a member without integration permission", async ({
   page,
   api,
 }) => {
   api.role = "member";
   await page.goto("/settings?tab=sandbox");
-
-  await page.getByLabel("Egress policy").selectOption("blocked");
-  await page.getByRole("button", { name: "Save Settings" }).click();
-
-  await expect(
-    page.getByText("Only platform editors and admins can change this policy.", { exact: true })
-  ).toBeVisible();
+  await expect(page.getByRole("button", { name: "Sandbox", exact: true })).toHaveCount(0);
+  await expect(page.getByLabel("Egress policy")).toHaveCount(0);
   expect(api.sandboxNetworkPolicy).toEqual({ mode: "unrestricted" });
+  expect(
+    api.requests.some(({ method, path }) => method === "PUT" && path.includes("sandbox"))
+  ).toBe(false);
 });

@@ -37,6 +37,7 @@ def test_runtime_config_parses_frozen_values_without_environment_patching(tmp_pa
     )
 
     assert config.repo_path == tmp_path / "repo"
+    assert config.session_id == "session-1"
     assert config.base_branch == "develop"
     assert config.has_repository is True
 
@@ -44,6 +45,22 @@ def test_runtime_config_parses_frozen_values_without_environment_patching(tmp_pa
 def test_runtime_config_rejects_non_object_session_config():
     with pytest.raises(ValueError, match="JSON object"):
         RuntimeConfig.from_env({"SESSION_CONFIG": "[]"})
+
+
+@pytest.mark.parametrize(
+    "url", ["http://control.example", "ftp://control.example", "control.example"]
+)
+def test_runtime_config_rejects_insecure_control_plane_url(url):
+    with pytest.raises(ValueError, match="must use HTTPS"):
+        RuntimeConfig.from_env({"CONTROL_PLANE_URL": url})
+
+
+@pytest.mark.parametrize(
+    "url",
+    ["http://localhost:8787", "http://127.0.0.1:8787", "http://[::1]:8787"],
+)
+def test_runtime_config_allows_loopback_http_control_plane_url(url):
+    assert RuntimeConfig.from_env({"CONTROL_PLANE_URL": url}).control_plane_url == url
 
 
 def test_session_config_is_recursively_immutable():
@@ -61,3 +78,27 @@ def test_session_config_is_recursively_immutable():
     assert isinstance(repositories[0], MappingProxyType)
     with pytest.raises(TypeError):
         repositories[0]["repo_name"] = "changed"
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [(None, False), ("", False), ("false", False), ("1", False), ("TRUE", False), ("true", True)],
+)
+def test_docker_enabled_is_only_the_exact_trusted_value(value, expected):
+    environment = {"SANDBOX_ID": "sandbox-1"}
+    if value is not None:
+        environment["OPENINSPECT_DOCKER_ENABLED"] = value
+
+    assert RuntimeConfig.from_env(environment).docker_enabled is expected
+
+
+@pytest.mark.parametrize(
+    "governance",
+    [
+        {"security_pipelines": [{"id": "pipeline-1"}]},
+        {"mcp_servers": [{"artifactSha256": "a" * 64}]},
+    ],
+)
+def test_governed_claude_launch_fails_closed(governance):
+    with pytest.raises(ValueError, match="Claude does not yet support governed"):
+        RuntimeConfig.from_env({"SESSION_CONFIG": json.dumps({"harness": "claude", **governance})})

@@ -11,6 +11,7 @@ import type {
 } from "@open-inspect/shared/types/provider-accounts";
 import { ProviderAccountsSettings } from "./provider-accounts-settings";
 import { CHATGPT_DEVICE_AUTHORIZATION_SETTINGS_URL } from "./provider-device-authorization-dialog";
+import { ANTHROPIC_CREDENTIAL_ROTATION_WARNING } from "./provider-authorization-code-dialog";
 
 expect.extend(matchers);
 afterEach(cleanup);
@@ -22,10 +23,15 @@ const startAuthorization = vi.fn();
 const pollAuthorization = vi.fn();
 const cancelAuthorization = vi.fn();
 const reconnectAccount = vi.fn();
+const connectAccount = vi.fn();
+const startAuthorizationCode = vi.fn();
+const completeAuthorizationCode = vi.fn();
+const cancelAuthorizationCode = vi.fn();
 let legacyCredentialsResult: Record<string, unknown>;
 const providers = [
   { provider: "openai" as const, displayName: "OpenAI", subscriptionName: "ChatGPT" },
   { provider: "xai" as const, displayName: "xAI", subscriptionName: "SuperGrok" },
+  { provider: "anthropic" as const, displayName: "Anthropic", subscriptionName: "Claude" },
 ];
 const account = {
   id: "a".repeat(32),
@@ -41,8 +47,31 @@ const account = {
   updatedAt: 1,
   archivedAt: null,
 };
+const claudeAccount = {
+  ...account,
+  id: "f".repeat(32),
+  provider: "anthropic" as const,
+  displayName: "Team Claude",
+  externalAccountId: null,
+};
+const authorizationCodeStart = {
+  transactionId: "9".repeat(64),
+  provider: "anthropic" as const,
+  operation: "create" as const,
+  authorizationUrl: "https://claude.ai/oauth/authorize?state=abc",
+  expiresAt: Date.now() + 60_000,
+  expiresInMs: 60_000,
+};
 let accountsResult: ModelProviderAccount[];
 let defaultsResult: ModelProviderAccountDefault[];
+let allowedPermissions: Set<string> | null;
+
+vi.mock("@/hooks/use-current-user-authorization", () => ({
+  useCurrentUserAuthorization: () => ({
+    hasPermission: (permission: string) =>
+      allowedPermissions === null || allowedPermissions.has(permission),
+  }),
+}));
 
 vi.mock("@/hooks/use-provider-accounts", () => ({
   useProviderAccounts: () => ({
@@ -56,13 +85,16 @@ vi.mock("@/hooks/use-provider-accounts", () => ({
   useLegacyProviderCredentials: () => legacyCredentialsResult,
   runProviderAccountAction: (...args: unknown[]) => runAction(...args),
   archiveProviderAccount: vi.fn(),
-  connectProviderAccount: vi.fn(),
+  connectProviderAccount: (...args: unknown[]) => connectAccount(...args),
   reconnectProviderAccount: (...args: unknown[]) => reconnectAccount(...args),
   renameProviderAccount: vi.fn(),
   setProviderAccountDefault: (...args: unknown[]) => setDefault(...args),
   startProviderDeviceAuthorization: (...args: unknown[]) => startAuthorization(...args),
   pollProviderDeviceAuthorization: (...args: unknown[]) => pollAuthorization(...args),
   cancelProviderDeviceAuthorization: (...args: unknown[]) => cancelAuthorization(...args),
+  startProviderAuthorizationCode: (...args: unknown[]) => startAuthorizationCode(...args),
+  completeProviderAuthorizationCode: (...args: unknown[]) => completeAuthorizationCode(...args),
+  cancelProviderAuthorizationCode: (...args: unknown[]) => cancelAuthorizationCode(...args),
 }));
 
 vi.mock("sonner", () => ({ toast: { success: vi.fn(), error: vi.fn() } }));
@@ -86,8 +118,13 @@ describe("ProviderAccountsSettings", () => {
     pollAuthorization.mockImplementation(() => new Promise(() => undefined));
     cancelAuthorization.mockResolvedValue(undefined);
     reconnectAccount.mockResolvedValue(undefined);
+    connectAccount.mockResolvedValue(undefined);
+    startAuthorizationCode.mockResolvedValue(authorizationCodeStart);
+    completeAuthorizationCode.mockImplementation(() => new Promise(() => undefined));
+    cancelAuthorizationCode.mockResolvedValue(undefined);
     accountsResult = [account];
     defaultsResult = [];
+    allowedPermissions = null;
     Object.defineProperty(navigator, "clipboard", {
       configurable: true,
       value: { writeText: vi.fn().mockResolvedValue(undefined) },
@@ -98,9 +135,25 @@ describe("ProviderAccountsSettings", () => {
     };
   });
 
+  it("keeps read-only account details visible without management actions", () => {
+    allowedPermissions = new Set(["provider_accounts.read"]);
+
+    render(<ProviderAccountsSettings />);
+
+    expect(screen.getByText("Team ChatGPT")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Add account" })).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "More actions for Team ChatGPT" })
+    ).not.toBeInTheDocument();
+  });
+
   it("reconnects OpenAI through device authorization with the selected account id", async () => {
     render(<ProviderAccountsSettings />);
-    fireEvent.click(screen.getByRole("button", { name: "Reconnect" }));
+    fireEvent.pointerDown(screen.getByRole("button", { name: "More actions for Team ChatGPT" }), {
+      button: 0,
+      ctrlKey: false,
+    });
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Reconnect" }));
 
     expect(
       await screen.findByRole("heading", { name: "Reconnect Team ChatGPT" })
@@ -227,7 +280,11 @@ describe("ProviderAccountsSettings", () => {
     );
 
     render(<ProviderAccountsSettings />);
-    fireEvent.click(screen.getByRole("button", { name: "Reconnect" }));
+    fireEvent.pointerDown(screen.getByRole("button", { name: "More actions for Team ChatGPT" }), {
+      button: 0,
+      ctrlKey: false,
+    });
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Reconnect" }));
 
     expect(await screen.findByText("Provider account is archived")).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Retry" })).not.toBeInTheDocument();
@@ -283,7 +340,11 @@ describe("ProviderAccountsSettings", () => {
     accountsResult = [legacyAccount];
     render(<ProviderAccountsSettings />);
 
-    fireEvent.click(screen.getByRole("button", { name: "Reconnect" }));
+    fireEvent.pointerDown(
+      screen.getByRole("button", { name: "More actions for Legacy SuperGrok" }),
+      { button: 0, ctrlKey: false }
+    );
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Reconnect" }));
     expect(screen.getByRole("heading", { name: "Reconnect Legacy SuperGrok" })).toBeInTheDocument();
     fireEvent.change(screen.getByLabelText("Refresh token"), { target: { value: "legacy-token" } });
     fireEvent.click(screen.getByRole("button", { name: "Save" }));
@@ -295,6 +356,143 @@ describe("ProviderAccountsSettings", () => {
       })
     );
     expect(startAuthorization).not.toHaveBeenCalled();
+  });
+
+  it("starts Claude through the authorization-code dialog from the provider picker", async () => {
+    render(<ProviderAccountsSettings />);
+
+    expect(screen.getByText("Claude")).toBeInTheDocument();
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Add account" }), {
+      button: 0,
+      ctrlKey: false,
+    });
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Claude" }));
+
+    expect(
+      await screen.findByRole("heading", { name: "Connect your Claude account" })
+    ).toBeInTheDocument();
+    expect(startAuthorizationCode).toHaveBeenCalledWith("anthropic", {
+      operation: "create",
+      displayName: "Claude account",
+    });
+    expect(startAuthorization).not.toHaveBeenCalled();
+    const link = await screen.findByRole("link", { name: "Open Anthropic" });
+    expect(link).toHaveAttribute("href", authorizationCodeStart.authorizationUrl);
+    expect(link).toHaveAttribute("target", "_blank");
+    expect(screen.getByLabelText("Authorization code")).toBeInTheDocument();
+    expect(document.body.textContent).not.toMatch(/Claude Code/);
+  });
+
+  it("connects a Claude setup token through the direct path", async () => {
+    render(<ProviderAccountsSettings />);
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Add account" }), {
+      button: 0,
+      ctrlKey: false,
+    });
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Claude" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Paste a setup token instead" }));
+    fireEvent.change(screen.getByLabelText("Setup token"), {
+      target: { value: "sk-ant-oat01-token" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+
+    await waitFor(() =>
+      expect(connectAccount).toHaveBeenCalledWith({
+        provider: "anthropic",
+        displayName: "Claude account",
+        setupToken: "sk-ant-oat01-token",
+      })
+    );
+    await waitFor(() => expect(refresh).toHaveBeenCalled());
+    expect(toast.success).toHaveBeenCalledWith("Claude account connected");
+    await waitFor(() =>
+      expect(
+        screen.queryByRole("heading", { name: "Connect your Claude account" })
+      ).not.toBeInTheDocument()
+    );
+  });
+
+  it("closes the setup token form once the connect succeeds even if the refresh fails", async () => {
+    refresh.mockRejectedValueOnce(new Error("Failed to load provider accounts"));
+    render(<ProviderAccountsSettings />);
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Add account" }), {
+      button: 0,
+      ctrlKey: false,
+    });
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Claude" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Paste a setup token instead" }));
+    fireEvent.change(screen.getByLabelText("Setup token"), {
+      target: { value: "sk-ant-oat01-token" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+
+    await waitFor(() =>
+      expect(
+        screen.queryByRole("heading", { name: "Connect your Claude account" })
+      ).not.toBeInTheDocument()
+    );
+    expect(connectAccount).toHaveBeenCalledTimes(1);
+    expect(toast.success).toHaveBeenCalledWith("Claude account connected");
+    await waitFor(() =>
+      expect(toast.error).toHaveBeenCalledWith(
+        "Saved, but the account list could not be refreshed. Reload the page to see it."
+      )
+    );
+  });
+
+  it("reconnects a Claude account with a setup token against the explicit account", async () => {
+    accountsResult = [claudeAccount];
+    startAuthorizationCode.mockResolvedValue({ ...authorizationCodeStart, operation: "reconnect" });
+    render(<ProviderAccountsSettings />);
+    fireEvent.pointerDown(screen.getByRole("button", { name: "More actions for Team Claude" }), {
+      button: 0,
+      ctrlKey: false,
+    });
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Reconnect" }));
+
+    expect(
+      await screen.findByRole("heading", { name: "Reconnect Team Claude" })
+    ).toBeInTheDocument();
+    expect(screen.getByText(ANTHROPIC_CREDENTIAL_ROTATION_WARNING)).toBeInTheDocument();
+    expect(startAuthorizationCode).toHaveBeenCalledWith("anthropic", {
+      operation: "reconnect",
+      providerAccountId: claudeAccount.id,
+    });
+    expect(await screen.findByRole("link", { name: "Open Anthropic" })).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Paste a setup token instead" }));
+    expect(screen.queryByLabelText("Account name")).not.toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText("Setup token"), {
+      target: { value: "sk-ant-oat01-rotated" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+
+    await waitFor(() =>
+      expect(reconnectAccount).toHaveBeenCalledWith(claudeAccount.id, {
+        provider: "anthropic",
+        setupToken: "sk-ant-oat01-rotated",
+      })
+    );
+  });
+
+  it("hides Verify for Claude accounts and warns before disabling", async () => {
+    accountsResult = [claudeAccount];
+    render(<ProviderAccountsSettings />);
+    fireEvent.pointerDown(screen.getByRole("button", { name: "More actions for Team Claude" }), {
+      button: 0,
+      ctrlKey: false,
+    });
+
+    expect(await screen.findByRole("menuitem", { name: "Reconnect" })).toBeInTheDocument();
+    expect(screen.queryByRole("menuitem", { name: "Verify" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("menuitem", { name: "Copy account ID" })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("menuitem", { name: "Disable" }));
+
+    expect(await screen.findByRole("alertdialog")).toHaveTextContent(
+      ANTHROPIC_CREDENTIAL_ROTATION_WARNING
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Disable" }));
+    await waitFor(() => expect(runAction).toHaveBeenCalledWith(claudeAccount.id, "disable"));
   });
 
   it("keeps the changing countdown outside the live region", async () => {
@@ -323,10 +521,11 @@ describe("ProviderAccountsSettings", () => {
       )
     ).toBeInTheDocument();
     expect(screen.queryByLabelText("Automated authentication")).not.toBeInTheDocument();
-    expect(screen.getAllByText("No default account selected")).toHaveLength(2);
-    expect(screen.getAllByText("Choose Make default from an account above.")).toHaveLength(2);
+    expect(screen.getAllByText("No default account selected")).toHaveLength(3);
+    expect(screen.getAllByText("Choose Make default from an account above.")).toHaveLength(3);
     expect(screen.getAllByTitle("OpenAI")).not.toHaveLength(0);
     expect(screen.getAllByTitle("Grok")).not.toHaveLength(0);
+    expect(screen.getAllByTitle("Anthropic")).not.toHaveLength(0);
   });
 
   it("names the effective account used by automated sessions", () => {
@@ -346,6 +545,27 @@ describe("ProviderAccountsSettings", () => {
     expect(screen.getByLabelText("Automated authentication")).toHaveTextContent(
       "Use default: Team ChatGPT"
     );
+    expect(screen.getByText("Default for automation")).toBeInTheDocument();
+  });
+
+  it("does not label the stored account as the automation default in API key mode", () => {
+    defaultsResult = [
+      {
+        provider: "openai",
+        providerAccountId: account.id,
+        unattendedMode: "api_key",
+        createdBy: null,
+        updatedBy: null,
+        createdAt: 1,
+        updatedAt: 1,
+      },
+    ];
+    render(<ProviderAccountsSettings />);
+
+    expect(screen.getByLabelText("Automated authentication")).toHaveTextContent(
+      "No account (API key)"
+    );
+    expect(screen.queryByText("Default for automation")).not.toBeInTheDocument();
   });
 
   it("sets the provider default from the account row", async () => {
@@ -385,29 +605,30 @@ describe("ProviderAccountsSettings", () => {
     ];
     render(<ProviderAccountsSettings />);
 
-    const verifyButtons = screen.getAllByRole("button", { name: "Verify" });
-    fireEvent.click(verifyButtons[0]);
+    fireEvent.pointerDown(screen.getByRole("button", { name: "More actions for Team ChatGPT" }), {
+      button: 0,
+      ctrlKey: false,
+    });
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Verify" }));
 
     expect(screen.getByRole("button", { name: "Add account" })).toBeDisabled();
     expect(screen.getAllByLabelText("Automated authentication")[0]).toBeDisabled();
-    expect(verifyButtons[1]).toBeDisabled();
-    fireEvent.click(verifyButtons[1]);
+    expect(screen.getByRole("button", { name: "More actions for Backup ChatGPT" })).toBeDisabled();
     expect(runAction).toHaveBeenCalledTimes(1);
 
     await act(async () => finishAction());
     await waitFor(() => expect(screen.getByRole("button", { name: "Add account" })).toBeEnabled());
   });
 
-  it("keeps primary account actions on one line and moves secondary actions to overflow", async () => {
+  it("shows primary actions only for accounts needing intervention", async () => {
     render(<ProviderAccountsSettings />);
 
     expect(screen.queryByText(account.externalAccountId)).not.toBeInTheDocument();
     expect(screen.getByText("Verified Never")).toHaveClass("whitespace-nowrap");
     expect(screen.getByText("Used Never")).toHaveClass("whitespace-nowrap");
-    const reconnect = screen.getByRole("button", { name: "Reconnect" });
-    expect(screen.getByRole("button", { name: "Disable" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Verify" })).toBeInTheDocument();
-    expect(reconnect.parentElement).toHaveClass("flex", "shrink-0", "items-center");
+    expect(screen.queryByRole("button", { name: "Reconnect" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Disable" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Verify" })).not.toBeInTheDocument();
     expect(screen.queryByRole("menuitem", { name: "Rename" })).not.toBeInTheDocument();
     expect(screen.queryByRole("menuitem", { name: "Archive" })).not.toBeInTheDocument();
 
@@ -417,6 +638,9 @@ describe("ProviderAccountsSettings", () => {
     });
 
     expect(await screen.findByRole("menuitem", { name: "Make default" })).toBeInTheDocument();
+    expect(screen.getByRole("menuitem", { name: "Reconnect" })).toBeInTheDocument();
+    expect(screen.getByRole("menuitem", { name: "Verify" })).toBeInTheDocument();
+    expect(screen.getByRole("menuitem", { name: "Disable" })).toBeInTheDocument();
     expect(screen.getByRole("menuitem", { name: "Rename" })).toBeInTheDocument();
     expect(screen.getByRole("menuitem", { name: "Archive" })).toBeInTheDocument();
     fireEvent.click(screen.getByRole("menuitem", { name: "Copy account ID" }));
@@ -425,9 +649,44 @@ describe("ProviderAccountsSettings", () => {
     );
   });
 
+  it("surfaces reconnect only as the primary action when an account needs attention", async () => {
+    accountsResult = [{ ...account, status: "reconnect_required" }];
+    render(<ProviderAccountsSettings />);
+
+    expect(screen.getByRole("button", { name: "Reconnect" })).toBeInTheDocument();
+    expect(
+      screen.getByText("This account cannot start new sessions until it is reconnected.")
+    ).toBeInTheDocument();
+    fireEvent.pointerDown(screen.getByRole("button", { name: "More actions for Team ChatGPT" }), {
+      button: 0,
+      ctrlKey: false,
+    });
+    expect(await screen.findByRole("menuitem", { name: "Rename" })).toBeInTheDocument();
+    expect(screen.queryByRole("menuitem", { name: "Reconnect" })).not.toBeInTheDocument();
+  });
+
+  it("surfaces enable as the primary action when an account is disabled", async () => {
+    accountsResult = [{ ...account, status: "disabled" }];
+    render(<ProviderAccountsSettings />);
+
+    expect(screen.getByRole("button", { name: "Enable" })).toBeInTheDocument();
+    expect(
+      screen.getByText("This account is disabled and is not available for new sessions.")
+    ).toBeInTheDocument();
+    fireEvent.pointerDown(screen.getByRole("button", { name: "More actions for Team ChatGPT" }), {
+      button: 0,
+      ctrlKey: false,
+    });
+    expect(await screen.findByRole("menuitem", { name: "Reconnect" })).toBeInTheDocument();
+  });
+
   it("confirms disable and runs the lifecycle action", async () => {
     render(<ProviderAccountsSettings />);
-    fireEvent.click(screen.getByRole("button", { name: "Disable" }));
+    fireEvent.pointerDown(screen.getByRole("button", { name: "More actions for Team ChatGPT" }), {
+      button: 0,
+      ctrlKey: false,
+    });
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Disable" }));
     fireEvent.click(screen.getByRole("button", { name: "Disable" }));
 
     await waitFor(() => {

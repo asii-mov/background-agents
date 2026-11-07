@@ -98,29 +98,29 @@ describe("GET /api/image-builds feed", () => {
   it("serves enabled scopes plus cross-scope status, failed rows included", async () => {
     const readyRepoRow = {
       id: "build-1",
-      scope_kind: "repo",
-      scope_id: "acme/web",
+      scopeKind: "repo",
+      scopeId: "acme/web",
       provider: "modal",
       status: "ready",
-      repositories_fingerprint: "fp-repo",
-      repository_shas: JSON.stringify([{ repoOwner: "acme", repoName: "web", baseSha: "abc123" }]),
-      runtime_version: "60",
-      build_duration_seconds: 42.5,
-      error_message: null,
-      created_at: 1700000000000,
+      repositoriesFingerprint: "fp-repo",
+      repositoryShas: [{ repoOwner: "acme", repoName: "web", baseSha: "abc123" }],
+      runtimeVersion: "60",
+      buildDurationSeconds: 42.5,
+      errorMessage: null,
+      createdAt: 1700000000000,
     };
     const failedEnvironmentRow = {
       id: "build-2",
-      scope_kind: "environment",
-      scope_id: "env_1",
+      scopeKind: "environment",
+      scopeId: "env_1",
       provider: "modal",
       status: "failed",
-      repositories_fingerprint: "fp-env",
-      repository_shas: "[]",
-      runtime_version: "60",
-      build_duration_seconds: null,
-      error_message: "boom",
-      created_at: 1700000000001,
+      repositoriesFingerprint: "fp-env",
+      repositoryShas: [],
+      runtimeVersion: "60",
+      buildDurationSeconds: null,
+      errorMessage: "boom",
+      createdAt: 1700000000001,
     };
     vi.mocked(controlPlaneUserFetch).mockImplementation(async (path: string) => {
       if (path === "/image-builds/enabled") {
@@ -182,6 +182,52 @@ describe("GET /api/image-builds feed", () => {
     });
   });
 
+  it("serves the deployment's admission state alongside the toggles", async () => {
+    vi.mocked(controlPlaneUserFetch).mockImplementation(async (path: string) => {
+      if (path === "/image-builds/enabled") {
+        return Response.json({
+          units: [],
+          admission: { open: false, reason: "daytona_prebuilds_disabled" },
+        });
+      }
+      if (path === "/image-builds/enabled-repos") return Response.json({ repos: [] });
+      return Response.json({ images: [] });
+    });
+
+    const response = await getFeed();
+
+    await expect(response.json()).resolves.toMatchObject({
+      admission: { open: false, reason: "daytona_prebuilds_disabled" },
+    });
+  });
+
+  it("drops rows another provider built", async () => {
+    const otherProviderRow = {
+      id: "build-old",
+      scopeKind: "repo",
+      scopeId: "acme/web",
+      provider: "daytona",
+      status: "ready",
+      repositoriesFingerprint: "fp-repo",
+      repositoryShas: [],
+      runtimeVersion: "60",
+      buildDurationSeconds: 10,
+      errorMessage: null,
+      createdAt: 1700000000000,
+    };
+    vi.mocked(controlPlaneUserFetch).mockImplementation(async (path: string) => {
+      if (path === "/image-builds/enabled") return Response.json({ units: [] });
+      if (path === "/image-builds/enabled-repos") return Response.json({ repos: [] });
+      return Response.json({ images: [otherProviderRow] });
+    });
+
+    const response = await getFeed();
+
+    // The deployment runs on modal here; a retained Daytona row is history,
+    // not a prebuild this deployment can boot.
+    await expect(response.json()).resolves.toMatchObject({ images: [] });
+  });
+
   it("filters superseded rows at the fetch boundary", async () => {
     vi.mocked(controlPlaneUserFetch).mockImplementation(async (path: string) => {
       if (path === "/image-builds/enabled") return Response.json({ units: [] });
@@ -190,16 +236,16 @@ describe("GET /api/image-builds feed", () => {
         images: [
           {
             id: "build-1",
-            scope_kind: "environment",
-            scope_id: "env_1",
+            scopeKind: "environment",
+            scopeId: "env_1",
             provider: "modal",
             status: "superseded",
-            repositories_fingerprint: "fp-env",
-            repository_shas: "[]",
-            runtime_version: "60",
-            build_duration_seconds: 10,
-            error_message: null,
-            created_at: 1700000000000,
+            repositoriesFingerprint: "fp-env",
+            repositoryShas: [],
+            runtimeVersion: "60",
+            buildDurationSeconds: 10,
+            errorMessage: null,
+            createdAt: 1700000000000,
           },
         ],
       });

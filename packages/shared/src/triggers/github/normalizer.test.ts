@@ -1,9 +1,20 @@
 import { describe, it, expect } from "vitest";
 import { normalizeGitHubEvent } from "./normalizer";
+import {
+  GITHUB_WEBHOOK_EVENT_CATALOG,
+  checkSuiteEventSchema,
+  issueCommentEventSchema,
+  issuesEventSchema,
+  pullRequestEventSchema,
+  pullRequestReviewCommentEventSchema,
+  workflowRunEventSchema,
+} from "./webhook-types";
+import { githubAutomationEventSchema, type GitHubAutomationEvent } from "../types";
 
 // ─── Shared fixture data ───────────────────────────────────────────────────────
 
 const repo = {
+  id: 9001,
   name: "my-app",
   owner: { login: "acme-org" },
 };
@@ -88,6 +99,22 @@ const checkSuiteCompletedPayload = {
     head_sha: "abc1234def5678",
     conclusion: "failure",
     pull_requests: [{ number: 42 }, { number: 43 }],
+  },
+};
+
+const workflowRunCompletedPayload = {
+  action: "completed",
+  repository: repo,
+  sender,
+  workflow_run: {
+    id: 123456789,
+    run_attempt: 1,
+    name: "CI",
+    conclusion: "failure",
+    head_branch: "main",
+    head_sha: "abc1234def5678",
+    path: ".github/workflows/ci.yml",
+    html_url: "https://github.com/acme-org/my-app/actions/runs/123456789",
   },
 };
 
@@ -246,12 +273,13 @@ describe("normalizeGitHubEvent", () => {
   });
 
   describe("check_suite.completed", () => {
-    it("extracts checkConclusion and check suite id", () => {
+    it("extracts the canonical conclusion and check suite id", () => {
       const event = normalizeGitHubEvent("check_suite", checkSuiteCompletedPayload);
 
       expect(event).not.toBeNull();
       expect(event!.source).toBe("github");
       expect(event!.eventType).toBe("check_suite.completed");
+      expect(event!.conclusion).toBe("failure");
       expect(event!.checkConclusion).toBe("failure");
       expect(event!.triggerKey).toBe("check_suite:77777");
       expect(event!.concurrencyKey).toBe("check_suite:77777");
@@ -260,6 +288,75 @@ describe("normalizeGitHubEvent", () => {
       expect(event!.contextBlock).toContain("check_suite.completed");
       expect(event!.contextBlock).toContain("failure");
       expect(event!.meta).toMatchObject({ checkSuiteId: 77777, conclusion: "failure" });
+    });
+
+    it.each(["skipped", "startup_failure"] as const)(
+      "accepts the %s provider conclusion",
+      (conclusion) => {
+        const event = normalizeGitHubEvent("check_suite", {
+          ...checkSuiteCompletedPayload,
+          check_suite: { ...checkSuiteCompletedPayload.check_suite, conclusion },
+        });
+
+        expect(event?.conclusion).toBe(conclusion);
+      }
+    );
+  });
+
+  describe("workflow_run.completed", () => {
+    it("normalizes a completed workflow run", () => {
+      const event = normalizeGitHubEvent("workflow_run", workflowRunCompletedPayload);
+
+      expect(event).not.toBeNull();
+      expect(event!.eventType).toBe("workflow_run.completed");
+      expect(event!.repoOwner).toBe("acme-org");
+      expect(event!.repoName).toBe("my-app");
+      expect(event!.workflowName).toBe("CI");
+      expect(event!.conclusion).toBe("failure");
+      expect(event).not.toHaveProperty("checkConclusion");
+      expect(event!.branch).toBe("main");
+      expect(event!.triggerKey).toBe("workflow_run:123456789:1");
+      expect(event!.concurrencyKey).toBe("workflow_run:123456789");
+      expect(event!.contextBlock).toContain("Run: 123456789");
+      expect(event!.contextBlock).toContain(".github/workflows/ci.yml");
+      expect(event!.meta).toMatchObject({
+        workflowRunId: 123456789,
+        workflowRunAttempt: 1,
+        workflowName: "CI",
+        conclusion: "failure",
+      });
+    });
+
+    it("deduplicates attempts separately within one run concurrency scope", () => {
+      const rerun = normalizeGitHubEvent("workflow_run", {
+        ...workflowRunCompletedPayload,
+        workflow_run: { ...workflowRunCompletedPayload.workflow_run, run_attempt: 2 },
+      });
+
+      expect(rerun?.triggerKey).toBe("workflow_run:123456789:2");
+      expect(rerun?.concurrencyKey).toBe("workflow_run:123456789");
+    });
+
+    it("admits different run ids with the same workflow name independently", () => {
+      const otherRun = normalizeGitHubEvent("workflow_run", {
+        ...workflowRunCompletedPayload,
+        workflow_run: { ...workflowRunCompletedPayload.workflow_run, id: 987654321 },
+      });
+
+      expect(otherRun?.triggerKey).toBe("workflow_run:987654321:1");
+      expect(otherRun?.concurrencyKey).toBe("workflow_run:987654321");
+    });
+
+    it("rejects check-suite-only conclusions", () => {
+      const event = normalizeGitHubEvent("workflow_run", {
+        ...workflowRunCompletedPayload,
+        workflow_run: {
+          ...workflowRunCompletedPayload.workflow_run,
+          conclusion: "startup_failure",
+        },
+      });
+
+      expect(event).toBeNull();
     });
   });
 
@@ -673,4 +770,159 @@ describe("typed pullRequest facts on pull_request events", () => {
       expect(parsed.pullRequest).toEqual(event!.pullRequest);
     }
   });
+});
+
+// ─── Catalog ↔ normalizer agreement ───────────────────────────────────────────
+//
+// The catalog tells the UI and the API which conditions an event type may use.
+// That promise is only worth anything if the normalizer actually fills the field
+// each condition reads. This suite normalizes one payload per catalog entry and
+// checks every condition the catalog offers against the fields that came out, so
+// the catalog can never promise a filter that could not match.
+//
+// One direction only: over-promising is the failure that reaches users, and
+// asserting the reverse would quietly require every fixture to be the fattest
+// payload GitHub can send.
+
+/** The normalized event field each GitHub condition reads. */
+const CONDITION_SOURCE_FIELD = {
+  branch: "branch",
+  target_branch: "targetBranch",
+  label: "labels",
+  path_glob: "changedFiles",
+  actor: "actor",
+  conclusion: "conclusion",
+  workflow_name: "workflowName",
+} as const satisfies Record<string, keyof GitHubAutomationEvent>;
+
+/** A payload per catalog event type. */
+const CATALOG_PAYLOADS: Record<string, [event: string, payload: Record<string, unknown>]> = {
+  "pull_request.opened": ["pull_request", pullRequestOpenedPayload],
+  "pull_request.synchronize": ["pull_request", pullRequestSynchronizePayload],
+  "pull_request.closed": ["pull_request", pullRequestClosedPayload],
+  "issue_comment.created": ["issue_comment", issueCommentPayload],
+  "pull_request_review_comment.created": ["pull_request_review_comment", reviewCommentPayload],
+  "check_suite.completed": ["check_suite", checkSuiteCompletedPayload],
+  "workflow_run.completed": ["workflow_run", workflowRunCompletedPayload],
+  // The shared opened fixture covers the unlabelled case; a catalog entry that
+  // promises `label` has to be checked against a payload that carries labels.
+  "issues.opened": [
+    "issues",
+    { ...issuesOpenedPayload, issue: { ...issuesOpenedPayload.issue, labels: [{ name: "bug" }] } },
+  ],
+  "issues.labeled": ["issues", issuesLabeledPayload],
+};
+
+const RAW_EVENT_SCHEMAS = {
+  pull_request: pullRequestEventSchema,
+  issue_comment: issueCommentEventSchema,
+  pull_request_review_comment: pullRequestReviewCommentEventSchema,
+  check_suite: checkSuiteEventSchema,
+  workflow_run: workflowRunEventSchema,
+  issues: issuesEventSchema,
+} as const;
+
+describe("GitHub repository routing identity", () => {
+  it.each(Object.entries(CATALOG_PAYLOADS))(
+    "%s carries the numeric repository id through normalization and schema boundaries",
+    (eventType, [header, payload]) => {
+      const schema = RAW_EVENT_SCHEMAS[header as keyof typeof RAW_EVENT_SCHEMAS];
+      for (const repositoryId of [1, repo.id, Number.MAX_SAFE_INTEGER]) {
+        const raw = { ...payload, repository: { ...repo, id: repositoryId } };
+        expect(schema.parse(raw).repository).toHaveProperty("id", repositoryId);
+
+        const event = normalizeGitHubEvent(header, raw);
+        expect(event).toMatchObject({
+          eventType,
+          repositoryId,
+          repoOwner: repo.owner.login,
+          repoName: repo.name,
+          actor: sender.login,
+        });
+        expect(githubAutomationEventSchema.parse(event)).toEqual(event);
+      }
+    }
+  );
+
+  it.each(Object.entries(CATALOG_PAYLOADS))(
+    "%s rejects missing or invalid repository ids without falling back to owner/name",
+    (_eventType, [header, payload]) => {
+      const schema = RAW_EVENT_SCHEMAS[header as keyof typeof RAW_EVENT_SCHEMAS];
+      const invalidRepositories = [
+        undefined,
+        null,
+        {},
+        { name: repo.name, owner: repo.owner },
+        ...[
+          undefined,
+          null,
+          String(repo.id),
+          0,
+          -1,
+          1.5,
+          Number.MAX_SAFE_INTEGER + 1,
+          NaN,
+          Infinity,
+        ].map((id) => ({ ...repo, id })),
+      ];
+
+      for (const repository of invalidRepositories) {
+        const raw = { ...payload, repository };
+        expect(schema.safeParse(raw).success).toBe(false);
+        expect(normalizeGitHubEvent(header, raw)).toBeNull();
+      }
+    }
+  );
+
+  it("preserves routing identity when a repository is renamed or transferred", () => {
+    const event = normalizeGitHubEvent("pull_request", {
+      ...pullRequestOpenedPayload,
+      repository: { ...repo, name: "renamed-app", owner: { login: "new-org" } },
+    });
+
+    expect(event).toMatchObject({
+      repositoryId: repo.id,
+      repoOwner: "new-org",
+      repoName: "renamed-app",
+    });
+  });
+
+  it("does not substitute the PR base repository id for a missing webhook repository id", () => {
+    expect(
+      normalizeGitHubEvent("pull_request", {
+        ...pullRequestOpenedPayload,
+        repository: { name: repo.name, owner: repo.owner },
+        pull_request: { ...basePR, base: { ...basePR.base, repo: { id: repo.id } } },
+      })
+    ).toBeNull();
+  });
+
+  it("still accepts an absent sender without guessing an actor", () => {
+    const event = normalizeGitHubEvent("pull_request", {
+      ...pullRequestOpenedPayload,
+      sender: undefined,
+    });
+
+    expect(event).toMatchObject({ repositoryId: repo.id });
+    expect(event?.actor).toBeUndefined();
+  });
+});
+
+describe("GITHUB_WEBHOOK_EVENT_CATALOG supportedConditions", () => {
+  it.each(GITHUB_WEBHOOK_EVENT_CATALOG.map((entry) => [`${entry.event}.${entry.action}`, entry]))(
+    "%s only offers conditions its normalizer can answer",
+    (eventType, entry) => {
+      const fixture = CATALOG_PAYLOADS[eventType];
+      expect(fixture, `no fixture for ${eventType}`).toBeDefined();
+
+      const event = normalizeGitHubEvent(fixture[0], fixture[1]);
+      expect(event).not.toBeNull();
+
+      const unanswerable = entry.supportedConditions.filter(
+        (conditionType) => event![CONDITION_SOURCE_FIELD[conditionType]] === undefined
+      );
+
+      expect(unanswerable).toEqual([]);
+    }
+  );
 });

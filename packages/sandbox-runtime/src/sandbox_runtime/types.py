@@ -1,7 +1,7 @@
 """Type definitions for sandbox operations."""
 
 from enum import StrEnum
-from typing import Any, TypedDict
+from typing import TypedDict
 
 from pydantic import BaseModel
 
@@ -18,83 +18,6 @@ class SandboxStatus(StrEnum):
     SNAPSHOTTING = "snapshotting"  # Taking filesystem snapshot
     STOPPED = "stopped"
     FAILED = "failed"
-
-
-class GitSyncStatus(StrEnum):
-    """Status of git synchronization."""
-
-    PENDING = "pending"
-    IN_PROGRESS = "in_progress"
-    COMPLETED = "completed"
-    FAILED = "failed"
-
-
-class SandboxEvent(BaseModel):
-    """Event emitted from sandbox to control plane."""
-
-    type: str
-    sandbox_id: str
-    data: dict[str, Any] = {}
-    timestamp: float
-
-
-class HeartbeatEvent(SandboxEvent):
-    """Heartbeat event from sandbox."""
-
-    type: str = "heartbeat"
-    status: SandboxStatus
-
-
-class TokenEvent(SandboxEvent):
-    """Token streaming event from agent."""
-
-    type: str = "token"
-    content: str
-    message_id: str
-
-
-class ToolCallEvent(SandboxEvent):
-    """Tool call event from agent."""
-
-    type: str = "tool_call"
-    tool: str
-    args: dict[str, Any]
-    call_id: str
-
-
-class ToolResultEvent(SandboxEvent):
-    """Tool result event from agent."""
-
-    type: str = "tool_result"
-    call_id: str
-    result: str
-    error: str | None = None
-
-
-class GitSyncEvent(SandboxEvent):
-    """Git sync status event."""
-
-    type: str = "git_sync"
-    status: GitSyncStatus
-    sha: str | None = None
-    error: str | None = None
-
-
-class ExecutionCompleteEvent(SandboxEvent):
-    """Execution complete event."""
-
-    type: str = "execution_complete"
-    message_id: str
-    success: bool
-
-
-class ArtifactEvent(SandboxEvent):
-    """Artifact created event."""
-
-    type: str = "artifact"
-    artifact_type: str
-    url: str
-    metadata: dict[str, Any] = {}
 
 
 class GitUser(BaseModel):
@@ -166,7 +89,14 @@ class SessionConfig(BaseModel):
     repo_name: str | None = None
     branch: str | None = None
     base_sha: str | None = None
+    # The agent's own conversation id as the control plane last knew it, and
+    # its pre-rename spelling. Carried so the spawn payload round-trips; the
+    # runtime resumes from the session-id file the bridge persists, not from
+    # these fields.
+    agent_session_id: str | None = None
     opencode_session_id: str | None = None
+    # Which agent runs the session; absent means the built-in OpenCode harness.
+    harness: str = "opencode"
     provider: str = "anthropic"
     model: str = "claude-sonnet-4-6"
     mcp_servers: list[McpServerConfig] | None = None
@@ -177,3 +107,7 @@ class SessionConfig(BaseModel):
     # Shared working-branch name, computed control-plane-side
     # (generateBranchName) — the runtime never derives branch names itself.
     working_branch_name: str | None = None
+    # The control plane asks the bridge to connect before the repository boots
+    # and to report boot phases; absent (an older control plane) means the
+    # classic order, bridge last.
+    bridge_early_connect: bool = False

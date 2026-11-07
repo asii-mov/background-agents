@@ -5,6 +5,7 @@
  * enabling unit testing and future provider support.
  */
 
+import type { HarnessId } from "@open-inspect/shared/harnesses";
 import type { ImageBuildScopeKind } from "@open-inspect/shared/types/image-builds";
 import type { SandboxSettings } from "@open-inspect/shared/types/integrations";
 import type { CorrelationContext } from "../logger";
@@ -64,6 +65,23 @@ export interface SandboxProviderCapabilities {
   supportsPersistentResume?: boolean;
   /** Whether the provider can stop a sandbox explicitly via API */
   supportsExplicitStop?: boolean;
+  /** An ordinary checkpoint must enter the terminal shutdown flow first. */
+  snapshotRequiresShutdown?: boolean;
+}
+
+export type SandboxLifetime =
+  | {
+      kind: "finite";
+      expiresAtMs: number;
+      observedAtMs: number;
+      source: "provider" | "conservative_start_bound";
+    }
+  | { kind: "none"; observedAtMs: number }
+  | { kind: "unknown"; observedAtMs: number; reason: string };
+
+export interface PendingSandboxAllocation {
+  reference: string;
+  lifetime: Extract<SandboxLifetime, { kind: "finite" }>;
 }
 
 /**
@@ -97,14 +115,16 @@ export interface CreateSandboxConfig {
   controlPlaneUrl: string;
   /** Authentication token for sandbox */
   sandboxAuthToken: string;
+  /** Agent harness the session runs on */
+  harness: HarnessId;
   /** LLM provider (e.g., "anthropic") */
   provider: string;
   /** LLM model (e.g., "claude-sonnet-4-5") */
   model: string;
   /** User-provided environment variables (repo secrets) */
   userEnvVars?: Record<string, string>;
-  /** OpenCode session ID for resumption */
-  opencodeSessionId?: string;
+  /** The agent's own conversation id, for resumption */
+  agentSessionId?: string;
   /** Correlation context for downstream tracing */
   correlation?: CorrelationContext;
   /**
@@ -135,6 +155,10 @@ export interface CreateSandboxConfig {
   securityPipelines?: SecurityPipelineConfig[];
   /** Sandbox settings (tunnel ports, etc.) resolved from integration settings */
   sandboxSettings?: SandboxSettings;
+  /** Previous logical allocation identity, used by providers supporting ambiguous-create recovery. */
+  retireSandboxId?: string | null;
+  /** Generation reservation time used to bound pending provider launches. */
+  generationCreatedAtMs?: number;
   /**
    * Ordered member list for multi-repo sessions. Only set when the session
    * has more than one member — single-repo sessions keep the scalar
@@ -170,6 +194,7 @@ export interface CreateSandboxResult {
   providerObjectId?: string;
   /** Creation timestamp */
   createdAt: number;
+  lifetime: SandboxLifetime;
   /** Code-server tunnel URL (if available) */
   codeServerUrl?: string;
   /** Code-server password (if available) */
@@ -181,6 +206,15 @@ export interface CreateSandboxResult {
   /** Tunnel URLs for extra ports (port -> URL mapping) */
   tunnelUrls?: Record<string, string>;
 }
+
+export interface ResolveSandboxConfig {
+  sessionId: string;
+  sandboxId: string;
+  generationCreatedAtMs: number;
+  timeoutSeconds?: number;
+}
+
+export type ResolveSandboxResult = Omit<CreateSandboxResult, "createdAt">;
 
 /**
  * Configuration for restoring a sandbox from a snapshot.
@@ -200,6 +234,8 @@ export interface RestoreConfig {
   repoOwner: string | null;
   /** Repository name */
   repoName: string | null;
+  /** Agent harness the session runs on */
+  harness: HarnessId;
   /** LLM provider (e.g., "anthropic") */
   provider: string;
   /** LLM model (e.g., "claude-sonnet-4-5") */
@@ -223,6 +259,10 @@ export interface RestoreConfig {
   agentSlackNotifyEnabled?: boolean;
   /** Sandbox settings (tunnel ports, etc.) resolved from integration settings */
   sandboxSettings?: SandboxSettings;
+  /** Previous logical allocation identity, used by providers supporting ambiguous-create recovery. */
+  retireSandboxId?: string | null;
+  /** Generation reservation time used to bound pending provider launches. */
+  generationCreatedAtMs?: number;
   /** Multi-repo member list — see CreateSandboxConfig. */
   repositories?: SessionRepositoryInfo[];
 }
@@ -230,9 +270,7 @@ export interface RestoreConfig {
 /**
  * Result of restoring a sandbox from a snapshot.
  */
-export interface RestoreResult {
-  /** Whether the restore succeeded */
-  success: boolean;
+interface RestoreResultFields {
   /** Sandbox ID if successful */
   sandboxId?: string;
   /** Provider's internal object ID (e.g., Modal's object ID for snapshot API) */
@@ -251,6 +289,18 @@ export interface RestoreResult {
   tunnelUrls?: Record<string, string>;
 }
 
+export type RestoreResult =
+  | (RestoreResultFields & {
+      /** Whether the restore succeeded */
+      success: true;
+      lifetime: SandboxLifetime;
+    })
+  | (RestoreResultFields & {
+      /** Whether the restore succeeded */
+      success: false;
+      lifetime?: never;
+    });
+
 /**
  * Configuration for taking a sandbox snapshot.
  */
@@ -265,6 +315,8 @@ export interface SnapshotConfig {
   correlation?: CorrelationContext;
   /** Optional caller deadline for long-running provider artifact creation. */
   signal?: AbortSignal;
+  /** Absolute caller deadline shared by every nested provider operation. */
+  deadlineAtMs?: number;
 }
 
 /**
@@ -277,6 +329,10 @@ export interface SnapshotResult {
   imageId?: string;
   /** Error message if failed */
   error?: string;
+  /** True when snapshot creation itself stopped the source sandbox. */
+  sourceStopped?: boolean;
+  /** Immutable source ID to retire after committing the snapshot receipt. */
+  sourceObjectId?: string;
 }
 
 /**
@@ -304,9 +360,7 @@ export interface ResumeConfig {
 /**
  * Result of resuming a previously stopped sandbox.
  */
-export interface ResumeResult {
-  /** Whether the resume succeeded */
-  success: boolean;
+interface ResumeResultFields {
   /** Provider's internal object ID, if it changed during recovery */
   providerObjectId?: string;
   /** Error message if resume failed */
@@ -317,11 +371,25 @@ export interface ResumeResult {
   codeServerUrl?: string;
   /** Code-server password (if available) */
   codeServerPassword?: string;
+  /** ttyd proxy tunnel URL (if available) */
+  ttydUrl?: string;
   /** Complete browser-based VNC credential (if available) */
   vncAccess?: VncAccess;
   /** Tunnel URLs for extra ports (port -> URL mapping) */
   tunnelUrls?: Record<string, string>;
 }
+
+export type ResumeResult =
+  | (ResumeResultFields & {
+      /** Whether the resume succeeded */
+      success: true;
+      lifetime: SandboxLifetime;
+    })
+  | (ResumeResultFields & {
+      /** Whether the resume succeeded */
+      success: false;
+      lifetime?: never;
+    });
 
 /**
  * Configuration for explicitly stopping a sandbox.
@@ -333,10 +401,16 @@ export interface StopConfig {
   sessionId: string;
   /** Reason for the stop operation */
   reason: string;
+  /** Whether the provider-owned state must remain resumable or be destroyed. */
+  intent: "preserve" | "destroy";
   /** Correlation context for downstream tracing */
   correlation?: CorrelationContext;
   /** Optional caller deadline for provider cleanup. */
   signal?: AbortSignal;
+  /** Absolute caller deadline shared by every nested provider operation. */
+  deadlineAtMs?: number;
+  /** Reservation time of the generation being stopped, if known. */
+  generationCreatedAtMs?: number;
 }
 
 /**
@@ -347,6 +421,20 @@ export interface StopResult {
   success: boolean;
   /** Error message if stop failed */
   error?: string;
+}
+
+/** Combine caller cancellation with an absolute provider-operation deadline. */
+export function signalUntilDeadline(
+  deadlineAtMs: number | undefined,
+  signal?: AbortSignal
+): AbortSignal | undefined {
+  if (deadlineAtMs === undefined) return signal;
+  const remainingMs = deadlineAtMs - Date.now();
+  const deadlineSignal =
+    remainingMs <= 0
+      ? AbortSignal.abort(new DOMException("Provider operation deadline exceeded", "TimeoutError"))
+      : AbortSignal.timeout(remainingMs);
+  return signal ? AbortSignal.any([signal, deadlineSignal]) : deadlineSignal;
 }
 
 /**
@@ -435,6 +523,44 @@ export class SandboxProviderError extends Error {
   }
 }
 
+/** A rejected execution; a non-null handle remains a cleanup obligation. */
+export class SandboxLaunchRejectedError extends SandboxProviderError {
+  constructor(
+    message: string,
+    readonly providerObjectId: string | null,
+    cause?: Error
+  ) {
+    super(message, "permanent", cause);
+    this.name = "SandboxLaunchRejectedError";
+  }
+}
+
+/** The provider confirmed that the selected prebuilt artifact cannot be restored. */
+export class PrebuiltImageUnavailableError extends SandboxProviderError {
+  constructor(message: string, cause?: Error) {
+    super(message, "permanent", cause);
+    this.name = "PrebuiltImageUnavailableError";
+  }
+}
+
+/**
+ * A prebuilt image the provider could not confirm as usable right now: it is
+ * still being brought back from cold storage, or the provider could not be
+ * reached to say.
+ *
+ * Transient, and deliberately not a `PrebuiltImageUnavailableError`: only an
+ * answer about the artifact itself — that it is missing, or in a state it
+ * never leaves — may retire an image, so a slow activation or an unreachable
+ * API does not throw away a perfectly good prebuild. The image is not proven
+ * unusable, so it stays in rotation; this spawn fails transiently.
+ */
+export class PrebuiltImageActivationPendingError extends SandboxProviderError {
+  constructor(message: string, cause?: Error) {
+    super(message, "transient", cause);
+    this.name = "PrebuiltImageActivationPendingError";
+  }
+}
+
 /**
  * Sandbox provider interface.
  *
@@ -467,6 +593,20 @@ export interface SandboxProvider {
 
   /** Provider capabilities */
   readonly capabilities: SandboxProviderCapabilities;
+
+  /** Reference and lifetime to persist before launch; neither confirms startup succeeded. */
+  pendingSandboxAllocation?(
+    config: Pick<
+      CreateSandboxConfig,
+      "sessionId" | "sandboxId" | "generationCreatedAtMs" | "timeoutSeconds"
+    >
+  ): PendingSandboxAllocation | undefined;
+
+  /** Lookup only, for a VM launch whose response was lost. */
+  resolveSandbox?(config: ResolveSandboxConfig): Promise<ResolveSandboxResult>;
+
+  /** Whether a failed launch could still have created this generation. */
+  isUnknownStartupError?(error: unknown): boolean;
 
   /**
    * Create a new sandbox.
@@ -512,4 +652,15 @@ export interface SandboxProvider {
    * Only available if `capabilities.supportsExplicitStop` is true.
    */
   stopSandbox?(config: StopConfig): Promise<StopResult>;
+}
+
+/** Existing capability-based preserve-stop policy; resume support is checked separately at startup. */
+export function providerResumesAfterStop(
+  provider: Pick<SandboxProvider, "capabilities" | "stopSandbox">
+): boolean {
+  return (
+    !!provider.capabilities.supportsExplicitStop &&
+    !!provider.stopSandbox &&
+    !!provider.capabilities.supportsPersistentResume
+  );
 }

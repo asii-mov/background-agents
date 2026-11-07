@@ -1,0 +1,26 @@
+INSERT INTO roles (id,key,name,normalized_name,description,is_system) VALUES ('role_fork_catalog_editor',NULL,'Catalogue editor','catalogue editor','Member access plus managed catalogue editing',0);
+INSERT INTO role_permissions (role_id,permission_id) VALUES
+('role_fork_catalog_editor','analytics.read'),
+('role_fork_catalog_editor','automations.read'),
+('role_fork_catalog_editor','environments.read'),
+('role_fork_catalog_editor','image_builds.read'),
+('role_fork_catalog_editor','mcp_servers.read'),
+('role_fork_catalog_editor','repositories.read'),
+('role_fork_catalog_editor','sessions.read'),
+('role_fork_catalog_editor','skills.read'),
+('role_fork_catalog_editor','automations.create'),
+('role_fork_catalog_editor','automations.manage.own'),
+('role_fork_catalog_editor','automations.trigger.own'),
+('role_fork_catalog_editor','environments.use'),
+('role_fork_catalog_editor','provider_accounts.read'),
+('role_fork_catalog_editor','repositories.use'),
+('role_fork_catalog_editor','sessions.collaborate'),
+('role_fork_catalog_editor','sessions.create'),
+('role_fork_catalog_editor','sessions.delete'),
+('role_fork_catalog_editor','sessions.lifecycle'),
+('role_fork_catalog_editor','sessions.sandbox_access'),
+('role_fork_catalog_editor','skill_profiles.manage_own'),
+('role_fork_catalog_editor','memories.manage_own'),
+('role_fork_catalog_editor','skills.manage'),
+('role_fork_catalog_editor','mcp_servers.manage');
+UPDATE user_role_assignments SET role_id='role_fork_catalog_editor' WHERE user_id IN (SELECT id FROM users WHERE platform_role='editor') AND role_id='role_builtin_member';

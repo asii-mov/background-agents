@@ -63,6 +63,7 @@ describe("ProviderAccountAuthorizationStore", () => {
       id: "01".repeat(32),
       user_id: "user-1",
       provider: "openai",
+      authorization_kind: "device",
       operation: "create",
       provider_account_id: null,
       target_account_status: null,
@@ -95,6 +96,7 @@ describe("ProviderAccountAuthorizationStore", () => {
       id: raw.id,
       userId: "user-1",
       provider: "openai",
+      authorizationKind: "device",
       operation: "create",
       displayName: "Primary OpenAI",
       encryptedProviderData: "encrypted",
@@ -110,6 +112,61 @@ describe("ProviderAccountAuthorizationStore", () => {
     });
   });
 
+  it("returns an initiating authorization with nullable row fields", async () => {
+    const raw = {
+      id: "01".repeat(32),
+      user_id: "user-1",
+      provider: "openai",
+      authorization_kind: "authorization_code",
+      operation: "reconnect",
+      provider_account_id: "02".repeat(16),
+      target_account_status: "disabled",
+      target_account_lifecycle_version: 7,
+      display_name: null,
+      encrypted_provider_data: null,
+      provider_state_version: null,
+      interval_ms: 5_000,
+      next_poll_at: 100_000,
+      expires_at: 700_000,
+      state: "initiating",
+      processing_owner: null,
+      processing_started_at: null,
+      result_provider_account_id: null,
+      reconnected_existing: null,
+      created_at: 1,
+      updated_at: 1,
+      completed_at: null,
+    };
+    const { db } = database([], [raw]);
+
+    await expect(
+      new ProviderAccountAuthorizationStore(db).getOwned("user-1", "01".repeat(32))
+    ).resolves.toEqual({
+      id: raw.id,
+      userId: "user-1",
+      provider: "openai",
+      authorizationKind: "authorization_code",
+      operation: "reconnect",
+      providerAccountId: "02".repeat(16),
+      targetAccountStatus: "disabled",
+      targetAccountLifecycleVersion: 7,
+      intervalMs: 5_000,
+      nextPollAt: 100_000,
+      expiresAt: 700_000,
+      state: "initiating",
+      createdAt: 1,
+      updatedAt: 1,
+    });
+  });
+
+  it("rejects a partial persisted authorization row", async () => {
+    const { db } = database([], [{ id: "01".repeat(32), user_id: "user-1" }]);
+
+    await expect(
+      new ProviderAccountAuthorizationStore(db).getOwned("user-1", "01".repeat(32))
+    ).rejects.toThrow("Invalid provider authorization row");
+  });
+
   it("rejects a pending row whose state-specific provider data is missing", async () => {
     const { db } = database(
       [],
@@ -118,6 +175,7 @@ describe("ProviderAccountAuthorizationStore", () => {
           id: "01".repeat(32),
           user_id: "user-1",
           provider: "openai",
+          authorization_kind: "device",
           operation: "create",
           provider_account_id: null,
           target_account_status: null,

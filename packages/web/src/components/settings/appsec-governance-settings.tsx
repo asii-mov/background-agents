@@ -1,5 +1,12 @@
 "use client";
 
+import {
+  Select,
+  SelectTrigger,
+  SelectValue,
+  SelectContent,
+  SelectItem,
+} from "@/components/ui/select";
 import { useState } from "react";
 import useSWR from "swr";
 import { toast } from "sonner";
@@ -433,16 +440,18 @@ export function AppSecGovernanceSettings() {
             </div>
             <div>
               <Label className="mb-1.5">Criticality</Label>
-              <select
-                value={riskLevel}
-                onChange={(event) => setRiskLevel(event.target.value as RiskLevel)}
-                className="h-9 w-full rounded-sm border border-border bg-background px-3 text-sm"
-              >
-                <option value="low">Low</option>
-                <option value="medium">Medium</option>
-                <option value="high">High</option>
-                <option value="critical">Critical</option>
-              </select>
+              <Select value={riskLevel} onValueChange={(value) => setRiskLevel(value as RiskLevel)}>
+                <SelectTrigger className="h-9 w-full rounded-sm border border-border bg-background px-3 text-sm">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  {" "}
+                  <SelectItem value="low">Low</SelectItem>
+                  <SelectItem value="medium">Medium</SelectItem>
+                  <SelectItem value="high">High</SelectItem>
+                  <SelectItem value="critical">Critical</SelectItem>
+                </SelectContent>
+              </Select>
             </div>
             <div>
               <Label className="mb-1.5">Rationale</Label>
@@ -504,16 +513,23 @@ export function AppSecGovernanceSettings() {
                   </p>
                   <p className="truncate text-xs text-muted-foreground">{user.email || user.id}</p>
                 </div>
-                <select
-                  aria-label={`Role for ${user.displayName || user.email || user.id}`}
+                <Select
                   value={user.role}
-                  onChange={(event) => updateRole(user.id, event.target.value as PlatformRole)}
-                  className="h-8 rounded-sm border border-border bg-background px-2 text-xs"
+                  onValueChange={(value) => updateRole(user.id, value as PlatformRole)}
                 >
-                  <option value="member">Member</option>
-                  <option value="editor">Editor</option>
-                  <option value="admin">Admin</option>
-                </select>
+                  <SelectTrigger
+                    aria-label={`Role for ${user.displayName || user.email || user.id}`}
+                    className="h-8 rounded-sm border border-border bg-background px-2 text-xs"
+                  >
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {" "}
+                    <SelectItem value="member">Member</SelectItem>
+                    <SelectItem value="editor">Editor</SelectItem>
+                    <SelectItem value="admin">Admin</SelectItem>
+                  </SelectContent>
+                </Select>
               </div>
             ))}
           </div>

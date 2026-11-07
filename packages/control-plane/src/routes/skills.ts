@@ -1,3 +1,6 @@
+import { skillImportSnapshotMismatch } from "../skills/import-confirmation";
+import { parseBody } from "./body";
+import { Hono } from "hono";
 import {
   createSkillInputSchema,
   createSkillProfileInputSchema,
@@ -21,6 +24,10 @@ import {
   SkillProfileValidationError,
 } from "../db/skill-profiles";
 import { SkillConflictError, SkillStore, SkillValidationError } from "../db/skills";
+import {
+  evaluateEnvironmentAdmission,
+  ownedResourceAdmissionResponse,
+} from "../authorization/owned-resource-admission";
 import { EnvironmentStore } from "../db/environments";
 import { resolveManagedSkills, SkillResolutionError } from "../session/skill-resolution";
 import type { Env } from "../types";
@@ -30,19 +37,30 @@ import {
   buildValidatedSkillRevision,
   SkillRevisionValidationError,
 } from "../skills/content-addressing";
-import { fetchSkillImport, SkillImportError, type SkillImportResult } from "../skills/git-import";
-import { skillImportSnapshotMismatch } from "../skills/import-confirmation";
+import {
+  fetchSkillImport,
+  resolveSkillImportRepository,
+  SkillImportError,
+  type SkillImportResult,
+} from "../skills/git-import";
+import { admit, dispatch } from "../routing/admit";
+import type { ControlPlaneHonoEnv } from "../routing/hono-env";
+import { z } from "zod";
+import { parseQuery } from "./query";
 import {
   createRouteSourceControlProvider,
   error,
   json,
-  parsePattern,
   type RequestContext,
-  type Route,
   SCM_AGNOSTIC_HUMAN_USER_ROUTE,
   SCM_AGNOSTIC_USER_OR_SERVICE_ROUTE,
-  defineRoutes,
+  requirePermission,
+  resolveRepoOrError,
 } from "./shared";
+import {
+  authorizeWorkspaceRepositories,
+  type RepositoryAuthorizationTarget,
+} from "./workspace-repository-authorization";
 
 const log = createLogger("router:skills");
 
@@ -99,52 +117,45 @@ function canonicalUserId(ctx: RequestContext): string | null {
   return null;
 }
 
-async function parsedBody(request: Request): Promise<unknown | Response> {
-  try {
-    return await request.json();
-  } catch {
-    return error("Invalid JSON body", 400);
-  }
-}
-
-function resourceId(match: RegExpMatchArray): string | Response {
-  return match.groups?.id ?? error("Resource ID required", 400);
-}
+const skillListQuerySchema = z.object({
+  limit: z
+    .string()
+    .regex(/^[1-9]\d*$/, { error: "Invalid limit" })
+    .optional()
+    .transform((raw) => (raw === undefined ? SKILL_LIST_PAGE_SIZE : Number(raw)))
+    .refine((limit) => limit <= SKILL_LIST_PAGE_SIZE, { error: "Invalid limit" }),
+  cursor: z
+    .string()
+    .optional()
+    .transform((raw, context) => {
+      if (raw === undefined) return null;
+      const parsed = skillNameSchema.safeParse(raw);
+      if (!parsed.success) {
+        context.addIssue({ code: "custom", message: "Invalid cursor" });
+        return z.NEVER;
+      }
+      return parsed.data;
+    }),
+});
 
 async function handleListSkills(
   request: Request,
   _env: Env,
-  _match: RegExpMatchArray,
+  _params: object,
   ctx: RequestContext
 ): Promise<Response> {
-  const url = new URL(request.url);
-  const limitValue = url.searchParams.get("limit");
-  const cursorValue = url.searchParams.get("cursor");
-  if (url.searchParams.getAll("limit").length > 1 || url.searchParams.getAll("cursor").length > 1) {
-    return error("Invalid skill list query", 400);
-  }
-  const limit = limitValue === null ? SKILL_LIST_PAGE_SIZE : Number(limitValue);
-  if (!Number.isInteger(limit) || limit < 1 || limit > SKILL_LIST_PAGE_SIZE) {
-    return error("Invalid limit", 400);
-  }
-  const parsedCursor = cursorValue === null ? null : skillNameSchema.safeParse(cursorValue);
-  if (parsedCursor !== null && !parsedCursor.success) return error("Invalid cursor", 400);
-  return json(
-    await new SkillStore(ctx.db).list({
-      limit,
-      cursor: parsedCursor === null ? null : parsedCursor.data,
-    })
-  );
+  const query = parseQuery(request, skillListQuerySchema);
+  if (query instanceof Response) return query;
+  return json(await new SkillStore(ctx.db).list(query));
 }
 
 async function handleGetSkill(
   _request: Request,
   _env: Env,
-  match: RegExpMatchArray,
+  params: { id: string },
   ctx: RequestContext
 ): Promise<Response> {
-  const id = resourceId(match);
-  if (id instanceof Response) return id;
+  const { id } = params;
   const skill = await new SkillStore(ctx.db).get(id);
   return skill ? json({ skill }) : error("Skill not found", 404);
 }
@@ -152,19 +163,25 @@ async function handleGetSkill(
 async function handleCreateSkill(
   request: Request,
   env: Env,
-  _match: RegExpMatchArray,
+  _params: object,
   ctx: RequestContext
 ): Promise<Response> {
   const managed = rejectGitManagedWrite(env);
   if (managed) return managed;
   const userId = canonicalUserId(ctx);
   if (!userId) return error("Canonical user required", 403);
-  const body = await parsedBody(request);
-  if (body instanceof Response) return body;
-  const parsed = createSkillInputSchema.safeParse(body);
-  if (!parsed.success) return error("Invalid skill", 400);
+  const parsed = await parseBody(request, createSkillInputSchema, "Invalid skill");
+  if (parsed instanceof Response) return parsed;
+  const denied = await authorizeSkillRepositories(
+    env,
+    ctx,
+    parsed.assignments.flatMap((assignment) =>
+      assignment.type === "repository" ? [assignment.repository] : []
+    )
+  );
+  if (denied) return denied;
   try {
-    const skill = await new SkillStore(ctx.db).create(parsed.data, userId);
+    const skill = await new SkillStore(ctx.db).create(parsed, userId);
     audit(ctx, {
       action: "skill.created",
       skill_id: skill.id,
@@ -176,18 +193,59 @@ async function handleCreateSkill(
   }
 }
 
+async function authorizeSkillRepositories(
+  env: Env,
+  ctx: RequestContext,
+  repositories: readonly { repoOwner: string; repoName: string }[]
+): Promise<Response | null> {
+  if (repositories.length === 0) return null;
+  const resolved: RepositoryAuthorizationTarget[] = [];
+  const seen = new Set<string>();
+  for (const repository of repositories) {
+    const key = `${repository.repoOwner}/${repository.repoName}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    const access = await resolveRepoOrError(
+      env,
+      repository.repoOwner,
+      repository.repoName,
+      ctx,
+      log
+    );
+    resolved.push({ owner: access.repoOwner, name: access.repoName, repoId: access.repoId });
+  }
+  return authorizeWorkspaceRepositories(ctx, { repositories: resolved });
+}
+
+async function fetchAuthorizedSkillImport(
+  env: Env,
+  ctx: RequestContext,
+  source: SkillImportSourceInput,
+  name?: string | null
+): Promise<SkillImportResult | Response> {
+  const provider = createRouteSourceControlProvider(env);
+  const resolved = await resolveSkillImportRepository(provider, source);
+  const denied = await authorizeWorkspaceRepositories(ctx, {
+    repositories: [{ owner: resolved.repoOwner, name: resolved.repoName, repoId: resolved.repoId }],
+  });
+  if (denied) return denied;
+  return fetchSkillImport(provider, source, name, resolved);
+}
+
 async function handlePreviewSkill(
   request: Request,
   _env: Env,
-  _match: RegExpMatchArray,
+  _params: object,
   _ctx: RequestContext
 ): Promise<Response> {
-  const body = await parsedBody(request);
-  if (body instanceof Response) return body;
-  const parsed = createSkillInputSchema.pick({ name: true, content: true }).safeParse(body);
-  if (!parsed.success) return error("Invalid skill", 400);
+  const parsed = await parseBody(
+    request,
+    createSkillInputSchema.pick({ name: true, content: true }),
+    "Invalid skill"
+  );
+  if (parsed instanceof Response) return parsed;
   try {
-    const revision = await buildValidatedSkillRevision(parsed.data.name, parsed.data.content);
+    const revision = await buildValidatedSkillRevision(parsed.name, parsed.content);
     return json({
       skillMarkdown: revision.files.find((file) => file.path === "SKILL.md")?.content,
       revisionSha256: revision.revisionSha256,
@@ -247,19 +305,18 @@ function confirmSkillImportSnapshot(
 async function handlePreviewSkillImport(
   request: Request,
   env: Env,
-  _match: RegExpMatchArray,
+  _params: object,
   ctx: RequestContext
 ): Promise<Response> {
-  const body = await parsedBody(request);
-  if (body instanceof Response) return body;
-  const parsed = skillImportPreviewInputSchema.safeParse(body);
-  if (!parsed.success) return error("Invalid skill import source", 400);
+  const parsed = await parseBody(
+    request,
+    skillImportPreviewInputSchema,
+    "Invalid skill import source"
+  );
+  if (parsed instanceof Response) return parsed;
   try {
-    const result = await fetchSkillImport(
-      createRouteSourceControlProvider(env),
-      parsed.data.source,
-      parsed.data.name
-    );
+    const result = await fetchAuthorizedSkillImport(env, ctx, parsed.source, parsed.name);
+    if (result instanceof Response) return result;
     return json(await importPreviewResponse(ctx, result));
   } catch (e) {
     return skillImportWriteError(e);
@@ -269,27 +326,30 @@ async function handlePreviewSkillImport(
 async function handleImportSkill(
   request: Request,
   env: Env,
-  _match: RegExpMatchArray,
+  _params: object,
   ctx: RequestContext
 ): Promise<Response> {
   const managed = rejectGitManagedWrite(env);
   if (managed) return managed;
   const userId = canonicalUserId(ctx);
   if (!userId) return error("Canonical user required", 403);
-  const body = await parsedBody(request);
-  if (body instanceof Response) return body;
-  const parsed = importSkillInputSchema.safeParse(body);
-  if (!parsed.success) return error("Invalid skill import", 400);
+  const parsed = await parseBody(request, importSkillInputSchema, "Invalid skill import");
+  if (parsed instanceof Response) return parsed;
+  const denied = await authorizeSkillRepositories(
+    env,
+    ctx,
+    parsed.assignments.flatMap((assignment) =>
+      assignment.type === "repository" ? [assignment.repository] : []
+    )
+  );
+  if (denied) return denied;
   try {
-    const result = await fetchSkillImport(
-      createRouteSourceControlProvider(env),
-      parsed.data.source,
-      parsed.data.name
-    );
-    const stale = confirmSkillImportSnapshot(result, parsed.data);
+    const result = await fetchAuthorizedSkillImport(env, ctx, parsed.source, parsed.name);
+    if (result instanceof Response) return result;
+    const stale = confirmSkillImportSnapshot(result, parsed);
     if (stale) return stale;
     const skill = await new SkillStore(ctx.db).create(
-      { name: result.name, content: result.content, assignments: parsed.data.assignments },
+      { name: result.name, content: result.content, assignments: parsed.assignments },
       userId,
       result.source
     );
@@ -337,22 +397,24 @@ function recordedImportSource(
 async function handlePreviewSkillReimport(
   request: Request,
   env: Env,
-  match: RegExpMatchArray,
+  params: { id: string },
   ctx: RequestContext
 ): Promise<Response> {
-  const id = resourceId(match);
-  if (id instanceof Response) return id;
-  const body = await parsedBody(request);
-  if (body instanceof Response) return body;
-  const parsed = reimportSkillPreviewInputSchema.safeParse(body);
-  if (!parsed.success) return error("Invalid skill re-import", 400);
+  const { id } = params;
+  const parsed = await parseBody(
+    request,
+    reimportSkillPreviewInputSchema,
+    "Invalid skill re-import"
+  );
+  if (parsed instanceof Response) return parsed;
   const skill = await new SkillStore(ctx.db).get(id);
   if (!skill) return error("Skill not found", 404);
   try {
     const provider = createRouteSourceControlProvider(env);
-    const source = recordedImportSource(skill.source, parsed.data.ref, provider.name);
+    const source = recordedImportSource(skill.source, parsed.ref, provider.name);
     if (source instanceof Response) return source;
-    const result = await fetchSkillImport(provider, source, skill.name);
+    const result = await fetchAuthorizedSkillImport(env, ctx, source, skill.name);
+    if (result instanceof Response) return result;
     return json(await importPreviewResponse(ctx, result, skill.name));
   } catch (e) {
     return skillImportWriteError(e);
@@ -362,21 +424,18 @@ async function handlePreviewSkillReimport(
 async function handleReimportSkill(
   request: Request,
   env: Env,
-  match: RegExpMatchArray,
+  params: { id: string },
   ctx: RequestContext
 ): Promise<Response> {
   const managed = rejectGitManagedWrite(env);
   if (managed) return managed;
-  const id = resourceId(match);
-  if (id instanceof Response) return id;
+  const { id } = params;
   const userId = canonicalUserId(ctx);
   if (!userId) return error("Canonical user required", 403);
   const ifMatch = request.headers.get("If-Match")?.replace(/^"|"$/g, "");
   if (!ifMatch) return error("If-Match revision is required", 428);
-  const body = await parsedBody(request);
-  if (body instanceof Response) return body;
-  const parsed = reimportSkillInputSchema.safeParse(body);
-  if (!parsed.success) return error("Invalid skill re-import", 400);
+  const parsed = await parseBody(request, reimportSkillInputSchema, "Invalid skill re-import");
+  if (parsed instanceof Response) return parsed;
   const store = new SkillStore(ctx.db);
   const skill = await store.get(id);
   if (!skill) return error("Skill not found", 404);
@@ -385,10 +444,11 @@ async function handleReimportSkill(
   }
   try {
     const provider = createRouteSourceControlProvider(env);
-    const source = recordedImportSource(skill.source, parsed.data.ref, provider.name);
+    const source = recordedImportSource(skill.source, parsed.ref, provider.name);
     if (source instanceof Response) return source;
-    const result = await fetchSkillImport(provider, source, skill.name);
-    const stale = confirmSkillImportSnapshot(result, parsed.data);
+    const result = await fetchAuthorizedSkillImport(env, ctx, source, skill.name);
+    if (result instanceof Response) return result;
+    const stale = confirmSkillImportSnapshot(result, parsed);
     if (stale) return stale;
     const applied = await store.applyImportedRevision(
       id,
@@ -425,21 +485,18 @@ function sourceAuditFields(source: SkillImportResult["source"]) {
 async function handleSetSkillEnabled(
   request: Request,
   env: Env,
-  match: RegExpMatchArray,
+  params: { id: string },
   ctx: RequestContext
 ): Promise<Response> {
   const managed = rejectGitManagedWrite(env);
   if (managed) return managed;
-  const id = resourceId(match);
-  if (id instanceof Response) return id;
+  const { id } = params;
   const userId = canonicalUserId(ctx);
   if (!userId) return error("Canonical user required", 403);
-  const body = await parsedBody(request);
-  if (body instanceof Response) return body;
-  const parsed = setSkillEnabledInputSchema.safeParse(body);
-  if (!parsed.success) return error("Invalid skill update", 400);
+  const parsed = await parseBody(request, setSkillEnabledInputSchema, "Invalid skill update");
+  if (parsed instanceof Response) return parsed;
   try {
-    const skill = await new SkillStore(ctx.db).setEnabled(id, parsed.data, userId);
+    const skill = await new SkillStore(ctx.db).setEnabled(id, parsed, userId);
     if (skill) audit(ctx, { action: "skill.enabled_updated", skill_id: id });
     return skill ? json({ skill }) : error("Skill not found", 404);
   } catch (e) {
@@ -450,25 +507,34 @@ async function handleSetSkillEnabled(
 async function handleReplaceSkillContentAndAssignments(
   request: Request,
   env: Env,
-  match: RegExpMatchArray,
+  params: { id: string },
   ctx: RequestContext
 ): Promise<Response> {
   const managed = rejectGitManagedWrite(env);
   if (managed) return managed;
-  const id = resourceId(match);
-  if (id instanceof Response) return id;
+  const { id } = params;
   const userId = canonicalUserId(ctx);
   if (!userId) return error("Canonical user required", 403);
   const ifMatch = request.headers.get("If-Match")?.replace(/^"|"$/g, "");
   if (!ifMatch) return error("If-Match revision is required", 428);
-  const body = await parsedBody(request);
-  if (body instanceof Response) return body;
-  const parsed = replaceSkillContentAndAssignmentsInputSchema.safeParse(body);
-  if (!parsed.success) return error("Invalid skill edit", 400);
+  const parsed = await parseBody(
+    request,
+    replaceSkillContentAndAssignmentsInputSchema,
+    "Invalid skill edit"
+  );
+  if (parsed instanceof Response) return parsed;
+  const denied = await authorizeSkillRepositories(
+    env,
+    ctx,
+    parsed.assignments.flatMap((assignment) =>
+      assignment.type === "repository" ? [assignment.repository] : []
+    )
+  );
+  if (denied) return denied;
   try {
     const skill = await new SkillStore(ctx.db).replaceContentAndAssignments(
       id,
-      parsed.data,
+      parsed,
       userId,
       ifMatch
     );
@@ -487,13 +553,12 @@ async function handleReplaceSkillContentAndAssignments(
 async function handleDeleteSkill(
   _request: Request,
   env: Env,
-  match: RegExpMatchArray,
+  params: { id: string },
   ctx: RequestContext
 ): Promise<Response> {
   const managed = rejectGitManagedWrite(env);
   if (managed) return managed;
-  const id = resourceId(match);
-  if (id instanceof Response) return id;
+  const { id } = params;
   const userId = canonicalUserId(ctx);
   if (!userId) return error("Canonical user required", 403);
   const deleted = await new SkillStore(ctx.db).delete(id, userId);
@@ -504,7 +569,7 @@ async function handleDeleteSkill(
 async function handleListProfiles(
   _request: Request,
   _env: Env,
-  _match: RegExpMatchArray,
+  _params: object,
   ctx: RequestContext
 ): Promise<Response> {
   const userId = canonicalUserId(ctx);
@@ -515,20 +580,18 @@ async function handleListProfiles(
 async function handleCreateProfile(
   request: Request,
   _env: Env,
-  _match: RegExpMatchArray,
+  _params: object,
   ctx: RequestContext
 ): Promise<Response> {
   const userId = canonicalUserId(ctx);
   if (!userId) return error("Canonical user required", 403);
-  const body = await parsedBody(request);
-  if (body instanceof Response) return body;
-  const parsed = createSkillProfileInputSchema.safeParse(body);
-  if (!parsed.success) return error("Invalid skill profile", 400);
+  const parsed = await parseBody(request, createSkillProfileInputSchema, "Invalid skill profile");
+  if (parsed instanceof Response) return parsed;
   try {
     const profile = await new SkillProfileStore(ctx.db).create(
       userId,
-      parsed.data.name,
-      parsed.data.skillIds
+      parsed.name,
+      parsed.skillIds
     );
     const response = json({ profile }, 201);
     audit(ctx, { action: "profile.created", profile_id: profile.id });
@@ -541,19 +604,16 @@ async function handleCreateProfile(
 async function handleUpdateProfile(
   request: Request,
   _env: Env,
-  match: RegExpMatchArray,
+  params: { id: string },
   ctx: RequestContext
 ): Promise<Response> {
-  const id = resourceId(match);
-  if (id instanceof Response) return id;
+  const { id } = params;
   const userId = canonicalUserId(ctx);
   if (!userId) return error("Canonical user required", 403);
-  const body = await parsedBody(request);
-  if (body instanceof Response) return body;
-  const parsed = updateSkillProfileInputSchema.safeParse(body);
-  if (!parsed.success) return error("Invalid skill profile", 400);
+  const parsed = await parseBody(request, updateSkillProfileInputSchema, "Invalid skill profile");
+  if (parsed instanceof Response) return parsed;
   try {
-    const profile = await new SkillProfileStore(ctx.db).update(id, userId, parsed.data);
+    const profile = await new SkillProfileStore(ctx.db).update(id, userId, parsed);
     if (profile) audit(ctx, { action: "profile.updated", profile_id: id });
     return profile ? json({ profile }) : error("Skill profile not found", 404);
   } catch (e) {
@@ -564,11 +624,10 @@ async function handleUpdateProfile(
 async function handleDeleteProfile(
   _request: Request,
   _env: Env,
-  match: RegExpMatchArray,
+  params: { id: string },
   ctx: RequestContext
 ): Promise<Response> {
-  const id = resourceId(match);
-  if (id instanceof Response) return id;
+  const { id } = params;
   const userId = canonicalUserId(ctx);
   if (!userId) return error("Canonical user required", 403);
   const deleted = await new SkillProfileStore(ctx.db).delete(id, userId);
@@ -579,35 +638,36 @@ async function handleDeleteProfile(
 async function handleResolvePreview(
   request: Request,
   _env: Env,
-  _match: RegExpMatchArray,
+  _params: object,
   ctx: RequestContext
 ): Promise<Response> {
-  const body = await parsedBody(request);
-  if (body instanceof Response) return body;
-  const parsed = skillResolutionPreviewInputSchema.safeParse(body);
-  if (!parsed.success) return error("Invalid skill resolution target", 400);
+  const parsed = await parseBody(
+    request,
+    skillResolutionPreviewInputSchema,
+    "Invalid skill resolution target"
+  );
+  if (parsed instanceof Response) return parsed;
   let repositories =
-    parsed.data.repositories ??
-    (parsed.data.repoOwner && parsed.data.repoName
-      ? [{ repoOwner: parsed.data.repoOwner, repoName: parsed.data.repoName }]
+    parsed.repositories ??
+    (parsed.repoOwner && parsed.repoName
+      ? [{ repoOwner: parsed.repoOwner, repoName: parsed.repoName }]
       : []);
-  if (parsed.data.environmentId) {
+  if (parsed.environmentId) {
+    const admission = await evaluateEnvironmentAdmission(ctx, parsed.environmentId, "read");
+    if (admission.kind !== "allowed") return ownedResourceAdmissionResponse(admission);
     const environments = new EnvironmentStore(ctx.db);
-    if (!(await environments.getById(parsed.data.environmentId))) {
-      return error("Environment not found", 404);
-    }
-    repositories = (
-      await environments.getRepositoriesForEnvironment(parsed.data.environmentId)
-    ).map((repository) => ({
-      repoOwner: repository.repo_owner,
-      repoName: repository.repo_name,
-    }));
+    repositories = (await environments.getRepositoriesForEnvironment(parsed.environmentId)).map(
+      (repository) => ({
+        repoOwner: repository.repo_owner,
+        repoName: repository.repo_name,
+      })
+    );
   }
   try {
     const manifest = await resolveManagedSkills(
       ctx.db,
-      { repositories, environmentId: parsed.data.environmentId ?? null },
-      parsed.data.selection,
+      { repositories, environmentId: parsed.environmentId ?? null },
+      parsed.selection,
       canonicalUserId(ctx)
     );
     return json({
@@ -640,86 +700,53 @@ function profileWriteError(value: unknown): Response {
   throw value;
 }
 
-const skillReadRoutes = defineRoutes(SCM_AGNOSTIC_USER_OR_SERVICE_ROUTE, [
-  { method: "GET", pattern: parsePattern("/skills"), handler: handleListSkills },
-  {
-    method: "POST",
-    pattern: parsePattern("/skills/preview"),
-    handler: handlePreviewSkill,
-  },
-  {
-    method: "POST",
-    pattern: parsePattern("/skills/resolve-preview"),
-    handler: handleResolvePreview,
-  },
-  { method: "GET", pattern: parsePattern("/skills/:id"), handler: handleGetSkill },
-]);
+const SKILLS_READ = admit({
+  ...SCM_AGNOSTIC_USER_OR_SERVICE_ROUTE,
+  authorization: requirePermission("skills.read"),
+});
+const SKILLS_MANAGE = admit({
+  ...SCM_AGNOSTIC_HUMAN_USER_ROUTE,
+  authorization: requirePermission("skills.manage"),
+  requiredPermission: "catalog.write",
+});
+const PROFILES_MANAGE_OWN = admit({
+  ...SCM_AGNOSTIC_HUMAN_USER_ROUTE,
+  authorization: requirePermission("skill_profiles.manage_own"),
+});
+const PROFILES_READ_OWN = admit({
+  ...SCM_AGNOSTIC_HUMAN_USER_ROUTE,
+  authorization: requirePermission("skill_profiles.manage_own"),
+  cacheControl: "private, no-store",
+});
 
-const skillAdministrationRoutes = defineRoutes(SCM_AGNOSTIC_HUMAN_USER_ROUTE, [
-  {
-    method: "POST",
-    pattern: parsePattern("/skills"),
-    requiredPermission: "catalog.write",
-    handler: handleCreateSkill,
-  },
-  {
-    method: "POST",
-    pattern: parsePattern("/skills/import/preview"),
-    requiredPermission: "catalog.write",
-    handler: handlePreviewSkillImport,
-  },
-  {
-    method: "POST",
-    pattern: parsePattern("/skills/import"),
-    requiredPermission: "catalog.write",
-    handler: handleImportSkill,
-  },
-  {
-    method: "POST",
-    pattern: parsePattern("/skills/:id/reimport/preview"),
-    requiredPermission: "catalog.write",
-    handler: handlePreviewSkillReimport,
-  },
-  {
-    method: "POST",
-    pattern: parsePattern("/skills/:id/reimport"),
-    requiredPermission: "catalog.write",
-    handler: handleReimportSkill,
-  },
-  {
-    method: "PATCH",
-    pattern: parsePattern("/skills/:id"),
-    requiredPermission: "catalog.write",
-    handler: handleSetSkillEnabled,
-  },
-  {
-    method: "PUT",
-    pattern: parsePattern("/skills/:id"),
-    requiredPermission: "catalog.write",
-    handler: handleReplaceSkillContentAndAssignments,
-  },
-  {
-    method: "DELETE",
-    pattern: parsePattern("/skills/:id"),
-    requiredPermission: "catalog.write",
-    handler: handleDeleteSkill,
-  },
-  { method: "GET", pattern: parsePattern("/skill-profiles"), handler: handleListProfiles },
-  {
-    method: "POST",
-    pattern: parsePattern("/skill-profiles"),
-    handler: handleCreateProfile,
-  },
-  {
-    method: "PATCH",
-    pattern: parsePattern("/skill-profiles/:id"),
-    handler: handleUpdateProfile,
-  },
-  {
-    method: "DELETE",
-    pattern: parsePattern("/skill-profiles/:id"),
-    handler: handleDeleteProfile,
-  },
-]);
+export const skillRoutes = new Hono<ControlPlaneHonoEnv>();
 
-export const skillRoutes: Route[] = [...skillReadRoutes, ...skillAdministrationRoutes];
+// Read routes register ahead of administration so `/skills/preview` and
+// `/skills/resolve-preview` take precedence over the parameterized paths.
+skillRoutes.get("/skills", SKILLS_READ, (c) => dispatch(c, handleListSkills));
+skillRoutes.post("/skills/preview", SKILLS_READ, (c) => dispatch(c, handlePreviewSkill));
+skillRoutes.post("/skills/resolve-preview", SKILLS_READ, (c) => dispatch(c, handleResolvePreview));
+skillRoutes.get("/skills/:id", SKILLS_READ, (c) => dispatch(c, handleGetSkill));
+
+skillRoutes.post("/skills", SKILLS_MANAGE, (c) => dispatch(c, handleCreateSkill));
+skillRoutes.post("/skills/import/preview", SKILLS_MANAGE, (c) =>
+  dispatch(c, handlePreviewSkillImport)
+);
+skillRoutes.post("/skills/import", SKILLS_MANAGE, (c) => dispatch(c, handleImportSkill));
+skillRoutes.post("/skills/:id/reimport/preview", SKILLS_MANAGE, (c) =>
+  dispatch(c, handlePreviewSkillReimport)
+);
+skillRoutes.post("/skills/:id/reimport", SKILLS_MANAGE, (c) => dispatch(c, handleReimportSkill));
+skillRoutes.patch("/skills/:id", SKILLS_MANAGE, (c) => dispatch(c, handleSetSkillEnabled));
+skillRoutes.put("/skills/:id", SKILLS_MANAGE, (c) =>
+  dispatch(c, handleReplaceSkillContentAndAssignments)
+);
+skillRoutes.delete("/skills/:id", SKILLS_MANAGE, (c) => dispatch(c, handleDeleteSkill));
+skillRoutes.get("/skill-profiles", PROFILES_READ_OWN, (c) => dispatch(c, handleListProfiles));
+skillRoutes.post("/skill-profiles", PROFILES_MANAGE_OWN, (c) => dispatch(c, handleCreateProfile));
+skillRoutes.patch("/skill-profiles/:id", PROFILES_MANAGE_OWN, (c) =>
+  dispatch(c, handleUpdateProfile)
+);
+skillRoutes.delete("/skill-profiles/:id", PROFILES_MANAGE_OWN, (c) =>
+  dispatch(c, handleDeleteProfile)
+);

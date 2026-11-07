@@ -16,11 +16,13 @@ import {
   SourceControlProviderError,
   type SourceControlProvider,
   type SourceControlAuthContext,
+  type CredentialScope,
   type GitPushAuthContext,
   type GitPushSpec,
   type PullRequestSnapshot,
 } from "../source-control";
 import type { SessionMessenger } from "./messenger";
+import type { PromptingAuthResolution } from "./participant-service";
 import type { ArtifactRepository } from "./artifact-repository";
 import { listPrArtifactsForHead, type PrArtifactHeadMatch } from "./pr-artifacts";
 import {
@@ -38,7 +40,8 @@ import {
 import type { ArtifactRow, SessionRow } from "./types";
 
 /**
- * Inputs required to create a PR once caller identity/auth are already resolved.
+ * Inputs required to create a PR once caller identity is selected. User auth
+ * remains lazy until the final provider call.
  */
 export interface CreatePullRequestInput {
   title: string;
@@ -52,7 +55,7 @@ export interface CreatePullRequestInput {
   repoOwner: string;
   repoName: string;
   promptingUserId: string;
-  promptingAuth: SourceControlAuthContext | null;
+  resolvePromptingAuth: () => Promise<PromptingAuthResolution>;
   sessionUrl: string;
   /**
    * Whether to open the PR in draft mode. When configured, the SCM setting
@@ -151,6 +154,7 @@ export interface PullRequestServiceDeps {
   /** DO-instance-scoped in-flight claims — must outlive individual requests. */
   claims: PullRequestCreationClaims;
   sourceControlProvider: SourceControlProvider;
+  resolveCredentialScope: (sessionId: string, target: RepoIdentity) => Promise<CredentialScope>;
   log: Logger;
   generateId: () => string;
   pushBranchToRemote: (pushSpec: GitPushSpec) => Promise<PushBranchResult>;
@@ -158,10 +162,10 @@ export interface PullRequestServiceDeps {
   /** Display name used in the PR body footer (e.g. "Created with [name](url)"). */
   appName: string;
   /**
-   * D1 authority store for session PR records (design §4). Absent when the
-   * deployment has no D1 binding; the write is best-effort either way.
+   * D1 authority store for session PR records (design §4). The write is
+   * best-effort: an upsert failure still leaves the mirror updated.
    */
-  sessionPullRequests?: Pick<SessionPullRequestStore, "upsert">;
+  sessionPullRequests: Pick<SessionPullRequestStore, "upsert">;
   /** Resolves SCM policy for the pull request's target repository. */
   resolveScmSettings: (repo: RepoIdentity) => Promise<ScmSettings>;
 }
@@ -236,16 +240,10 @@ export class SessionPullRequestService {
       const draft = scmSettings.alwaysUseDraftMode === true || (input.draft ?? false);
 
       let pushAuth: GitPushAuthContext;
+      let credentialScope: CredentialScope;
       try {
-        pushAuth = await this.deps.sourceControlProvider.generatePushAuth({
-          repositories: [
-            {
-              owner: targetRepo.repoOwner,
-              name: targetRepo.repoName,
-              providerRepoId: memberRow?.repo_id ?? (isPrimary ? session.repo_id : null),
-            },
-          ],
-        });
+        credentialScope = await this.deps.resolveCredentialScope(sessionId, targetRepo);
+        pushAuth = await this.deps.sourceControlProvider.generatePushAuth(credentialScope);
         this.deps.log.info("Generated fresh push auth token");
       } catch (error) {
         this.deps.log.error("Failed to generate push auth", {
@@ -314,6 +312,7 @@ export class SessionPullRequestService {
         headMatches,
         targetRepo,
         sessionId,
+        credentialScope,
         {
           sanitizedHeadBranch,
           generatedHeadBranch,
@@ -380,9 +379,13 @@ export class SessionPullRequestService {
         };
       }
 
-      // Use user OAuth if available, otherwise fall back to GitHub App token
-      // (e.g. sessions triggered from Linear or other integrations without user GitHub OAuth)
-      const prAuth = input.promptingAuth ?? appAuth;
+      // Resolve user OAuth at the last possible moment so branch work cannot
+      // consume most of a short-lived token's remaining lifetime.
+      const authResolution = await input.resolvePromptingAuth();
+      if ("error" in authResolution) {
+        return { kind: "error", status: authResolution.status, error: authResolution.error };
+      }
+      const prAuth = authResolution.auth ?? appAuth;
 
       const fullBody =
         input.body + `\n\n---\n*Created with [${this.deps.appName}](${input.sessionUrl})*`;
@@ -484,10 +487,8 @@ export class SessionPullRequestService {
    * webhook or read-through repairs a missing record (design §5).
    */
   private async writeSessionPullRequestRecord(record: SessionPullRequestRecord): Promise<void> {
-    const store = this.deps.sessionPullRequests;
-    if (!store) return;
     try {
-      await store.upsert(record);
+      await this.deps.sessionPullRequests.upsert(record);
     } catch (error) {
       this.deps.log.error("Failed to write session pull request record", {
         artifact_id: record.artifactId,
@@ -512,6 +513,7 @@ export class SessionPullRequestService {
     matches: PrArtifactHeadMatch[],
     targetRepo: RepoIdentity,
     sessionId: string,
+    credentialScope: CredentialScope,
     head: {
       sanitizedHeadBranch: string;
       generatedHeadBranch: string;
@@ -549,12 +551,15 @@ export class SessionPullRequestService {
       // opening a duplicate is not.
       let live: PullRequestSnapshot | null = null;
       try {
-        live = await this.deps.sourceControlProvider.getPullRequest({
-          owner: targetRepo.repoOwner,
-          name: targetRepo.repoName,
-          number: candidate.prNumber,
-          repositoryExternalId: candidate.repositoryExternalId ?? undefined,
-        });
+        live = await this.deps.sourceControlProvider.getPullRequest(
+          {
+            owner: targetRepo.repoOwner,
+            name: targetRepo.repoName,
+            number: candidate.prNumber,
+            repositoryExternalId: candidate.repositoryExternalId ?? undefined,
+          },
+          credentialScope
+        );
       } catch (error) {
         this.deps.log.warn("Could not read live PR state; using the stored artifact's", {
           pr_number: candidate.prNumber,
@@ -630,7 +635,7 @@ export class SessionPullRequestService {
     const applied = await applyPullRequestSnapshot(
       {
         artifactRepository: this.deps.artifactRepository,
-        sessionPullRequests: this.deps.sessionPullRequests ?? null,
+        sessionPullRequests: this.deps.sessionPullRequests,
       },
       { artifactId: artifact.id, sessionId, artifactCreatedAt: artifact.created_at },
       live

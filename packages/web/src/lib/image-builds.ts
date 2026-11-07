@@ -11,11 +11,35 @@ import {
   type ImageBuildRecordView,
   type ImageBuildScopeKind,
   type ImageBuildStatus,
+  type RepositoryShaEntry,
 } from "@open-inspect/shared/types/image-builds";
 import { z } from "zod";
 
 /** SWR key for the unified image-build feed. */
 export const IMAGE_BUILDS_KEY = "/api/image-builds";
+
+/** Poll cadence for a build-row feed showing a build still in progress. */
+export const IMAGE_BUILD_POLL_INTERVAL_MS = 30_000;
+
+/**
+ * Background cadence for a loaded, all-terminal feed. Builds also start
+ * without any client action — the cron scheduler, and save hooks that run
+ * detached from the CRUD response that scheduled them — so a terminal feed
+ * keeps refreshing slowly to discover new builds.
+ */
+export const IMAGE_BUILD_IDLE_POLL_INTERVAL_MS = 120_000;
+
+/**
+ * SWR `refreshInterval` for build-row feeds: fast while a build is visibly in
+ * progress, slow discovery otherwise. Before the first response (or after an
+ * error) this returns 0 — SWR's own retry and revalidation own that phase.
+ */
+export function imageBuildPollInterval(images: ImageBuildRecordView[] | undefined): number {
+  if (!images) return 0;
+  return images.some((image) => image.status === "building")
+    ? IMAGE_BUILD_POLL_INTERVAL_MS
+    : IMAGE_BUILD_IDLE_POLL_INTERVAL_MS;
+}
 
 /** One prebuild-enabled scope as served by GET /api/image-builds. */
 export const imageBuildUnitViewSchema = z.object({
@@ -35,8 +59,28 @@ export const imageBuildEnabledRepoViewSchema = z.object({
 
 export type ImageBuildEnabledRepoView = z.infer<typeof imageBuildEnabledRepoViewSchema>;
 
+/**
+ * Whether the deployment will act on a prebuild toggle at all. A paused
+ * deployment keeps serving status and cleanup, so the controls stay readable
+ * — they just stop promising builds that would be refused.
+ */
+const imageBuildAdmissionSchema = z.object({
+  open: z.boolean(),
+  reason: z.string().optional(),
+});
+
+type ImageBuildAdmissionView = z.infer<typeof imageBuildAdmissionSchema>;
+
+/**
+ * What admission means when the control plane reports none: a control plane
+ * that predates the control admits everything.
+ */
+export const DEFAULT_IMAGE_BUILD_ADMISSION_OPEN = true;
+
 export const imageBuildsEnabledResponseSchema = z.object({
   units: z.array(imageBuildUnitViewSchema),
+  // Optional so a web build can run against a control plane that predates it.
+  admission: imageBuildAdmissionSchema.optional(),
 });
 
 export const imageBuildsEnabledReposResponseSchema = z.object({
@@ -56,6 +100,8 @@ export interface ImageBuildsFeed {
   units: ImageBuildUnitView[];
   enabledRepos: ImageBuildEnabledRepoView[];
   images: ImageBuildRecordView[];
+  /** Absent when the control plane does not report it; treated as open. */
+  admission?: ImageBuildAdmissionView;
 }
 
 /**
@@ -65,6 +111,21 @@ export interface ImageBuildsFeed {
  */
 export function excludeSupersededBuilds(images: ImageBuildRecordView[]): ImageBuildRecordView[] {
   return images.filter((image) => image.status !== "superseded");
+}
+
+/**
+ * Drop rows built on another provider.
+ *
+ * The status feed is cross-provider history: a deployment that switched
+ * providers keeps its old ready rows so their artifacts can still be
+ * reclaimed. Showing one as this deployment's prebuild would promise a boot
+ * that spawn selection — which matches on provider — will never perform.
+ */
+export function excludeOtherProviderBuilds(
+  images: ImageBuildRecordView[],
+  provider: string
+): ImageBuildRecordView[] {
+  return images.filter((image) => image.provider === provider);
 }
 
 /** Map key for one build scope in the folded status map. */
@@ -118,9 +179,9 @@ export function foldImageBuildStatusByScope(
   );
   const statusByScope = new Map<string, ImageBuildStatus>();
   for (const image of images) {
-    const key = imageBuildScopeKey(image.scope_kind, image.scope_id);
+    const key = imageBuildScopeKey(image.scopeKind, image.scopeId);
     const currentFingerprint = currentFingerprintByScope.get(key);
-    if (currentFingerprint !== undefined && image.repositories_fingerprint !== currentFingerprint) {
+    if (currentFingerprint !== undefined && image.repositoriesFingerprint !== currentFingerprint) {
       continue;
     }
     const current = statusByScope.get(key);
@@ -132,22 +193,10 @@ export function foldImageBuildStatusByScope(
 }
 
 /**
- * The primary repository's baseSha out of a build's provenance document
- * (`repository_shas`, the JSON-encoded RepositoryShaEntry[] column value).
+ * The primary repository's baseSha out of a build's decoded provenance.
  */
-export function parsePrimaryBuildSha(repositoryShas: string): string | null {
-  try {
-    const parsed: unknown = JSON.parse(repositoryShas);
-    if (!Array.isArray(parsed)) return null;
-    const primary: unknown = parsed[0];
-    if (primary && typeof primary === "object" && "baseSha" in primary) {
-      const sha = (primary as { baseSha?: unknown }).baseSha;
-      return typeof sha === "string" ? sha : null;
-    }
-    return null;
-  } catch {
-    return null;
-  }
+export function parsePrimaryBuildSha(repositoryShas: RepositoryShaEntry[] | null): string | null {
+  return repositoryShas?.[0]?.baseSha ?? null;
 }
 
 /** Formats the ready-details line shared by both image families. */

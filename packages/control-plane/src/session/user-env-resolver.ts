@@ -1,6 +1,6 @@
 /**
  * Resolves the user-defined environment a session's sandbox receives: decrypts
- * and folds global/repo/environment secrets, derives the managed-provider env
+ * and folds global/team/repo/environment secrets, derives the managed-provider env
  * from the session's provider auth modes, and answers whether a model's
  * provider has usable authentication in that environment. Legacy session rows
  * that predate `repo_id` resolve it through the injected `resolveRepoId`
@@ -11,6 +11,7 @@ import { SessionIndexStore } from "../db/session-index";
 import { GlobalSecretsStore } from "../db/global-secrets";
 import { RepoSecretsStore } from "../db/repo-secrets";
 import { EnvironmentSecretsStore } from "../db/environment-secrets";
+import { TeamSecretsStore } from "../db/team-secrets";
 import {
   auditSecretsMerge,
   mergeSecretSources,
@@ -20,10 +21,12 @@ import {
   getProviderAuthenticationError as resolveProviderAuthenticationError,
   prepareManagedProviderEnv,
 } from "../sandbox/managed-provider-env";
-import type {
-  SessionProviderAuthMode,
-  SubscriptionProviderId,
+import {
+  SUBSCRIPTION_PROVIDER_DISPLAY_METADATA,
+  type SessionProviderAuthMode,
+  type SubscriptionProviderId,
 } from "@open-inspect/shared/types/provider-accounts";
+import { ModelProviderAccountStore } from "../db/model-provider-accounts";
 import type { SqlDatabase } from "../db/sql-database";
 import type { Logger } from "../logger";
 import { resolvePublicSessionId } from "./public-session-id";
@@ -36,7 +39,7 @@ import type { SessionRow } from "./types";
  * Dependencies injected into UserEnvResolver.
  */
 export interface UserEnvResolverDeps {
-  db: SqlDatabase | null;
+  db: SqlDatabase;
   sessionCoreRepository: SessionCoreRepository;
   /**
    * Resolves (and persists) the session's primary repo id for legacy rows
@@ -55,10 +58,12 @@ export interface UserEnvResolverDeps {
 interface UserEnvContext {
   sandboxEnv: Record<string, string>;
   providerAuthModes: Record<SubscriptionProviderId, SessionProviderAuthMode>;
+  /** Bound account per provider in provider_account mode. */
+  providerAccountIds: Partial<Record<SubscriptionProviderId, string>>;
 }
 
 export class UserEnvResolver {
-  private readonly db: SqlDatabase | null;
+  private readonly db: SqlDatabase;
   private readonly sessionCoreRepository: SessionCoreRepository;
   private readonly resolveRepoId: (session: SessionRow) => Promise<number>;
   private readonly durableObjectId: string;
@@ -93,6 +98,8 @@ export class UserEnvResolver {
   async getProviderAuthenticationError(model: string): Promise<string | null> {
     const context = await this.loadUserEnvContext();
     if (!context) return null;
+    const accountIssue = await this.checkBoundAccount(model, context);
+    if (accountIssue) return accountIssue;
     const issue = resolveProviderAuthenticationError(
       model,
       context.sandboxEnv,
@@ -107,6 +114,33 @@ export class UserEnvResolver {
     return issue.message;
   }
 
+  /**
+   * Pre-spawn check: a session bound to a connected account that has since
+   * been disabled, archived, or fenced fails the prompt in the queue, before
+   * a sandbox is spawned into a credential denial.
+   */
+  private async checkBoundAccount(model: string, context: UserEnvContext): Promise<string | null> {
+    const provider = model.split("/", 1)[0] as SubscriptionProviderId;
+    const accountId = context.providerAccountIds[provider];
+    if (!accountId || context.providerAuthModes[provider] !== "provider_account") return null;
+    const account = await new ModelProviderAccountStore(this.db).getById(accountId);
+    const subscription = SUBSCRIPTION_PROVIDER_DISPLAY_METADATA[provider].subscriptionName;
+    if (!account || account.archivedAt !== null) {
+      return `The connected ${subscription} account for this session was removed. Start a new session with another account or an API key.`;
+    }
+    if (account.status !== "active") {
+      const state = account.status === "disabled" ? "disabled" : "needs to be reconnected";
+      this.log.error("provider_auth.account_unusable", {
+        event: "provider_auth.account_unusable",
+        provider,
+        provider_account_id: accountId,
+        status: account.status,
+      });
+      return `The connected ${subscription} account for this session ${state}. Reconnect it in Settings, then start a new session.`;
+    }
+    return null;
+  }
+
   private async loadUserEnvContext(): Promise<UserEnvContext | null> {
     const session = this.sessionCoreRepository.getSession();
     if (!session) {
@@ -115,18 +149,33 @@ export class UserEnvResolver {
     }
 
     const db = this.db;
-    if (!db) throw new Error("D1 is required to load session provider auth");
-    const providerAuth = await new SessionIndexStore(db).getCompleteProviderAuth(
-      resolvePublicSessionId(session, this.durableObjectId)
-    );
+    const sessionId = resolvePublicSessionId(session, this.durableObjectId);
+    const indexStore = new SessionIndexStore(db);
+    // Team ownership can change without changing the DO's launch snapshot.
+    const indexedSession = await indexStore.get(sessionId);
+    if (!indexedSession) throw new Error("Session index row not found");
+    const providerAuth = await indexStore.getCompleteProviderAuth(sessionId);
     const providerAuthModes = Object.fromEntries(
       providerAuth.map(({ provider, authMode }) => [provider, authMode])
     ) as Record<SubscriptionProviderId, SessionProviderAuthMode>;
+    const providerAccountIds = Object.fromEntries(
+      providerAuth.flatMap((auth) =>
+        "providerAccountId" in auth && auth.providerAccountId
+          ? [[auth.provider, auth.providerAccountId]]
+          : []
+      )
+    ) as Partial<Record<SubscriptionProviderId, string>>;
 
     // Fail hard on secret loading — sandboxes must not silently lose secrets
     const encryptionKey = this.repoSecretsEncryptionKey;
     const globalStore = new GlobalSecretsStore(db, encryptionKey);
     const globalSecrets = await globalStore.getDecryptedSecrets();
+    const teamSecrets =
+      indexedSession.ownerTeamId === null
+        ? {}
+        : await new TeamSecretsStore(db, encryptionKey).getDecryptedSecrets(
+            indexedSession.ownerTeamId
+          );
 
     const repoStore = new RepoSecretsStore(db, encryptionKey);
     const environmentSecretsStore = new EnvironmentSecretsStore(db, encryptionKey);
@@ -134,6 +183,7 @@ export class UserEnvResolver {
     const sources = await buildSessionTargetSecretSources({
       environmentId: session.environment_id,
       globalSecrets,
+      teamSecrets,
       members,
       loadMemberSecrets: (member) => this.loadMemberRepoSecrets(session, member, repoStore),
       loadEnvironmentSecrets: (environmentId) =>
@@ -159,20 +209,21 @@ export class UserEnvResolver {
     }
 
     const primary = members.find((member) => member.isPrimary);
-    const managedSources = session.environment_id
-      ? sources
-      : sources.filter(
-          (source) =>
-            source.label === "global" ||
-            (primary && source.label === `${primary.repoOwner}/${primary.repoName}`)
-        );
+    // Legacy OAuth brokers can read only global and target scopes, not team secrets.
+    const managedSources = sources.filter(
+      (source) =>
+        source.label === "global" ||
+        (session.environment_id
+          ? source.label === "environment"
+          : primary && source.label === `${primary.repoOwner}/${primary.repoName}`)
+    );
     const managedSecrets = mergeSecretSources(managedSources).merged;
     const sandboxEnv = prepareManagedProviderEnv({
       exposedSecrets: merge.merged,
       brokerSecrets: managedSecrets,
       providerAuthModes,
     });
-    return { sandboxEnv, providerAuthModes };
+    return { sandboxEnv, providerAuthModes, providerAccountIds };
   }
 
   /**

@@ -32,8 +32,7 @@ type AccessConfiguration =
   | AccessRejection;
 
 let cachedJwks:
-  | { readonly issuer: string; readonly keys: ReturnType<typeof createRemoteJWKSet> }
-  | undefined;
+  { readonly issuer: string; readonly keys: ReturnType<typeof createRemoteJWKSet> } | undefined;
 
 function parseConfiguration(environment: AccessEnvironment, hostname: string): AccessConfiguration {
   if (environment.AUTH_DEV_BYPASS === "1") {

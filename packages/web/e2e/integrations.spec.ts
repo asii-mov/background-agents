@@ -12,7 +12,7 @@ test("integrations.open-slack-configuration", async ({ page, api }) => {
   await expect(page.getByRole("switch", { name: "Enable agent notifications" })).not.toBeChecked();
   await expect(page.getByRole("radio", { name: "Allow" })).toBeChecked();
   await expect(page.getByText(/No repository overrides yet/)).toBeVisible();
-  await expect(page.getByRole("link", { name: "Back to integrations" })).toBeVisible();
+  await expect(page.getByRole("link", { name: "Integrations", exact: true })).toBeVisible();
   expect(api.requests).toEqual(
     expect.arrayContaining([
       expect.objectContaining({ method: "GET", path: "/api/integration-settings/slack" }),

@@ -9,6 +9,8 @@ import { SessionIndexStore } from "../../src/db/session-index";
 import { cleanD1Tables } from "./cleanup";
 import { initSession, queryDO, serviceFetch } from "./helpers";
 
+const internal = { kind: "internal", reason: "session repositories integration tests" } as const;
+
 type MemberRow = {
   position: number;
   repo_owner: string;
@@ -95,6 +97,8 @@ describe("D1 session index repositories", () => {
     const now = Date.now();
     return {
       id,
+      ownerTeamId: null,
+      visibility: "workspace" as const,
       title: null,
       repoOwner: repositories?.[0]?.repoOwner ?? "acme",
       repoName: repositories?.[0]?.repoName ?? "web-app",
@@ -124,7 +128,7 @@ describe("D1 session index repositories", () => {
       ])
     );
 
-    const { sessions } = await store.list();
+    const { sessions } = await store.list({ readScope: internal, mode: "on" });
     expect(sessions).toHaveLength(1);
     expect(sessions[0].repositories).toEqual([
       { repoOwner: "acme", repoName: "frontend", repoId: 1, baseBranch: "main" },
@@ -136,40 +140,9 @@ describe("D1 session index repositories", () => {
     const store = new SessionIndexStore(env.DB);
     await store.create(makeEntry("scalar-1"));
 
-    const { sessions } = await store.list();
+    const { sessions } = await store.list({ readScope: internal, mode: "on" });
     expect(sessions).toHaveLength(1);
     expect(sessions[0].repositories).toBeUndefined();
-  });
-
-  it("list repo filters match secondary members", async () => {
-    const store = new SessionIndexStore(env.DB);
-    await store.create(
-      makeEntry("multi-filter", [
-        { repoOwner: "acme", repoName: "frontend", repoId: 1, baseBranch: "main" },
-        { repoOwner: "acme", repoName: "backend", repoId: 2, baseBranch: "main" },
-      ])
-    );
-    await store.create(
-      makeEntry("other-filter", [
-        { repoOwner: "acme", repoName: "unrelated", repoId: 3, baseBranch: "main" },
-      ])
-    );
-
-    const bySecondary = await store.list({ repoOwner: "acme", repoName: "backend" });
-    expect(bySecondary.sessions.map((s) => s.id)).toEqual(["multi-filter"]);
-
-    const byPrimary = await store.list({ repoOwner: "acme", repoName: "frontend" });
-    expect(byPrimary.sessions.map((s) => s.id)).toEqual(["multi-filter"]);
-  });
-
-  it("list repo filters fall back to scalars for pre-feature sessions", async () => {
-    const store = new SessionIndexStore(env.DB);
-    // No repositories list — simulates a session created before the
-    // membership table existed (scalar columns only).
-    await store.create(makeEntry("legacy-filter"));
-
-    const result = await store.list({ repoOwner: "acme", repoName: "web-app" });
-    expect(result.sessions.map((s) => s.id)).toEqual(["legacy-filter"]);
   });
 
   it("deletes member rows together with the session", async () => {
