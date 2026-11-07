@@ -1104,6 +1104,72 @@ export const openInspectFeatureDirectory = {
           },
         },
         {
+          id: "settings.apps",
+          title: "Browse the apps directory and manage only your own apps as a member",
+          settingsTab: "apps",
+          sources: {
+            ui: [
+              "packages/web/src/components/settings/apps-settings.tsx",
+              "packages/web/src/components/settings/settings-registry.ts",
+            ],
+            bff: [
+              "packages/web/src/app/api/apps/route.ts",
+              "packages/web/src/app/api/apps/[name]/route.ts",
+              "packages/web/src/app/api/apps/[name]/takedown/route.ts",
+              "packages/web/src/app/api/apps/[name]/release-hold/route.ts",
+            ],
+            backend: ["packages/control-plane/src/routes/apps.ts"],
+          },
+          coverage: {
+            kind: "browser-covered",
+            test: {
+              file: "packages/web/e2e/settings-apps.spec.ts",
+              title: "shows a member their own apps with actions and colleagues' apps read-only",
+            },
+            proofs: [
+              "packages/web/src/components/settings/apps-settings.test.tsx",
+              "packages/web/src/components/settings/settings-registry.test.ts",
+              "packages/web/src/app/api/apps/routes.test.ts",
+              "packages/control-plane/test/integration/apps.test.ts",
+            ],
+          },
+        },
+        {
+          id: "settings.apps-admin-data",
+          title:
+            "Take down and release apps, approve schema changes, set secrets and restore app data",
+          sources: {
+            ui: ["packages/web/src/components/settings/apps-settings.tsx"],
+            bff: [
+              "packages/web/src/app/api/apps/[name]/data/route.ts",
+              "packages/web/src/app/api/apps/[name]/data/operations/route.ts",
+              "packages/web/src/app/api/apps/[name]/data/secrets/route.ts",
+              "packages/web/src/app/api/apps/[name]/data/secrets/[key]/route.ts",
+              "packages/web/src/app/api/apps/[name]/data/migrations/approve/route.ts",
+              "packages/web/src/app/api/apps/[name]/data/restore/route.ts",
+              "packages/web/src/app/api/apps/[name]/data/classification/route.ts",
+            ],
+            backend: [
+              "packages/control-plane/src/routes/app-data.ts",
+              "packages/control-plane/src/app-data/service.ts",
+            ],
+          },
+          coverage: {
+            kind: "browser-covered",
+            test: {
+              file: "packages/web/e2e/settings-apps.spec.ts",
+              title:
+                "lets an administrator take down, release, approve, set a secret and restore app data",
+            },
+            proofs: [
+              "packages/web/src/components/settings/apps-settings.test.tsx",
+              "packages/web/src/app/api/apps/routes.test.ts",
+              "packages/control-plane/test/integration/app-data.test.ts",
+              "packages/control-plane/src/app-data/service.test.ts",
+            ],
+          },
+        },
+        {
           id: "settings.appsec",
           title:
             "Role assignment, pipeline creation, and repository criticality for administrators",

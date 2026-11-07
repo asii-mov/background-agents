@@ -5,6 +5,7 @@ import {
   DataControlsIcon,
   FolderIcon,
   GitPrIcon,
+  GlobeIcon,
   IntegrationsIcon,
   KeyboardIcon,
   KeyIcon,
@@ -194,6 +195,15 @@ export const SETTINGS_GROUPS = [
         panel: lazyPanel(() =>
           import("./environments-settings").then(({ EnvironmentsSettings }) => EnvironmentsSettings)
         ),
+      },
+      {
+        id: "apps",
+        label: "Apps",
+        description: "Internal apps agents published, their status and data",
+        keywords: "deploy hosting takedown release data secrets database restore migrations",
+        icon: GlobeIcon,
+        visibility: anyOf("apps.read"),
+        panel: lazyPanel(() => import("./apps-settings").then(({ AppsSettings }) => AppsSettings)),
       },
       {
         id: "secrets",

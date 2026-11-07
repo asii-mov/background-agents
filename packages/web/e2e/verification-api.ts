@@ -9,6 +9,7 @@ import {
   stackRollup,
   type StackPolicyState,
 } from "./verification-stack-policy";
+import { appsRoute, appsState, type AppsVerificationState } from "./verification-apps";
 
 type PlatformRole = "member" | "editor" | "admin";
 type NetworkPolicy =
@@ -41,9 +42,11 @@ export interface VerificationApiState {
   automation: VerificationAutomationState;
   stackPolicy: StackPolicyState;
   sessionSkills: Array<Record<string, unknown>>;
+  apps: AppsVerificationState;
 }
 
 const userId = "0123456789abcdef0123456789abcdef";
+const staffUserId = "fedcba9876543210fedcba9876543210";
 const commitSha = "49f948faa9258a0c61caceaf225e179651397431";
 const sourceSha256 = "4a".repeat(32);
 const revisionSha256 = "7b".repeat(32);
@@ -712,6 +715,14 @@ async function handleApi(route: Route, state: VerificationApiState): Promise<voi
     await json(route, { error: "Not found" }, 404);
     return;
   }
+  const appsResponse = appsRoute(state.apps, url.pathname, method, body, {
+    userId,
+    manageAny: state.role === "admin",
+  });
+  if (appsResponse) {
+    await json(route, appsResponse.body, appsResponse.status);
+    return;
+  }
   if (method === "GET" && url.pathname === "/api/security-pipelines") {
     await json(route, state.pipelines);
     return;
@@ -799,6 +810,10 @@ export async function installVerificationApi(page: Page): Promise<VerificationAp
     automation: { triggered: false },
     stackPolicy: { webFrontendEnforcement: "advise", webFrontendRevision: 1 },
     sessionSkills: [],
+    apps: appsState(
+      { userId, displayName: "Verifier Admin" },
+      { userId: staffUserId, displayName: "Staff Engineer" }
+    ),
   };
   await page.route("**/api/**", (route) => handleApi(route, state));
   return state;

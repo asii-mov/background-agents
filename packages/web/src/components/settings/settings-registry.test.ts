@@ -37,3 +37,21 @@ describe("governance settings visibility", () => {
     expect(resolveSettingsCategory("appsec", true, grantsOf("administrator"))).toBe("appsec");
   });
 });
+
+describe("apps settings visibility", () => {
+  it("shows Apps to members and administrators but not viewers", () => {
+    expect(visibleIds(grantsOf("member"))).toContain("apps");
+    expect(visibleIds(grantsOf("administrator"))).toContain("apps");
+    expect(visibleIds(grantsOf("viewer"))).not.toContain("apps");
+  });
+
+  it("needs only apps.read to open the Apps tab", () => {
+    expect(visibleIds((permission) => permission === "apps.read")).toEqual([
+      "appearance",
+      "keyboard-shortcuts",
+      "apps",
+    ]);
+    expect(resolveSettingsCategory("apps", true, grantsOf("viewer"))).not.toBe("apps");
+    expect(resolveSettingsCategory("apps", true, grantsOf("member"))).toBe("apps");
+  });
+});
