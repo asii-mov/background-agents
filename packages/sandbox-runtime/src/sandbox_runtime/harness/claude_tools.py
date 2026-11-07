@@ -2,7 +2,7 @@
 
 These are the same tools OpenCode gets as ``.opencode/tool/*.js`` plugins,
 ported over the same control-plane side channels (``/sessions/:id/children``,
-``/pr``, ``/slack-notify``, ``/media``, ``/sandbox-memory``). They run
+``/pr``, ``/slack-notify``, ``/media``, ``/sandbox-memory``, ``/apps``). They run
 inside the bridge process, so they see the bridge's environment rather than
 the child's clean one, and no credential has to reach the ``claude`` process
 for them to work.
@@ -12,9 +12,10 @@ from __future__ import annotations
 
 import json
 import mimetypes
+import os
 import subprocess
-from collections.abc import Mapping
-from dataclasses import dataclass
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final
@@ -22,6 +23,7 @@ from urllib.parse import quote, urlencode
 
 import httpx
 
+from ..app_deploy import APP_DEPLOY_CONTRACT, APP_DEPLOY_ENABLED_ENV, deploy_app, project_root
 from ..memory_contract import MEMORY_TOOL_SPECS
 from ..repo_config import load_repo_manifest
 from .memory_tools import MemoryTools
@@ -85,6 +87,9 @@ class ToolServerConfig:
     repo_manifest_path: Path
     has_repository: bool
     slack_notify_enabled: bool
+    app_deploy_enabled: bool = field(
+        default_factory=lambda: os.environ.get(APP_DEPLOY_ENABLED_ENV, "").lower() == "true"
+    )
 
 
 class ControlPlaneToolClient:
@@ -120,7 +125,7 @@ class ControlPlaneToolClient:
         path: str,
         *,
         json_body: Any | None = None,
-        files: Mapping[str, Any] | None = None,
+        files: Mapping[str, Any] | Sequence[tuple[str, Any]] | None = None,
         data: Mapping[str, Any] | None = None,
         timeout_seconds: float = TOOL_REQUEST_TIMEOUT_SECONDS,
     ) -> httpx.Response:
@@ -608,6 +613,14 @@ class OpenInspectTools:
         final_reason = reason if reason in _SLACK_REASON_GUIDANCE else fallback
         return text_result(_slack_failure(final_reason, message, retry_after))
 
+    # --- apps ---------------------------------------------------------------
+
+    async def deploy_app(self, args: Mapping[str, Any]) -> dict[str, Any]:
+        envelope = await deploy_app(
+            self.client, args, root=project_root(self.config.repo_manifest_path)
+        )
+        return text_result(json.dumps(envelope))
+
     # --- media --------------------------------------------------------------
 
     async def upload_media(self, args: Mapping[str, Any]) -> dict[str, Any]:
@@ -863,6 +876,13 @@ def build_tools(client: ControlPlaneToolClient) -> list[Any]:
                     "required": ["channel", "text"],
                 },
             )(handlers.slack_notify)
+        )
+    if config.app_deploy_enabled:
+        tool_spec = APP_DEPLOY_CONTRACT["tool"]
+        tools.append(
+            tool(tool_spec["name"], tool_spec["description"], tool_spec["inputSchema"])(
+                handlers.deploy_app
+            )
         )
     tools.append(
         tool(

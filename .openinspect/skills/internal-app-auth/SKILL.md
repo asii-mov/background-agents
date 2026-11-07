@@ -1,167 +1,168 @@
 ---
 name: internal-app-auth
 description:
-  Enforce centralized Cloudflare Access authentication for company internal web apps. Use when
-  creating or changing an internal app, adding identity or access control, implementing routes or
-  middleware, reviewing authentication code, or preparing an internal app for deployment.
+  Keep sign-in and identity for company internal web apps on the platform's centralized Cloudflare
+  Access. Use when creating or changing an internal app, adding identity, ownership, or access
+  control, storing per-user data, implementing routes or middleware, reviewing authentication code,
+  or deploying an internal app.
 ---
 
 # Centralize internal app authentication
 
-Cloudflare Access owns workforce sign-in and decides who may reach an internal app. Do not add a
-second authentication system inside the app.
+Company sign-in happens before a request reaches the app. Do not add a second authentication system
+inside the app. The app owns only the authorization that sign-in cannot express, such as who may
+edit a record or approve a request.
 
-The app still has two security duties. It must verify the Cloudflare Access application token, and
-it must enforce any record-level or action-level authorization that Access cannot express.
+The person asking for the app is often not technical. Never ask them to configure Cloudflare, Access
+applications, audiences, policies, DNS, tokens, or Worker settings. When something needs an
+administrator, say so in one plain sentence and keep the app working without it.
 
-## Follow this workflow
+## Apps published with `deploy-app`
 
-1. Confirm that the target is a company internal app. Stop and report that this skill does not apply
-   to a customer-facing identity system.
-2. Classify each caller as a human or an automated service. Do not treat a service identity as a
-   human user.
-3. Search the repository and the `approved-components` catalog for the company's shared Cloudflare
-   Access verifier. Use it when available and record its adoption for the target repository.
-4. Before writing a verifier, read
-   [the Cloudflare Access reference](references/cloudflare-access.md).
-5. Put verification in one boundary middleware or request adapter. Protect routes by default and
-   allow-list any exceptions.
-6. Keep missing configuration, missing tokens, invalid tokens, and identity lookup failures closed.
-7. Report the Cloudflare Access and origin-network configuration that a platform owner must apply.
+Apps published with the `deploy-app` tool run behind a platform guard. For every request, static
+files included, the guard checks the visitor's Cloudflare Access token for this app, removes any
+identity headers the visitor sent, and sets two headers before the app code runs:
 
-If no approved verifier exists, report that gap to AppSec. Do not hide a new one-off verifier behind
-an unrelated utility name. Add a maintained JWT and remote-JWKS library as an explicit dependency.
-If registry access is unavailable, still declare the dependency and implement the verifier against
-the maintained library API. Keep startup fail-closed when the dependency cannot load, and report the
-verification that you could not run. Do not replace the library with handwritten JWT parsing, JWKS
-caching, or cryptography.
+| Header                     | Value                         | Use                                   |
+| -------------------------- | ----------------------------- | ------------------------------------- |
+| `x-openinspect-user-sub`   | The verified, stable user ID  | Key owners, assignees, and audit rows |
+| `x-openinspect-user-email` | The verified email at sign-in | Display and audit text; it can change |
 
-## Keep ownership at the right layer
+Follow these rules in app code:
 
-- The identity provider owns workforce identities, credentials, MFA, group membership, and
-  offboarding.
-- Cloudflare Access owns app-level admission policy.
-- The app verifies the signed application token at its request boundary.
-- The app owns authorization for records and actions inside the app.
+- Read identity only from those two headers.
+- Never read identity from `Cf-Access-Authenticated-User-Email`, `X-Forwarded-Email`,
+  `X-Forwarded-User`, `X-Auth-User`, a cookie, a query parameter, or the request body.
+- Do not verify the Access token again. Do not add a JWT or JWKS library, and do not read
+  `CF_ACCESS_AUD` in app code. The guard owns verification.
+- Read identity in one function at the request boundary and pass a typed user to handlers. When the
+  user ID header is missing or empty, return 401 and do no work.
+- Store the user ID as the durable reference. Treat the email as display data.
 
-Implement a requirement such as "only Finance may open this app" as a Cloudflare Access policy.
-Implement a requirement such as "only the assigned approver may approve this request" in the app.
+A static-only app needs no sign-in code at all. An app with server code ships one bundled ES-module
+Worker. Serve static files from that Worker with `env.ASSETS.fetch(request)` for every path the code
+does not handle.
 
-An app may store a profile, preferences, ownership, or audit data for a verified user. Key durable
-references by the verified `sub` claim. Treat `email` as mutable display and audit data. Do not
-store passwords, login sessions, or a copied directory of group membership.
+```ts
+interface Env {
+  ASSETS: Fetcher;
+  DB: D1Database;
+}
 
-## Verify every human request
+interface User {
+  sub: string;
+  email: string;
+}
 
-Require both settings at startup:
+function signedInUser(request: Request): User | null {
+  const sub = request.headers.get("x-openinspect-user-sub");
+  const email = request.headers.get("x-openinspect-user-email");
+  return sub && email ? { sub, email } : null;
+}
 
-```text
-CF_ACCESS_TEAM_DOMAIN=https://<team>.cloudflareaccess.com
-CF_ACCESS_AUD=<this application's audience tag>
+export default {
+  async fetch(request: Request, env: Env): Promise<Response> {
+    const url = new URL(request.url);
+    if (!url.pathname.startsWith("/api/")) return env.ASSETS.fetch(request);
+
+    const user = signedInUser(request);
+    if (!user) return new Response("Not signed in", { status: 401 });
+
+    if (url.pathname === "/api/notes" && request.method === "GET") {
+      const { results } = await env.DB.prepare("SELECT id, body FROM notes WHERE owner_sub = ?")
+        .bind(user.sub)
+        .all();
+      return Response.json(results);
+    }
+    return new Response("Not found", { status: 404 });
+  },
+};
 ```
 
-Accept `CF_ACCESS_TEAM_DOMAIN` only as an `https://` origin. Reject a bare hostname, `http://`, a
-path, a query, or a fragment. Do not repair an invalid value by adding a scheme.
+## Declare data and secrets in `openinspect.app.json`
 
-Validate the Access application token against the contract in the reference. At minimum,
-verification must fail closed for:
+Declare every data store and secret name in `openinspect.app.json` at the project root. The platform
+creates a dedicated store per binding and binds it to the Worker as `env.<NAME>`.
 
-- Signature and algorithm
-- Issuer and per-app audience
-- Expiry and not-before time
-- Expected application-token type
-- Non-empty human subject and email claims
+```json
+{
+  "schemaVersion": 1,
+  "name": "expense-approvals",
+  "data": { "DB": { "kind": "d1" } },
+  "secrets": ["EXCHANGE_RATES_API_KEY"]
+}
+```
 
-Reject a missing or invalid token. Never decode a token and trust its payload without signature and
-claim verification. Never trust `X-Forwarded-Email`, `X-Auth-User`, or another unsigned header as an
-identity.
+- Use `d1` for records, `kv` for caches and small ephemeral state, and `r2` for files.
+- Put D1 schema changes in `migrations/` as numbered files such as `0001_create-notes.sql`. Never
+  edit or delete a migration that has been deployed. Add a new numbered file instead.
+- Never write `wrangler.toml`, `wrangler.json`, or `wrangler.jsonc`. Never put account IDs, database
+  IDs, API tokens, or connection strings in the repository.
+- A person enters secret values on the app's page in Open-Inspect (Settings, then Apps). Never ask
+  for a secret value in chat, and never write one to a file.
+- Scope personal records to the signed-in user, as in `WHERE owner_sub = ?` bound to the user ID.
 
-Apply the verifier to the whole router or framework boundary. Keep an unauthenticated health route
-only when the hosting platform requires one, and make that route return no application data.
+## Decide who may do what
 
-## Keep broad roles in the identity provider
+Every published app admits the company's signed-in people. Administrators own that sign-in policy.
 
-Use Cloudflare Access policy for coarse app entry. If users need different roles inside one app,
-read current group membership from Cloudflare's full identity endpoint and bind app behavior to the
-company's IdP group names.
+When the user wants only some people to use the app or an action, enforce it in the app and fail
+closed. Use record ownership, an allow-list kept in the app's own data and managed in the app, or
+current identity-provider group membership. For groups, follow the full-identity section of
+[the Cloudflare Access reference](references/cloudflare-access.md). Never copy group membership into
+a local roles table.
 
-Parse the response body as the identity object itself, not as an `identity` wrapper. Read group data
-through one adapter for the company's documented identity shape. The current company contract uses a
-top-level `groups` array whose entries have non-empty `name` fields. If a route needs groups, reject
-a missing or malformed group response.
+Requests without a person, such as CI jobs, scheduled jobs, or other services, cannot reach apps on
+this platform. Tell the user that an administrator must arrange that integration. Do not add API
+keys, shared secrets, or unauthenticated routes as a workaround.
 
-Do not authorize from a custom `groups` claim in the JWT. Cloudflare does not include groups by
-default and may trim custom claims. Do not mirror IdP group membership into a local roles table.
+## Publish
 
-The app may still enforce resource facts that the IdP cannot know, such as record ownership,
-approval state, or separation of duties.
+Build the app, then call `deploy-app` with the build output directory and, when the app has server
+code, the bundled Worker file. Calling it again with the same name updates the app. When it fails,
+do what its message says. When it succeeds, give the user the URL.
 
-## Route automated callers through Access
+Do not publish through other hosting, public tunnels, or preview URLs.
 
-Use a Cloudflare Access service token and a Service Auth policy for CI, scheduled jobs, or another
-service. Keep service-only endpoints explicit. Validate the resulting application token for the same
-issuer and audience. Require an empty `sub`, a non-empty `common_name`, and no human `email`. Use
-`common_name` as the service-token identifier. Require `exp` and `iat`, and validate `nbf` when the
-token contains it.
+## Test and run locally
 
-Model the verified request identity as a closed human-or-service variant. A human identity has a
-subject and email. A service identity has a service-token identifier and cannot carry a human email.
+Test handlers with requests that carry both identity headers. Also assert that a request without
+them gets 401.
 
-Do not accept a general API key or bearer token as a substitute for workforce authentication. Do not
-manufacture an `email` for a service token.
+Local tooling may inject a development identity. App code must never invent a user when the headers
+are missing. Do not add a branch such as "if not production, use a default user".
 
-## Keep local development fail-closed
+## Apps hosted elsewhere
 
-Prefer tests that inject a verified identity into the application layer without disabling the
-production request boundary.
-
-If interactive local development needs a fake identity, require an explicit development flag and
-make startup fail unless the runtime environment is exactly `development` or `test`. An unset or
-unknown environment is not development. Never use a condition such as "anything except production"
-to skip authentication.
+The guard and its headers exist only for apps published with `deploy-app`. For an app on any other
+host, the app must verify the Access token itself. Read
+[the Cloudflare Access reference](references/cloudflare-access.md) and follow it before writing any
+verifier. The operator of that host owns its Access configuration. Report what they must set up to
+the user as administrator work, never as steps for the user.
 
 ## Do not generate these patterns
 
 - Workforce login, signup, logout, password reset, OAuth, or SAML flows inside the app
 - Password hashes, credential tables, or application-managed login sessions
 - Auth middleware such as NextAuth, Auth.js, Passport, Flask-Login, or Devise for workforce sign-in
-- Token decoding without signature, issuer, and audience verification
-- Route-by-route opt-in protection
-- A production-capable authentication bypass
-- Local copies of IdP groups as an authorization source
+- Identity read from any header other than `x-openinspect-user-sub` and `x-openinspect-user-email`
+- A default or fake user when the identity headers are missing
+- Route-by-route opt-in protection of data routes
+- Hand-written Worker configuration, resource IDs, or credentials in the repository
+- Local copies of identity-provider groups as an authorization source
 
-This restriction does not prohibit OAuth credentials that the app needs to call an unrelated
-third-party API. Keep that integration separate from workforce sign-in.
-
-## Report platform handoffs
-
-Finish the task by listing any work that remains outside the repository:
-
-- Create the Access application and a least-privilege Allow policy.
-- Set the per-app audience and team domain in the deployment environment.
-- Route the origin through Cloudflare Tunnel or another private path with no direct public ingress.
-- Enable Cloudflare's account-wide Access protection when the account is dedicated to internal
-  applications.
-- Create and scope service tokens for approved automated callers.
-- Test both an allowed identity and a denied identity before release.
-
-Do not replace a missing platform setting with application auth. Keep the app fail-closed and report
-the missing setting. The platform owns the Access application and policy. The app still owns
-application-token verification, so never defer the verifier itself as platform work.
+This restriction does not prohibit credentials the app needs to call an unrelated third-party API.
+Declare those as secrets in `openinspect.app.json`.
 
 ## Check before completion
 
-- No app-local workforce sign-in or credential store exists.
-- Every data-bearing route passes through token verification.
-- The verifier uses an approved component or a maintained JWT and remote-JWKS library. It contains
-  no handwritten token parsing, JWKS cache, or cryptography.
-- The verifier restricts the algorithm and checks the signature, issuer, audience, and time claims.
-- Boundary checks cover a missing token, an invalid signature, the wrong issuer, the wrong audience,
-  expiry, not-before time, and identity lookup failure without bypassing the verifier.
-- Human identity requires verified `sub` and `email` claims.
-- Group-based roles use the full identity response, not JWT custom claims.
-- Automated callers use an explicit Access service identity with empty `sub`, non-empty
-  `common_name`, and no human `email`.
-- Development identity injection cannot start in an unknown or production environment.
-- The deployment handoff prevents direct origin access.
-- Any approved verifier adoption is recorded for the target repository.
+- Identity is read in one boundary function from `x-openinspect-user-sub` and
+  `x-openinspect-user-email`, and a request without them gets 401.
+- Durable references use the user ID, not the email.
+- No app-local sign-in, credential store, or workforce auth library exists.
+- No code reads a forbidden identity header.
+- Data stores and secret names are declared in `openinspect.app.json`, schema lives in numbered
+  migration files, and no Worker configuration, resource ID, or credential is in the repository.
+- Personal records are filtered by the signed-in user.
+- Nothing asks the user to do Cloudflare or platform setup. Administrator-only needs are stated in
+  one plain sentence.
