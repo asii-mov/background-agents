@@ -260,6 +260,7 @@ export class ApprovedComponentStore {
     actorUserId: string
   ): Promise<ApprovedComponent> {
     const definition = createApprovedComponentSchema.parse(input);
+    await this.assertAppOwnsCatalogue();
     const id = `component_${generateId()}`;
     const now = Date.now();
     await this.assertNoConflict(definition, null, false);
@@ -369,6 +370,20 @@ export class ApprovedComponentStore {
     return (deleted?.meta.changes ?? 0) > 0;
   }
 
+  /**
+   * The reconciler keeps a Git row exactly while catalog.yaml declares a non-empty catalogue, and
+   * disables every app component it finds then; an app row created meanwhile would not survive.
+   */
+  private async assertAppOwnsCatalogue(): Promise<void> {
+    const row = await this.db
+      .prepare(
+        `SELECT EXISTS (SELECT 1 FROM component_categories WHERE source_kind = 'git')
+             OR EXISTS (SELECT 1 FROM approved_components WHERE source_kind = 'git') AS managed`
+      )
+      .first<{ managed: number }>();
+    if (row?.managed) throw new GitManagedCatalogueError("The component catalogue");
+  }
+
   async listCategories(): Promise<ComponentCategory[]> {
     const result = await this.db
       .prepare("SELECT * FROM component_categories ORDER BY id")
@@ -389,6 +404,7 @@ export class ApprovedComponentStore {
     actorUserId: string
   ): Promise<ComponentCategory> {
     const category = componentCategoryInputSchema.parse(input);
+    await this.assertAppOwnsCatalogue();
     const now = Date.now();
     try {
       await this.db

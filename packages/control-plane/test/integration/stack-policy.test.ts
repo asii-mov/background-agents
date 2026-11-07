@@ -21,6 +21,7 @@ import {
   StackObservationRejectedError,
 } from "../../src/db/stack-inventory";
 import type { SqlDatabase } from "../../src/db/sql-database";
+import { GovernanceCatalogStore } from "../../src/governance/catalog-store";
 import { cleanD1Tables } from "./cleanup";
 import { initNamedSession, seedSandboxAuth, serviceFetch } from "./helpers";
 
@@ -408,6 +409,60 @@ describe("catalogue grades", () => {
     );
     expect(removal.status).toBe(409);
     expect(await catalogue().get("component_seed_react")).toEqual(react);
+  });
+
+  it("refuses API creation while the Git catalogue owns categories and components", async () => {
+    const governance = new GovernanceCatalogStore(env.DB);
+    const gitSource = {
+      provider: "github",
+      owner: "security",
+      name: "agent-catalog",
+      ref: "main",
+      path: ".openinspect",
+    };
+    const createComponent = () =>
+      serviceFetch("https://test.local/approved-components", {
+        method: "POST",
+        body: JSON.stringify(denoInput),
+      });
+    const createCategory = (id: string) =>
+      serviceFetch("https://test.local/component-categories", {
+        method: "POST",
+        body: JSON.stringify({ id, name: id, description: "Native mobile apps." }),
+      });
+
+    await governance.apply(
+      gitSource,
+      {
+        commitSha: BASE_SHA,
+        skills: [],
+        mcpServers: [],
+        stack: {
+          categories: [
+            {
+              id: "mobile",
+              name: "Mobile",
+              description: "Native mobile apps.",
+              enforcement: "advise",
+            },
+          ],
+          components: [],
+        },
+      },
+      []
+    );
+    const component = await createComponent();
+    expect(component.status).toBe(409);
+    await expect(component.json()).resolves.toEqual({
+      error: "The component catalogue is managed by the Git governance catalogue; change it there",
+    });
+    expect((await createCategory("tablet")).status).toBe(409);
+    expect((await catalogue().list()).some((row) => row.name === "Deno")).toBe(false);
+    expect(await catalogue().getCategory("tablet")).toBeNull();
+
+    await governance.apply(gitSource, { commitSha: NEXT_SHA, skills: [], mcpServers: [] }, []);
+    expect((await createComponent()).status).toBe(201);
+    expect((await createCategory("tablet")).status).toBe(201);
   });
 
   it("refuses to delete a category components still use", async () => {
