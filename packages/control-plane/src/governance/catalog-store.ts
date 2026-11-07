@@ -1,8 +1,17 @@
+import type { ApprovedComponentDefinition } from "@open-inspect/shared/types/approved-components";
+import type { StackSignal } from "@open-inspect/shared/types/stack-policy";
+import { generateId } from "../auth/crypto";
 import { buildValidatedSkillRevision } from "../skills/content-addressing";
+import { bulkInsertStatements } from "../db/bulk-insert";
 import { RESERVED_SKILL_NAMES } from "../db/skills";
 import { MAX_D1_QUERY_PARAMETERS } from "../db/query-limits";
 import type { SqlDatabase, SqlStatement } from "../db/sql-database";
-import type { ParsedGovernanceCatalog } from "./catalog-schema";
+import {
+  GOVERNANCE_CATALOG_FILE,
+  holdsPreference,
+  type ParsedGovernanceCatalog,
+  type ParsedStackCatalogue,
+} from "./catalog-schema";
 import type { ResolvedMcpServer } from "./npm-resolver";
 
 export interface GovernanceSource {
@@ -56,6 +65,72 @@ interface McpCatalogRow {
   artifact_key: string | null;
   artifact_sha256: string | null;
   artifact_executable: string | null;
+}
+
+type CategoryCatalogRow = {
+  id: string;
+  name: string;
+  description: string;
+  enforcement: string;
+  source_kind: "app" | "git";
+  source_path: string | null;
+};
+
+type ComponentCatalogRow = {
+  id: string;
+  name: string;
+  enabled: number;
+  source_kind: "app" | "git";
+  source_path: string | null;
+  [column: string]: unknown;
+};
+
+interface SignalCatalogRow {
+  kind: string;
+  ecosystem: string;
+  value: string;
+  component_id: string;
+}
+
+/** The column values ApprovedComponentStore writes, so a Git row reads back as declared. */
+function componentColumns(
+  definition: ApprovedComponentDefinition
+): Record<string, string | number | null> {
+  const scopes = (values: string[] | null, lowerCase: boolean) =>
+    values?.length
+      ? JSON.stringify(values.map((value) => (lowerCase ? value.toLowerCase() : value)))
+      : null;
+  return {
+    name: definition.name,
+    kind: definition.kind,
+    description: definition.description,
+    owner: definition.owner,
+    locator: definition.locator,
+    version: definition.version,
+    integrity: definition.integrity,
+    source_url: definition.sourceUrl,
+    documentation_url: definition.documentationUrl,
+    usage: definition.usage,
+    lifecycle: definition.lifecycle,
+    repo_scope: scopes(definition.repoScopes, true),
+    environment_scope: scopes(definition.environmentScopes, false),
+    enabled: definition.enabled ? 1 : 0,
+    category_id: definition.categoryId,
+    stance: definition.stance,
+  };
+}
+
+function signalColumns(signal: StackSignal): { kind: string; ecosystem: string; value: string } {
+  switch (signal.kind) {
+    case "package":
+      return { kind: "package", ecosystem: signal.ecosystem, value: signal.name };
+    case "file":
+      return { kind: "file", ecosystem: "", value: signal.pattern };
+    case "source":
+      return { kind: "source", ecosystem: "", value: signal.extension };
+    case "manifest":
+      return { kind: "manifest", ecosystem: "", value: signal.value };
+  }
 }
 
 interface GovernanceStateRow {
@@ -504,6 +579,9 @@ export class GovernanceCatalogStore {
     }
 
     statements.push(
+      ...(catalog.stack
+        ? await this.stackStatements(catalog.stack, catalog.commitSha, now)
+        : this.releaseStackStatements(now)),
       this.db.prepare(
         "UPDATE skills_catalog_state SET generation = generation + 1 WHERE singleton = 1"
       ),
@@ -527,6 +605,195 @@ export class GovernanceCatalogStore {
         )
     );
     await this.db.batch(statements);
+  }
+
+  /**
+   * Git owns the technology catalogue: its categories and components are written as declared,
+   * every other component is disabled, and only its components carry detection signals. Rows
+   * keep their ids (matched by source path, then name), so consumers survive adoption. A row
+   * changes revision only when its definition changes, so a repeat apply writes nothing new.
+   */
+  private async stackStatements(
+    stack: ParsedStackCatalogue,
+    commitSha: string,
+    now: number
+  ): Promise<SqlStatement[]> {
+    const [categoriesResult, componentsResult, signalsResult] = await Promise.all([
+      this.db.prepare("SELECT * FROM component_categories").all<CategoryCatalogRow>(),
+      this.db.prepare("SELECT * FROM approved_components").all<ComponentCatalogRow>(),
+      this.db
+        .prepare("SELECT kind, ecosystem, value, component_id FROM approved_component_signals")
+        .all<SignalCatalogRow>(),
+    ]);
+    const existingCategories = categoriesResult.results ?? [];
+    const existingComponents = componentsResult.results ?? [];
+    const signalKeysByComponent = new Map<string, string[]>();
+    for (const row of signalsResult.results ?? []) {
+      const keys = signalKeysByComponent.get(row.component_id) ?? [];
+      keys.push(JSON.stringify([row.kind, row.ecosystem, row.value]));
+      signalKeysByComponent.set(row.component_id, keys);
+    }
+
+    const categoryWrites = stack.categories.map((category) => {
+      const current = existingCategories.find((row) => row.id === category.id);
+      const holder = existingCategories.find(
+        (row) => row.id !== category.id && row.name.toLowerCase() === category.name.toLowerCase()
+      );
+      if (holder) {
+        throw new Error(`Category name '${category.name}' is already used by ${holder.id}`);
+      }
+      return { category, current };
+    });
+    const claimed = new Set<string>();
+    const componentWrites = stack.components.map(({ sourcePath, definition }) => {
+      const current =
+        existingComponents.find(
+          (row) => row.source_kind === "git" && row.source_path === sourcePath
+        ) ??
+        existingComponents.find((row) => row.name.toLowerCase() === definition.name.toLowerCase());
+      if (current && claimed.has(current.id)) {
+        throw new Error(`${sourcePath}: ${current.name} is already managed by another entry`);
+      }
+      const holder = existingComponents.find(
+        (row) => row.id !== current?.id && row.name.toLowerCase() === definition.name.toLowerCase()
+      );
+      if (holder) {
+        throw new Error(`${sourcePath}: component name '${definition.name}' is already in use`);
+      }
+      const id = current?.id ?? `component_${generateId()}`;
+      claimed.add(id);
+      return { id, sourcePath, definition, current };
+    });
+
+    const statements: SqlStatement[] = [];
+    for (const row of existingComponents) {
+      if (claimed.has(row.id) || row.enabled === 0) continue;
+      statements.push(
+        this.db
+          .prepare(
+            `UPDATE approved_components SET enabled = 0, revision = revision + 1,
+                    updated_by = 'git-governance', updated_at = ?
+             WHERE id = ?`
+          )
+          .bind(now, row.id)
+      );
+    }
+    statements.push(this.db.prepare("DELETE FROM approved_component_signals"));
+
+    for (const { category, current } of categoryWrites) {
+      const columns = {
+        name: category.name,
+        description: category.description,
+        enforcement: category.enforcement,
+      };
+      statements.push(
+        this.gitRowWrite("component_categories", category.id, columns, current, {
+          sourcePath: GOVERNANCE_CATALOG_FILE,
+          commitSha,
+          now,
+        })
+      );
+    }
+
+    for (const write of [
+      ...componentWrites.filter(({ definition }) => !holdsPreference(definition)),
+      ...componentWrites.filter(({ definition }) => holdsPreference(definition)),
+    ]) {
+      const signals = write.definition.signals.map(signalColumns);
+      const signalsChanged =
+        JSON.stringify((signalKeysByComponent.get(write.id) ?? []).sort()) !==
+        JSON.stringify(signals.map((s) => JSON.stringify([s.kind, s.ecosystem, s.value])).sort());
+      statements.push(
+        this.gitRowWrite(
+          "approved_components",
+          write.id,
+          componentColumns(write.definition),
+          write.current,
+          { sourcePath: write.sourcePath, commitSha, now, forceRevision: signalsChanged }
+        )
+      );
+    }
+    statements.push(
+      ...bulkInsertStatements(
+        this.db,
+        "approved_component_signals",
+        componentWrites.flatMap(({ id, definition }) =>
+          definition.signals.map((signal) => ({ ...signalColumns(signal), component_id: id }))
+        )
+      )
+    );
+
+    const declared = new Set(stack.categories.map((category) => category.id));
+    for (const row of existingCategories) {
+      if (row.source_kind !== "git" || declared.has(row.id)) continue;
+      statements.push(
+        this.db
+          .prepare(
+            `DELETE FROM component_categories WHERE id = ? AND source_kind = 'git'
+             AND NOT EXISTS (SELECT 1 FROM approved_components WHERE category_id = ?)`
+          )
+          .bind(row.id, row.id)
+      );
+    }
+    return statements;
+  }
+
+  /**
+   * Insert a Git-owned row, or rewrite an existing one as Git-owned. A definition change bumps
+   * the revision; an unchanged Git row only records the commit that still declares it.
+   */
+  private gitRowWrite(
+    table: "component_categories" | "approved_components",
+    id: string,
+    columns: Readonly<Record<string, string | number | null>>,
+    current:
+      (Record<string, unknown> & { source_kind: string; source_path: string | null }) | undefined,
+    source: { sourcePath: string; commitSha: string; now: number; forceRevision?: boolean }
+  ): SqlStatement {
+    const names = Object.keys(columns);
+    const values = Object.values(columns);
+    if (!current) {
+      return this.db
+        .prepare(
+          `INSERT INTO ${table}
+           (id, revision, ${names.join(", ")}, source_kind, source_path, source_commit_sha,
+            created_by, updated_by, created_at, updated_at)
+           VALUES (?, 1, ${names.map(() => "?").join(", ")}, 'git', ?, ?,
+                   'git-governance', 'git-governance', ?, ?)`
+        )
+        .bind(id, ...values, source.sourcePath, source.commitSha, source.now, source.now);
+    }
+    const unchanged =
+      !source.forceRevision &&
+      current.source_kind === "git" &&
+      current.source_path === source.sourcePath &&
+      names.every((name) => current[name] === columns[name]);
+    if (unchanged) {
+      return this.db
+        .prepare(`UPDATE ${table} SET source_commit_sha = ? WHERE id = ?`)
+        .bind(source.commitSha, id);
+    }
+    return this.db
+      .prepare(
+        `UPDATE ${table} SET ${names.map((name) => `${name} = ?`).join(", ")},
+                source_kind = 'git', source_path = ?, source_commit_sha = ?,
+                revision = revision + 1, updated_by = 'git-governance', updated_at = ?
+         WHERE id = ?`
+      )
+      .bind(...values, source.sourcePath, source.commitSha, source.now, id);
+  }
+
+  /** Without `categories` and `components`, Git no longer owns any catalogue row. */
+  private releaseStackStatements(now: number): SqlStatement[] {
+    return (["component_categories", "approved_components"] as const).map((table) =>
+      this.db
+        .prepare(
+          `UPDATE ${table} SET source_kind = 'app', source_path = NULL, source_commit_sha = NULL,
+                  revision = revision + 1, updated_by = 'git-governance', updated_at = ?
+           WHERE source_kind = 'git'`
+        )
+        .bind(now)
+    );
   }
 
   private mcpRevisionInsert(id: string, revision: number): SqlStatement {
