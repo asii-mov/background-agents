@@ -92,13 +92,22 @@ def test_docker_enabled_is_only_the_exact_trusted_value(value, expected):
     assert RuntimeConfig.from_env(environment).docker_enabled is expected
 
 
+def test_claude_with_a_pinned_mcp_artifact_fails_closed():
+    session_config = {"harness": "claude", "mcp_servers": [{"artifactSha256": "a" * 64}]}
+    with pytest.raises(ValueError, match="Claude does not yet support governed MCP artifacts"):
+        RuntimeConfig.from_env({"SESSION_CONFIG": json.dumps(session_config)})
+
+
 @pytest.mark.parametrize(
     "governance",
     [
         {"security_pipelines": [{"id": "pipeline-1"}]},
-        {"mcp_servers": [{"artifactSha256": "a" * 64}]},
+        {"stack_policy": {"schemaVersion": 1}},
+        {"mcp_servers": [{"name": "docs", "url": "https://mcp.example.com"}]},
     ],
 )
-def test_governed_claude_launch_fails_closed(governance):
-    with pytest.raises(ValueError, match="Claude does not yet support governed"):
-        RuntimeConfig.from_env({"SESSION_CONFIG": json.dumps({"harness": "claude", **governance})})
+def test_claude_boots_with_pipelines_a_stack_policy_or_unpinned_mcp(governance):
+    config = RuntimeConfig.from_env(
+        {"SESSION_CONFIG": json.dumps({"harness": "claude", **governance})}
+    )
+    assert config.session_config["harness"] == "claude"

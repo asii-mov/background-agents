@@ -9,6 +9,7 @@ import {
 import {
   normalizeSandboxSettings,
   parsePersistedSandboxSettings,
+  parseSandboxTunnelsPolicy,
   SandboxSettingsValidationError,
 } from "./settings";
 
@@ -356,5 +357,42 @@ describe("normalizeSandboxSettings", () => {
     ).toEqual({
       tunnelPorts: [3000],
     });
+  });
+});
+
+describe("sandbox tunnels policy", () => {
+  it("reads SANDBOX_TUNNELS_POLICY, keeping public tunnels when unset and failing closed otherwise", () => {
+    expect(parseSandboxTunnelsPolicy(undefined)).toBe("public");
+    expect(parseSandboxTunnelsPolicy("")).toBe("public");
+    expect(parseSandboxTunnelsPolicy("public")).toBe("public");
+    expect(parseSandboxTunnelsPolicy("disabled")).toBe("disabled");
+    expect(parseSandboxTunnelsPolicy("Disabled")).toBe("disabled");
+  });
+
+  it("accepts tunnel ports under the public policy", () => {
+    expect(normalizeSandboxSettings({ tunnelPorts: [3000] }, { tunnelsPolicy: "public" })).toEqual({
+      tunnelPorts: [3000],
+    });
+  });
+
+  it("rejects tunnel ports under the disabled policy and points at deploy-app", () => {
+    expect(() =>
+      normalizeSandboxSettings({ tunnelPorts: [3000] }, { tunnelsPolicy: "disabled" })
+    ).toThrow(/Deploy with the deploy-app tool instead/);
+  });
+
+  it("still accepts settings that expose no tunnel under the disabled policy", () => {
+    expect(
+      normalizeSandboxSettings(
+        { tunnelPorts: [], terminalEnabled: true },
+        { tunnelsPolicy: "disabled" }
+      )
+    ).toEqual({ terminalEnabled: true });
+  });
+
+  it("drops persisted tunnel ports under the disabled policy", () => {
+    expect(
+      parsePersistedSandboxSettings('{"tunnelPorts":[3000],"terminalEnabled":true}', "disabled")
+    ).toEqual({ terminalEnabled: true });
   });
 });

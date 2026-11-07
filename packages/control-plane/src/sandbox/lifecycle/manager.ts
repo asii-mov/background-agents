@@ -338,6 +338,8 @@ interface AlarmContext extends WatchdogContext {
  * Complete lifecycle configuration.
  */
 export interface SandboxLifecycleConfig extends AlarmPolicyConfig, SandboxLaunchConfig {
+  /** App hosting is configured for this deployment, so sandboxes get the deploy-app tool. */
+  agentAppDeployEnabled?: boolean;
   /** Persist a user-visible lifecycle warning in the session event stream. */
   recordWarning?: (message: string, eventId: string) => void;
   /** Pump the message queue once a deferred connect-timeout re-drive may proceed. */
@@ -476,8 +478,10 @@ export class SandboxLifecycleManager
         model: config.model,
         mcpServerLookup: config.mcpServerLookup,
         securityPipelineLookup: config.securityPipelineLookup,
+        stackPolicyLookup: config.stackPolicyLookup,
         sandboxNetworkPolicyLookup: config.sandboxNetworkPolicyLookup,
         slackAgentNotifyLookup: config.slackAgentNotifyLookup,
+        sandboxTunnelsPolicy: config.sandboxTunnelsPolicy,
       },
       imageBuildLookup,
       getLogger: () => this.log,
@@ -811,11 +815,8 @@ export class SandboxLifecycleManager
       const prebuiltImageSha: string | null = selectedImage?.primaryBaseSha ?? null;
 
       const mcpServers = await this.launchContext.loadMcpServers(session, repositories);
-      const securityPipelines = await this.launchContext.loadSecurityPipelines(
-        session,
-        repositories
-      );
-      this.launchContext.assertHarnessGovernance(session, mcpServers, securityPipelines);
+      this.launchContext.assertHarnessGovernance(session, mcpServers);
+      const governance = await this.launchContext.loadGovernance(session, repositories);
 
       const codeServerEnabled = session.code_server_enabled === 1;
       const vncEnabled = session.vnc_enabled === 1;
@@ -840,8 +841,9 @@ export class SandboxLifecycleManager
         codeServerEnabled,
         vncEnabled,
         agentSlackNotifyEnabled,
+        agentAppDeployEnabled: this.config.agentAppDeployEnabled,
         mcpServers,
-        securityPipelines,
+        governance,
         sandboxSettings,
         ...repositoryFields,
       };
@@ -1160,11 +1162,8 @@ export class SandboxLifecycleManager
       const agentSlackNotifyEnabled =
         await this.launchContext.resolveAgentSlackNotifyEnabled(session);
       const mcpServers = await this.launchContext.loadMcpServers(session, repositories);
-      const securityPipelines = await this.launchContext.loadSecurityPipelines(
-        session,
-        repositories
-      );
-      this.launchContext.assertHarnessGovernance(session, mcpServers, securityPipelines);
+      this.launchContext.assertHarnessGovernance(session, mcpServers);
+      const governance = await this.launchContext.loadGovernance(session, repositories);
       const { sandboxSettings, timeoutSeconds } =
         await this.launchContext.resolveLaunchSandboxSettings(session);
       const restoreConfig = {
@@ -1183,8 +1182,9 @@ export class SandboxLifecycleManager
         codeServerEnabled,
         vncEnabled,
         agentSlackNotifyEnabled,
+        agentAppDeployEnabled: this.config.agentAppDeployEnabled,
         mcpServers,
-        securityPipelines,
+        governance,
         sandboxSettings,
         ...repositoryFields,
       };
@@ -1343,11 +1343,12 @@ export class SandboxLifecycleManager
         await this.launchContext.resolveLaunchSandboxSettings(session);
 
       if (session.harness === "claude") {
-        const repositories = this.sessionContext.getSessionRepositories();
         this.launchContext.assertHarnessGovernance(
           session,
-          await this.launchContext.loadMcpServers(session, repositories),
-          await this.launchContext.loadSecurityPipelines(session, repositories)
+          await this.launchContext.loadMcpServers(
+            session,
+            this.sessionContext.getSessionRepositories()
+          )
         );
       }
 

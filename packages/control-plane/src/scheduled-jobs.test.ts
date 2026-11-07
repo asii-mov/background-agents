@@ -4,7 +4,9 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { checkAutofixQueueHealth } from "./autofix/queue-health";
+import { ApprovedComponentStore } from "./db/approved-components";
 import { SessionIndexStore } from "./db/session-index";
+import { StackInventoryStore } from "./db/stack-inventory";
 import type { SqlDatabase } from "./db/sql-database";
 import type * as ImageBuildScheduler from "./image-builds/scheduler";
 import { IMAGE_BUILD_SCHEDULER_CRON, runImageBuildScheduler } from "./image-builds/scheduler";
@@ -38,6 +40,11 @@ vi.mock("./scheduler/scheduler", () => ({
     return { tick: schedulerTick };
   }),
 }));
+vi.mock("./db/stack-inventory", () => ({
+  StackInventoryStore: vi.fn(function () {
+    return { prune: inventoryPrune };
+  }),
+}));
 vi.mock("./session/abandoned-draft-sweep", async (importOriginal) => ({
   ...(await importOriginal<typeof AbandonedDraftSweepModule>()),
   AbandonedDraftSweep: vi.fn(function () {
@@ -46,9 +53,10 @@ vi.mock("./session/abandoned-draft-sweep", async (importOriginal) => ({
   SessionDraftExpiryClient: vi.fn(),
 }));
 
-const { schedulerTick, sweepRun } = vi.hoisted(() => ({
+const { schedulerTick, sweepRun, inventoryPrune } = vi.hoisted(() => ({
   schedulerTick: vi.fn(async () => ({})),
   sweepRun: vi.fn(async () => ({})),
+  inventoryPrune: vi.fn(async () => 3),
 }));
 
 const TERRAFORM_WORKER = resolve(
@@ -138,5 +146,22 @@ describe("SCHEDULED_JOBS", () => {
     expect(client).toBe(vi.mocked(SessionDraftExpiryClient).mock.instances[0]);
     expect(log).toBe(deps.log);
     expect(sweepRun).toHaveBeenCalledWith(1_234_567);
+  });
+
+  it("prunes stale stack observations in the background on the abandoned-draft slot", async () => {
+    const deps = fakeDeps();
+    sweepRun.mockRejectedValueOnce(new Error("sweep failed"));
+
+    await expect(
+      findScheduledJob(ABANDONED_DRAFT_SWEEP_CRON)!.run(deps, 1_234_567)
+    ).rejects.toThrow("sweep failed");
+
+    expect(deps.submitted.map((entry) => entry.name)).toEqual(["stack_observation_prune"]);
+    expect(inventoryPrune).not.toHaveBeenCalled();
+    await deps.submitted[0]!.task();
+    const [db, catalogue] = vi.mocked(StackInventoryStore).mock.calls[0]!;
+    expect(db).toBe(deps.db);
+    expect(catalogue).toBeInstanceOf(ApprovedComponentStore);
+    expect(inventoryPrune).toHaveBeenCalledWith(1_234_567);
   });
 });

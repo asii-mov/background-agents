@@ -127,9 +127,11 @@ RESTORE_REQUEST = {
         (_call_create_sandbox, CREATE_REQUEST, "code_server_enabled"),
         (_call_create_sandbox, CREATE_REQUEST, "vnc_enabled"),
         (_call_create_sandbox, CREATE_REQUEST, "agent_slack_notify_enabled"),
+        (_call_create_sandbox, CREATE_REQUEST, "agent_app_deploy_enabled"),
         (_call_restore_sandbox, RESTORE_REQUEST, "code_server_enabled"),
         (_call_restore_sandbox, RESTORE_REQUEST, "vnc_enabled"),
         (_call_restore_sandbox, RESTORE_REQUEST, "agent_slack_notify_enabled"),
+        (_call_restore_sandbox, RESTORE_REQUEST, "agent_app_deploy_enabled"),
     ],
 )
 async def test_sandbox_requests_reject_string_booleans(monkeypatch, call, payload, field):
@@ -279,6 +281,41 @@ async def test_create_sandbox_passes_unknown_fields_to_session_config_helper(mon
 
     assert result["success"] is True
     assert helper_requests[0]["future_launch_option"] is True
+
+
+STACK_POLICY = {"schemaVersion": 1, "digest": "digest-1", "rules": []}
+
+
+@pytest.mark.asyncio
+async def test_create_carries_the_stack_policy_and_the_deploy_app_gate(monkeypatch):
+    captured = {}
+    _patch_auth(monkeypatch)
+    _patch_manager(monkeypatch, captured)
+
+    await _call_create_sandbox(
+        {**CREATE_REQUEST, "stack_policy": STACK_POLICY, "agent_app_deploy_enabled": True}
+    )
+
+    assert captured["config"].session_config.stack_policy == STACK_POLICY
+    assert captured["config"].agent_app_deploy_enabled is True
+
+
+@pytest.mark.asyncio
+async def test_restore_carries_the_stack_policy_and_the_deploy_app_gate(monkeypatch):
+    captured = {}
+    _patch_auth(monkeypatch)
+    _patch_restore_manager(monkeypatch, captured)
+
+    await _call_restore_sandbox(
+        {
+            **RESTORE_REQUEST,
+            "session_config": {**RESTORE_REQUEST["session_config"], "stack_policy": STACK_POLICY},
+            "agent_app_deploy_enabled": True,
+        }
+    )
+
+    assert captured["restore"]["session_config"]["stack_policy"] == STACK_POLICY
+    assert captured["restore"]["agent_app_deploy_enabled"] is True
 
 
 @pytest.mark.asyncio

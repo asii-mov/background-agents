@@ -145,6 +145,7 @@ class CreateSandboxRequest(_RepositoryContextModel):
     code_server_enabled: bool = False
     vnc_enabled: bool | None = None
     agent_slack_notify_enabled: bool = False
+    agent_app_deploy_enabled: bool = False
     sandbox_settings: dict[str, Any] | None = None
     sandbox_backend: ModalBackend = "modal"
     retire_sandbox_id: str | None = None
@@ -183,6 +184,7 @@ class RestoreSandboxRequest(_ModalRequestModel):
     code_server_enabled: bool = False
     vnc_enabled: bool | None = None
     agent_slack_notify_enabled: bool = False
+    agent_app_deploy_enabled: bool = False
     sandbox_settings: dict[str, Any] | None = None
     sandbox_backend: ModalBackend = "modal"
     retire_sandbox_id: str | None = None
@@ -475,6 +477,7 @@ async def api_create_sandbox(
                 else DEFAULT_VNC_ENABLED
             ),
             agent_slack_notify_enabled=parsed_request.agent_slack_notify_enabled,
+            agent_app_deploy_enabled=parsed_request.agent_app_deploy_enabled,
             settings=parsed_request.sandbox_settings or None,
             sandbox_backend=parsed_request.sandbox_backend,
             timeout_seconds=(
@@ -887,6 +890,7 @@ async def api_restore_sandbox(
                 else DEFAULT_VNC_ENABLED
             ),
             agent_slack_notify_enabled=parsed_request.agent_slack_notify_enabled,
+            agent_app_deploy_enabled=parsed_request.agent_app_deploy_enabled,
             settings=parsed_request.sandbox_settings or None,
             sandbox_backend=parsed_request.sandbox_backend,
             retire_sandbox_id=parsed_request.retire_sandbox_id or None,

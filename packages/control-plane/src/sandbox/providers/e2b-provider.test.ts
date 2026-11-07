@@ -14,6 +14,7 @@ import {
 } from "../../image-builds/model";
 import { PrebuiltImageUnavailableError, SandboxProviderError } from "../provider";
 import { E2BNotFoundError, E2BApiError } from "../e2b-rest-client";
+import { GOVERNANCE, expectGovernedSandboxEnv } from "../governance.test-helpers";
 
 /**
  * The one start command, shared by every boot path (base template, prebuilt
@@ -387,6 +388,17 @@ describe("E2BSandboxProvider", () => {
       { repo_owner: "o", repo_name: "r", branch: "main" },
       { repo_owner: "o2", repo_name: "r2", branch: "dev" },
     ]);
+  });
+
+  it("delivers the session governance and the deploy-app gate", async () => {
+    const client = mockClient();
+    const provider = new E2BSandboxProvider(client, providerConfig);
+    await provider.createSandbox({
+      ...baseCreateConfig,
+      governance: GOVERNANCE,
+      agentAppDeployEnabled: true,
+    });
+    expectGovernedSandboxEnv(createEnv(client));
   });
 
   it("emits CODE_SERVER_PORT (default, and a custom configured port)", async () => {

@@ -61,13 +61,15 @@ import { McpServerStore } from "../db/mcp-servers";
 import { UserStore } from "../db/user-store";
 import { IntegrationSettingsStore, resolveSlackSettings } from "../db/integration-settings";
 import { SecurityPipelineStore } from "../db/security-pipelines";
+import { ApprovedComponentStore } from "../db/approved-components";
 import { RepositoryRiskStore } from "../db/repository-risk";
 import { assessChangeRisk } from "../risk/change-risk";
 import { SessionIndexStore } from "../db/session-index";
 import { TeamMembershipStore } from "../db/team-memberships";
 import { TeamChannelBindingStore } from "../db/team-channel-bindings";
 import { SessionCollaboratorStore } from "../db/session-collaborators";
-import { parsePersistedSandboxSettings } from "../sandbox/settings";
+import { parsePersistedSandboxSettings, parseSandboxTunnelsPolicy } from "../sandbox/settings";
+import type { StackPolicyLookup } from "../sandbox/governance";
 import type { SandboxSettings } from "@open-inspect/shared/types/integrations";
 import { createSourceControlProviderFromEnv, type SourceControlProvider } from "../source-control";
 import {
@@ -1133,6 +1135,17 @@ interface LifecycleManagerDeps {
   backgroundTasks: BackgroundTasks;
 }
 
+/** App hosting needs the broker URL, the apps domain and both broker credentials. */
+function isAppHostingConfigured(env: Env): boolean {
+  return [
+    env.APP_BROKER_URL,
+    env.APPS_DOMAIN,
+    env.SERVICE_AUTH_SECRET_APP_BROKER,
+    env.APP_BROKER_ACCESS_CLIENT_ID,
+    env.APP_BROKER_ACCESS_CLIENT_SECRET,
+  ].every(Boolean);
+}
+
 /** Create the lifecycle manager with all required adapters. */
 function createLifecycleManager(deps: LifecycleManagerDeps): SandboxLifecycleManager {
   const {
@@ -1163,6 +1176,7 @@ function createLifecycleManager(deps: LifecycleManagerDeps): SandboxLifecycleMan
   // Create D1-backed lookups if database is available
   let mcpServerLookup: McpServerLookup | undefined;
   let securityPipelineLookup: SecurityPipelineLookup | undefined;
+  let stackPolicyLookup: StackPolicyLookup | undefined;
   let sandboxNetworkPolicyLookup: SandboxNetworkPolicyLookup | undefined;
   if (db) {
     const mcpStore = new McpServerStore(db, repoSecretsEncryptionKey);
@@ -1175,6 +1189,7 @@ function createLifecycleManager(deps: LifecycleManagerDeps): SandboxLifecycleMan
       getForSession: (repositories, environmentId) =>
         securityPipelines.getForSession(repositories, environmentId),
     };
+    stackPolicyLookup = new ApprovedComponentStore(db);
     sandboxNetworkPolicyLookup = {
       getForSession: async (repositories, environmentId) =>
         (await resolveSessionScopedSettings(db, repositories, environmentId)).sandboxSettings
@@ -1232,8 +1247,11 @@ function createLifecycleManager(deps: LifecycleManagerDeps): SandboxLifecycleMan
     bootBudget: { timeoutMs: bootBudget.timeoutMs },
     mcpServerLookup,
     securityPipelineLookup,
+    stackPolicyLookup,
     sandboxNetworkPolicyLookup,
     slackAgentNotifyLookup,
+    agentAppDeployEnabled: isAppHostingConfigured(env),
+    sandboxTunnelsPolicy: parseSandboxTunnelsPolicy(env.SANDBOX_TUNNELS_POLICY),
     recordWarning: deps.recordWarning,
     resumeQueuedWork: deps.resumeQueuedWork,
   };

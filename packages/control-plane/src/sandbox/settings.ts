@@ -13,11 +13,24 @@ import {
 
 type InvalidSandboxSettingsBehavior = "throw" | "omit";
 
+export const SANDBOX_TUNNELS_POLICIES = ["public", "disabled"] as const;
+export type SandboxTunnelsPolicy = (typeof SANDBOX_TUNNELS_POLICIES)[number];
+
+const SANDBOX_TUNNELS_DISABLED_MESSAGE =
+  "Public preview tunnels are disabled in this workspace. Deploy with the deploy-app tool instead.";
+
+/** `SANDBOX_TUNNELS_POLICY`. Unset keeps upstream public tunnels; an unrecognized value fails closed. */
+export function parseSandboxTunnelsPolicy(value: string | undefined): SandboxTunnelsPolicy {
+  return !value || value === "public" ? "public" : "disabled";
+}
+
 export interface NormalizeSandboxSettingsOptions {
   invalid?: InvalidSandboxSettingsBehavior;
   createError?: (message: string) => Error;
   /** Defer cross-field defaults until repo/environment overrides are merged. */
   partial?: boolean;
+  /** Under "disabled", tunnel ports are rejected (or omitted). Defaults to "public". */
+  tunnelsPolicy?: SandboxTunnelsPolicy;
 }
 
 export class SandboxSettingsValidationError extends Error {
@@ -28,9 +41,12 @@ export class SandboxSettingsValidationError extends Error {
 }
 
 /** Decode and normalize a session's persisted sandbox settings snapshot. */
-export function parsePersistedSandboxSettings(settingsJson: string | null): SandboxSettings {
+export function parsePersistedSandboxSettings(
+  settingsJson: string | null,
+  tunnelsPolicy?: SandboxTunnelsPolicy
+): SandboxSettings {
   if (settingsJson === null) return {};
-  return normalizeSandboxSettings(JSON.parse(settingsJson), { invalid: "omit" });
+  return normalizeSandboxSettings(JSON.parse(settingsJson), { invalid: "omit", tunnelsPolicy });
 }
 
 /**
@@ -77,6 +93,10 @@ export function normalizeSandboxSettings(
 
   if (settings.tunnelPorts !== undefined) {
     normalizeTunnelPorts(settings.tunnelPorts, reject, result);
+    if (result.tunnelPorts && options.tunnelsPolicy === "disabled") {
+      delete result.tunnelPorts;
+      reject(SANDBOX_TUNNELS_DISABLED_MESSAGE);
+    }
   }
 
   const codeServerPort = normalizePort(settings.codeServerPort, "codeServerPort", reject);

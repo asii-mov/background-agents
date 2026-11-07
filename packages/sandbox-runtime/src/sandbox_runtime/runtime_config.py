@@ -127,16 +127,13 @@ class RuntimeConfig:
         parsed_session_config = json.loads(environment.get("SESSION_CONFIG", "{}"))
         if not isinstance(parsed_session_config, dict):
             raise ValueError("SESSION_CONFIG must contain a JSON object")
-        if parsed_session_config.get("harness") == "claude" and (
-            parsed_session_config.get("security_pipelines")
-            or any(
-                isinstance(server, dict) and server.get("artifactSha256")
-                for server in parsed_session_config.get("mcp_servers") or []
-            )
+        # Pipelines and the stack policy run in the harness-agnostic bridge; only pinned MCP
+        # artifacts need harness support Claude lacks.
+        if parsed_session_config.get("harness") == "claude" and any(
+            isinstance(server, dict) and server.get("artifactSha256")
+            for server in parsed_session_config.get("mcp_servers") or []
         ):
-            raise ValueError(
-                "Claude does not yet support governed MCP artifacts or security pipelines"
-            )
+            raise ValueError("Claude does not yet support governed MCP artifacts")
         session_config = _freeze_json(parsed_session_config)
         repo_path = workspace_path / repo_name if repo_owner and repo_name else workspace_path
         control_plane_url = environment.get("CONTROL_PLANE_URL", "")
