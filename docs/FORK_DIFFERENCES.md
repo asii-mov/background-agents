@@ -40,9 +40,12 @@ Node control-plane host. The repository map records which new UI areas still lac
   `integrations.manage` to change them. This update does not grant broad integration administration
   automatically.
 - Governed Claude launches and restrictive network policy on unsupported backends are rejected.
-- Slack and Linear first-contact actors follow upstream enrollment, which links a new actor to an
-  existing user by the email the bot reports. The fork previously refused display email as identity
-  proof. Upstream role inheritance depends on this link.
+- A Slack or Linear first-contact actor links to an existing user by the email that the bot reports
+  only when `identity_link_email_domains` lists the email's domain and that user verified the email
+  at a web sign-in. The linked actor inherits the user's roles, as in upstream. A bot report never
+  verifies an email, so it cannot match an email entry in `PLATFORM_ADMIN_USERS`. The default empty
+  list keeps every bot actor a separate user. Users that upstream's Slack and Linear attestation
+  verified before this change stay verified.
 - Node 24 is required. Use `.env.web.example` for the web app and `.env.example` for the Node
   backend.
 
@@ -65,6 +68,7 @@ The fork keeps the core Open-Inspect product:
 | Area                   | Difference from upstream                                                                                                                                                                                                                                             |
 | ---------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Platform roles         | Adds installation-wide member, editor, and administrator roles. Control-plane policies enforce catalogue writes and role management.                                                                                                                                 |
+| Identity linking       | Limits upstream's linking by bot-reported email to domains in `identity_link_email_domains` and to users who verified that email at a web sign-in. A bot report never verifies an email. Each link logs `auth.identity_linked_by_email`.                             |
 | Repository admission   | Requires a linked GitHub user to have `write`, `maintain`, or `admin` permission on every selected repository. The sandbox credential helper receives a short-lived read-only token limited to one admitted repository. Only the managed push receives write access. |
 | Managed Skills         | Adds required assignments, Git catalogue ownership, and import provenance checks to upstream Skills and session manifests.                                                                                                                                           |
 | Git governance         | Lets a reviewed Git repository own the desired state for shared Skills and MCP entries. Reconciliation validates one commit and activates a complete last-good catalogue.                                                                                            |
@@ -77,6 +81,9 @@ The fork keeps the core Open-Inspect product:
 
 ## User-visible behavior changes
 
+- Slack and Linear requests act as the sender's web account only when `identity_link_email_domains`
+  lists the sender's email domain. Otherwise they belong to a separate user with the workspace
+  default role.
 - A GitHub user with read-only or triage access cannot start a repository session.
 - Required Skills remain selected even when a user selects **None** or a personal profile.
 - When Git governance is configured, the application treats shared Skill and MCP metadata as

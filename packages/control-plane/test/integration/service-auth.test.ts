@@ -1,5 +1,5 @@
-import { describe, it, expect, beforeEach } from "vitest";
-import { SELF, env } from "cloudflare:test";
+import { describe, it, expect, beforeEach, vi } from "vitest";
+import { SELF, createExecutionContext, env, waitOnExecutionContext } from "cloudflare:test";
 import {
   ACTOR_HEADER,
   buildServiceAuthHeaders,
@@ -12,7 +12,7 @@ import { GlobalSecretsStore } from "../../src/db/global-secrets";
 import { UserStore } from "../../src/db/user-store";
 import { REPOS_CACHE_KEY, reposCacheIdentity } from "../../src/routes/repos";
 import { cleanD1Tables } from "./cleanup";
-import { initNamedSession, seedSandboxAuth } from "./helpers";
+import { initNamedSession, routeRequest, seedSandboxAuth } from "./helpers";
 
 const SERVICE_SECRET: Record<ServiceName, string> = {
   web: "test-service-secret-web",
@@ -20,6 +20,65 @@ const SERVICE_SECRET: Record<ServiceName, string> = {
   "github-bot": "test-service-secret-github-bot",
   "linear-bot": "test-service-secret-linear-bot",
 };
+
+/**
+ * Routes a first-contact bot session create under the given
+ * IDENTITY_LINK_EMAIL_DOMAINS, returning every console line it logged.
+ */
+async function createSessionAsFirstContact(p: {
+  service: "slack-bot" | "linear-bot";
+  actor: string;
+  actorEmail: string;
+  linkDomains: string;
+}): Promise<{ response: Response; logLines: string[] }> {
+  const url = "https://test.local/sessions";
+  const body = JSON.stringify({
+    title: "First contact",
+    model: "anthropic/claude-haiku-4-5",
+    actorEmail: p.actorEmail,
+  });
+  const request = new Request(url, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      ...(await buildServiceAuthHeaders({
+        service: p.service,
+        secret: SERVICE_SECRET[p.service],
+        method: "POST",
+        url,
+        body,
+        actor: p.actor,
+      })),
+    },
+    body,
+  });
+  const consoleMethods = ["log", "warn", "error"] as const;
+  const spies = consoleMethods.map((method) =>
+    vi.spyOn(console, method).mockImplementation(() => {})
+  );
+  try {
+    const executionCtx = createExecutionContext();
+    const response = await routeRequest(
+      request,
+      { ...env, IDENTITY_LINK_EMAIL_DOMAINS: p.linkDomains },
+      executionCtx
+    );
+    await waitOnExecutionContext(executionCtx);
+    return { response, logLines: spies.flatMap((spy) => spy.mock.calls.map(String)) };
+  } finally {
+    for (const spy of spies) spy.mockRestore();
+  }
+}
+
+function loggedEvents(logLines: string[]): Record<string, unknown>[] {
+  return logLines.flatMap((line) => {
+    try {
+      return [JSON.parse(line) as Record<string, unknown>];
+    } catch {
+      return [];
+    }
+  });
+}
 
 async function signedFetch(p: {
   service: ServiceName;
@@ -485,7 +544,7 @@ describe("sig1 service-credential authentication", () => {
     });
   });
 
-  it("denies a first-contact Slack actor using the Viewer role selected by its attested email", async () => {
+  it("denies a first-contact Slack actor using the Viewer role selected by its allowed-domain email", async () => {
     const users = new UserStore(env.DB);
     const viewer = await users.createUser({
       displayName: "Existing Viewer",
@@ -617,7 +676,88 @@ describe("sig1 service-credential authentication", () => {
     ).resolves.toEqual({ title: "Readable after claim extraction", userId: member.id });
   });
 
-  it("denies a first-contact Linear actor whose attested email selects a suspended Member", async () => {
+  it.each([
+    {
+      service: "slack-bot",
+      provider: "slack",
+      subject: "U-LINK-ALLOWED",
+      linkDomains: "corp.test",
+    },
+    {
+      service: "linear-bot",
+      provider: "linear",
+      subject: "LINK-ALLOWED",
+      linkDomains: " Other.Test , CORP.TEST ",
+    },
+  ] as const)(
+    "links a first-contact $provider actor to the verified owner and audits it without the email",
+    async ({ service, provider, subject, linkDomains }) => {
+      const users = new UserStore(env.DB);
+      const member = await users.createUser({
+        displayName: "Linked Member",
+        email: "linked@corp.test",
+        emailVerified: true,
+      });
+      await env.DB.prepare("UPDATE user_role_assignments SET role_id = ? WHERE user_id = ?")
+        .bind("role_builtin_member", member.id)
+        .run();
+
+      const { response, logLines } = await createSessionAsFirstContact({
+        service,
+        actor: `${provider}:${subject}`,
+        actorEmail: "linked@corp.test",
+        linkDomains,
+      });
+
+      expect(response.status).toBe(201);
+      await expect(users.getIdentity(provider, subject)).resolves.toMatchObject({
+        userId: member.id,
+      });
+      expect(loggedEvents(logLines)).toContainEqual(
+        expect.objectContaining({
+          event: "auth.identity_linked_by_email",
+          provider,
+          actor: `${provider}:${subject}`,
+          email_domain: "corp.test",
+          user_id: member.id,
+          request_id: expect.any(String),
+        })
+      );
+      expect(logLines.join("\n")).not.toContain("linked@corp.test");
+    }
+  );
+
+  it.each([
+    { service: "slack-bot", provider: "slack", subject: "U-LINK-UNSET" },
+    { service: "linear-bot", provider: "linear", subject: "LINK-UNSET" },
+  ] as const)(
+    "keeps a first-contact $provider actor standalone when no link domain is configured",
+    async ({ service, provider, subject }) => {
+      const users = new UserStore(env.DB);
+      const member = await users.createUser({
+        displayName: "Unlinked Member",
+        email: "unlinked@corp.test",
+        emailVerified: true,
+      });
+
+      const { logLines } = await createSessionAsFirstContact({
+        service,
+        actor: `${provider}:${subject}`,
+        actorEmail: "unlinked@corp.test",
+        linkDomains: "",
+      });
+
+      const identity = await users.getIdentity(provider, subject);
+      expect(identity).toMatchObject({ providerEmail: "unlinked@corp.test" });
+      expect(identity?.userId).not.toBe(member.id);
+      await expect(users.getUserById(identity!.userId)).resolves.toMatchObject({ email: null });
+      expect(loggedEvents(logLines).map((entry) => entry.event)).not.toContain(
+        "auth.identity_linked_by_email"
+      );
+    }
+  );
+
+  it("denies a first-contact Linear actor whose allowed-domain email selects a suspended Member", async () => {
     const users = new UserStore(env.DB);
     const suspended = await users.createUser({
       displayName: "Suspended Member",
@@ -654,7 +794,7 @@ describe("sig1 service-credential authentication", () => {
     ).resolves.toMatchObject({ count: 0 });
   });
 
-  it("denies a first-contact actor whose attested email selects an unassigned user", async () => {
+  it("denies a first-contact actor whose allowed-domain email selects an unassigned user", async () => {
     const users = new UserStore(env.DB);
     const unassigned = await users.createUser({
       displayName: "Unassigned User",

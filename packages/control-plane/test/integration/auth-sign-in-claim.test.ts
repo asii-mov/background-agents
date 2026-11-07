@@ -3,7 +3,7 @@ import { getSetCookies } from "./helpers";
 import { BROWSER_AUTH_CLIENT_IP_HEADER } from "@open-inspect/shared/browser-auth-routes";
 import { buildServiceAuthHeaders } from "@open-inspect/shared/service-auth";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import { UserStore } from "../../src/db/user-store";
+import { parseEmailLinkPolicy, UserStore } from "../../src/db/user-store";
 import { routeRequest } from "./helpers";
 import { cleanD1Tables } from "./cleanup";
 import { createSignedGoogleIdToken } from "./google-id-token";
@@ -221,6 +221,37 @@ describe("email claim (bot-first users with an attributed email)", () => {
     });
     // No second canonical user was registered.
     expect(await countTableRows("users")).toBe(1);
+  });
+
+  it("signs a Slack-first user into their bot-created row once OAuth proves the allowed-domain email", async () => {
+    const slack = await new UserStore(env.DB).resolveOrCreateUser(
+      { provider: "slack", providerUserId: "U0SLACKFIRST", providerEmail: "octocat@example.com" },
+      parseEmailLinkPolicy("example.com")
+    );
+    expect(await getUserRow(slack.id)).toMatchObject({
+      email: "octocat@example.com",
+      email_verified: 0,
+    });
+
+    const { sessionUser } = await signIn("github");
+
+    expect(sessionUser?.id).toBe(slack.id);
+    expect(await getUserRow(slack.id)).toMatchObject({ email_verified: 1 });
+    expect(await countTableRows("users")).toBe(1);
+  });
+
+  it("registers its own user when the Slack-reported email was outside the allowed domains", async () => {
+    const slack = await new UserStore(env.DB).resolveOrCreateUser(
+      { provider: "slack", providerUserId: "U0SLACKOUTSIDE", providerEmail: "octocat@example.com" },
+      parseEmailLinkPolicy(undefined)
+    );
+
+    const { sessionUser } = await signIn("github");
+
+    expect(sessionUser).not.toBeNull();
+    expect(sessionUser?.id).not.toBe(slack.id);
+    expect(await getUserRow(slack.id)).toMatchObject({ email: null, email_verified: 0 });
+    expect(await getIdentityRow("slack", "U0SLACKOUTSIDE")).toMatchObject({ user_id: slack.id });
   });
 
   it("heals an unverified email owner that already has identities from other providers", async () => {

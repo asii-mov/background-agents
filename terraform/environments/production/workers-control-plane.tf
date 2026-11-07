@@ -97,6 +97,7 @@ module "control_plane_worker" {
       UNSAFE_ALLOW_ALL_USERS        = { value = tostring(var.unsafe_allow_all_users) }
       PLATFORM_ADMIN_USERS          = { value = var.platform_admin_users }
       PLATFORM_EDITOR_USERS         = { value = var.platform_editor_users }
+      IDENTITY_LINK_EMAIL_DOMAINS   = { value = var.identity_link_email_domains }
       WORKER_URL                    = { value = local.control_plane_url }
       DEPLOYMENT_NAME               = { value = var.deployment_name }
       APP_NAME                      = { value = var.app_name }

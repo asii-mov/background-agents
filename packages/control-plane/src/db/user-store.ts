@@ -21,26 +21,47 @@ export interface ProviderIdentity {
 }
 
 /**
- * Ingress providers whose attributed emails are platform-verified mailboxes
- * fetched server-side by first-party bots: Slack confirms every address at
- * signup and on change, and Linear's email is its login credential. Emails
- * written from these providers carry verification (`email_verified = 1`) —
- * the same weight as a completed OAuth sign-in proof, and what admits the
- * user through Better Auth's implicit-linking gate at their first web
- * sign-in. Every other provider's attribution stays unproven until the
- * sign-in claim mints proof; a new ingress provider must be added here
- * deliberately, never by default.
+ * Which provider-reported emails may link an identity to an existing user.
+ * A reported email is never mailbox proof. It links only inside an allowed
+ * domain and only to a user whose email a completed OAuth sign-in verified.
  */
-const EMAIL_ATTESTING_PROVIDERS: ReadonlySet<ProviderIdentity["provider"]> = new Set([
-  "slack",
-  "linear",
-]);
+export interface EmailLinkPolicy {
+  /** Exact lowercase domains, such as `corp.example`. Empty never links. */
+  readonly allowedEmailDomains: ReadonlySet<string>;
+}
+
+/** Parses the comma-separated `IDENTITY_LINK_EMAIL_DOMAINS` setting. */
+export function parseEmailLinkPolicy(domains: string | undefined): EmailLinkPolicy {
+  return {
+    allowedEmailDomains: new Set(
+      (domains ?? "")
+        .split(",")
+        .map((domain) => domain.trim().toLowerCase())
+        .filter(Boolean)
+    ),
+  };
+}
+
+const NO_EMAIL_LINKS = parseEmailLinkPolicy(undefined);
+
+interface LinkableEmail {
+  address: string;
+  domain: string;
+}
+
+function linkableEmail(email: string | null, policy: EmailLinkPolicy): LinkableEmail | null {
+  const [local, domain, ...rest] = email?.split("@") ?? [];
+  if (!email || !local || !domain || rest.length > 0) return null;
+  return policy.allowedEmailDomains.has(domain) ? { address: email, domain } : null;
+}
 
 export interface ResolvedUser {
   id: string;
   displayName: string | null;
   email: string | null;
   isNew: boolean;
+  /** The allowed domain whose email linked this identity to an existing user, if one did. */
+  linkedByEmailDomain: string | null;
 }
 
 export interface User {
@@ -67,7 +88,7 @@ export interface UserIdentity {
 export interface NewUser {
   displayName?: string;
   email?: string;
-  /** Whether `email` comes with mailbox-ownership proof (attesting provider). */
+  /** Whether `email` comes with mailbox-ownership proof. */
   emailVerified?: boolean;
   avatarUrl?: string;
 }
@@ -84,8 +105,6 @@ export interface UserUpdate {
   displayName?: string;
   avatarUrl?: string;
   email?: string;
-  /** Only meaningful alongside `email`: its mailbox-ownership proof. */
-  emailVerified?: boolean;
 }
 
 // ── Row types (D1 snake_case) ───────────────────────────────────────
@@ -217,16 +236,19 @@ export class UserStore {
 
   /**
    * Core resolution entry point. Finds or creates a canonical user for the
-   * given provider identity, with automatic email-based cross-provider linking.
+   * given provider identity, linking by email only as `linkPolicy` allows.
    *
    * On UNIQUE constraint violation (concurrent race), retries the lookup once.
    */
-  async resolveOrCreateUser(identity: ProviderIdentity): Promise<ResolvedUser> {
+  async resolveOrCreateUser(
+    identity: ProviderIdentity,
+    linkPolicy: EmailLinkPolicy = NO_EMAIL_LINKS
+  ): Promise<ResolvedUser> {
     try {
-      return await this.doResolveOrCreate(identity);
+      return await this.doResolveOrCreate(identity, linkPolicy);
     } catch (err) {
       if (isUniqueConstraintError(err)) {
-        return await this.doResolveOrCreate(identity);
+        return await this.doResolveOrCreate(identity, linkPolicy);
       }
       throw err;
     }
@@ -348,13 +370,10 @@ export class UserStore {
     }
     if (updates.email !== undefined) {
       // A blank email normalizes to null — treated as absent, never stored.
-      // Verification travels with the email: it reflects the new address's
-      // proof (attesting provider or not), never the old address's state.
-      const email = normalizeEmail(updates.email);
+      // A new address arrives unproven. Only the sign-in claim verifies it.
       sets.push("email = ?");
-      values.push(email);
-      sets.push("email_verified = ?");
-      values.push(email !== null && updates.emailVerified === true ? 1 : 0);
+      values.push(normalizeEmail(updates.email));
+      sets.push("email_verified = 0");
     }
 
     if (sets.length === 0) return;
@@ -371,8 +390,12 @@ export class UserStore {
 
   // ── Private ─────────────────────────────────────────────────────
 
-  private async doResolveOrCreate(identity: ProviderIdentity): Promise<ResolvedUser> {
+  private async doResolveOrCreate(
+    identity: ProviderIdentity,
+    linkPolicy: EmailLinkPolicy
+  ): Promise<ResolvedUser> {
     const normalizedEmail = normalizeEmail(identity.providerEmail);
+    const linkable = linkableEmail(normalizedEmail, linkPolicy);
 
     // Step 1: Look up by provider identity
     const existing = await this.getIdentity(identity.provider, identity.providerUserId);
@@ -397,21 +420,18 @@ export class UserStore {
         updates.avatarUrl = identity.avatarUrl;
       }
 
-      // Step 2c: Backfill email if user has none and provider now has one.
+      // Step 2c: Backfill an allowed-domain email if the user has none.
       // The check-then-update is racy (a concurrent writer could claim the email
       // between the SELECT and UPDATE), but the outer retry in resolveOrCreateUser
       // handles this: on retry, emailOwner is non-null and we re-link instead.
-      if (!user.email && normalizedEmail) {
-        const emailOwner = await this.getUserByEmail(normalizedEmail);
+      if (!user.email && linkable) {
+        const emailOwner = await this.getUserByEmail(linkable.address);
         if (!emailOwner) {
-          updates.email = normalizedEmail;
-          updates.emailVerified = EMAIL_ATTESTING_PROVIDERS.has(identity.provider);
-        } else if (emailOwner.id !== user.id) {
-          // Another user owns this email — re-link this identity to that user.
-          // This prevents permanent identity splits when e.g. a Slack identity
-          // (created without email) later discovers the same email that a GitHub
-          // identity already registered. Same principle as step 3 (email-based
-          // cross-provider linking) but for existing identities.
+          updates.email = linkable.address;
+        } else if (emailOwner.emailVerified) {
+          // Re-link this identity to the verified owner of its email. This
+          // heals the split left when e.g. a Slack identity created without an
+          // email later reports the email a GitHub sign-in already proved.
           await this.db
             .prepare("UPDATE user_identities SET user_id = ? WHERE id = ?")
             .bind(emailOwner.id, existing.id)
@@ -421,6 +441,7 @@ export class UserStore {
             displayName: emailOwner.displayName,
             email: emailOwner.email,
             isNew: false,
+            linkedByEmailDomain: linkable.domain,
           };
         }
       }
@@ -434,27 +455,28 @@ export class UserStore {
         displayName: updates.displayName ?? user.displayName,
         email: updates.email ?? user.email,
         isNew: false,
+        linkedByEmailDomain: null,
       };
     }
 
-    // Step 3: No identity found — try email-based cross-provider linking
-    if (normalizedEmail) {
-      const emailUser = await this.getUserByEmail(normalizedEmail);
-      if (emailUser) {
-        await this.createIdentity({
-          userId: emailUser.id,
-          provider: identity.provider,
-          providerUserId: identity.providerUserId,
-          providerLogin: identity.providerLogin,
-          providerEmail: normalizedEmail,
-        });
-        return {
-          id: emailUser.id,
-          displayName: emailUser.displayName,
-          email: emailUser.email,
-          isNew: false,
-        };
-      }
+    // Step 3: No identity found — link to the verified owner of an
+    // allowed-domain email
+    const emailOwner = linkable ? await this.getUserByEmail(linkable.address) : null;
+    if (linkable && emailOwner?.emailVerified) {
+      await this.createIdentity({
+        userId: emailOwner.id,
+        provider: identity.provider,
+        providerUserId: identity.providerUserId,
+        providerLogin: identity.providerLogin,
+        providerEmail: linkable.address,
+      });
+      return {
+        id: emailOwner.id,
+        displayName: emailOwner.displayName,
+        email: emailOwner.email,
+        isNew: false,
+        linkedByEmailDomain: linkable.domain,
+      };
     }
 
     // Step 4: Brand new user — batch user + identity creation so a UNIQUE
@@ -466,16 +488,16 @@ export class UserStore {
     const displayName = identity.displayName ?? null;
     const avatarUrl = identity.avatarUrl ?? null;
     const issuer = getSignInProviderIssuer(identity.provider);
-
-    const emailVerified =
-      normalizedEmail !== null && EMAIL_ATTESTING_PROVIDERS.has(identity.provider);
+    // A later OAuth sign-in proving users.email verifies this row and links
+    // into it, so only an allowed-domain address nobody owns may land there.
+    const email = linkable && !emailOwner ? linkable.address : null;
 
     await this.db.batch([
       this.db
         .prepare(
-          "INSERT INTO users (id, display_name, email, email_verified, avatar_url, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)"
+          "INSERT INTO users (id, display_name, email, email_verified, avatar_url, created_at, updated_at) VALUES (?, ?, ?, 0, ?, ?, ?)"
         )
-        .bind(userId, displayName, normalizedEmail, emailVerified ? 1 : 0, avatarUrl, now, now),
+        .bind(userId, displayName, email, avatarUrl, now, now),
       this.db
         .prepare(
           "INSERT INTO user_identities (id, user_id, provider, provider_user_id, provider_login, provider_email, provider_issuer, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
@@ -495,8 +517,9 @@ export class UserStore {
     return {
       id: userId,
       displayName,
-      email: normalizedEmail,
+      email,
       isNew: true,
+      linkedByEmailDomain: null,
     };
   }
 

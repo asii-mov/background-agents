@@ -41,6 +41,18 @@ admins can assign persisted roles under **Settings > AppSec** afterward.
 Write SCM logins as provider-scoped identifiers such as `github:octocat`. Bare login names and
 unverified email addresses do not grant a bootstrap role.
 
+Slack and Linear bots report each sender's email address. The control plane never treats that report
+as proof of the address, so it cannot satisfy an email entry in `platform_admin_users` or
+`platform_editor_users`. A first-contact bot actor links to an existing user only under two
+conditions. `identity_link_email_domains` lists the address's domain, and that user verified the
+address through a GitHub or Google sign-in. The actor then acts with that user's roles, and the
+control plane logs `auth.identity_linked_by_email` with the provider, actor, email domain, target
+user, and request ID. If no user owns an allowed-domain address yet, the actor's user keeps it
+unverified, and a later sign-in that proves the address signs in to that same user. List only
+domains whose Slack and Linear accounts your company administers, because anyone who can set an
+address in those domains on a bot account can act as its owner. The default empty list never links,
+so each bot actor stays a separate user with the workspace default role.
+
 All catalogue mutation routes enforce `catalog.write` in the control plane. Hiding controls in the
 web UI is only a usability measure, not the authorization boundary. Role changes enforce
 `platform.manage` and are logged with actor, target, role, request ID, and trace ID.
