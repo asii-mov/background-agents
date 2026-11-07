@@ -23,7 +23,7 @@ Use TodoWrite to create a checklist tracking these phases:
 4. GitHub App creation (+ Google OAuth if enabled)
 5. Slack App creation (if enabled)
 6. Security secrets generation
-7. Terraform configuration
+7. Terraform configuration (+ internal app hosting if enabled)
 8. Terraform deployment (two phases)
 9. Post-deployment Slack setup (if enabled)
 10. Post-deployment GitHub Bot setup (if enabled)
@@ -54,12 +54,15 @@ Use AskUserQuestion to gather:
 5. **Slack integration** - Yes or No
 6. **GitHub bot integration** - Yes or No (automated PR reviews and comment-triggered actions)
 7. **Sign-in providers** - GitHub, Google, or both. At least one is required.
-8. **Admission mode** - Restricted (collect the allowed GitHub usernames, exact verified emails,
+8. **Internal app hosting** - Yes or No. Yes lets agents deploy internal apps behind Cloudflare
+   Access in a second, dedicated Cloudflare account (`docs/APPS.md`). It can be added later.
+9. **Admission mode** - Restricted (collect the allowed GitHub usernames, exact verified emails,
    email domains, and/or GitHub orgs) or explicitly open to any authenticated user (no allowlists).
    Validate the chosen providers and admission mode against the compatibility table and allowlist
    rules in Step 5 of `docs/GETTING_STARTED.md` before proceeding.
-9. **Prerequisites confirmation** - Confirm they have Cloudflare, Modal, Anthropic, and GitHub
-   accounts, plus Vercel only if selected above.
+10. **Prerequisites confirmation** - Confirm they have Cloudflare, Modal, Anthropic, and GitHub
+    accounts, plus Vercel only if selected above, plus the dedicated apps Cloudflare account if app
+    hosting was selected.
 
 ## Phase 2: Repository Setup
 
@@ -256,6 +259,29 @@ github_webhook_secret = "{generated_value}"
 github_bot_username   = "{app-slug}[bot]"
 ```
 
+### Internal App Hosting (If Enabled)
+
+Walk the user through "Before you start", "Choose the apps domain" and "Set up Access in the apps
+account" in `docs/APPS.md`. Collect the apps account ID, the apps zone ID, the apps domain, the apps
+team domain, the visitor include rules, and a Terraform API token for the apps account with the
+permissions listed there. The apps account and its token must differ from the platform's; Terraform
+refuses both otherwise. Then add to `terraform.tfvars`:
+
+```hcl
+apps_enabled               = true
+apps_cloudflare_account_id = "{apps_account_id}"
+apps_cloudflare_api_token  = "{apps_terraform_token}"
+apps_zone_id               = "{apps_zone_id}"
+apps_domain                = "{apps_domain}"
+apps_access_team_domain    = "https://{apps_team}.cloudflareaccess.com"
+apps_access_include        = [{ email_domain = { domain = "{corp_domain}" } }]
+sandbox_tunnels_policy     = "disabled"
+```
+
+Ask before setting `app_data_jurisdiction` (`eu` or `fedramp`); it cannot change for existing app
+data. Leave `apps_hosting_backend` at its `workers` default unless the user has Workers for
+Platforms.
+
 ## Phase 8: Terraform Deployment (Two-Phase)
 
 **Important**: Build the workers before running Terraform (Terraform references the built bundles):
@@ -263,6 +289,8 @@ github_bot_username   = "{app-slug}[bot]"
 ```bash
 npm run build -w @open-inspect/control-plane -w @open-inspect/slack-bot -w @open-inspect/github-bot
 ```
+
+If internal app hosting is enabled, also run `npm run build -w @open-inspect/app-broker`.
 
 **Phase 1** (bindings disabled):
 
@@ -376,7 +404,8 @@ curl -I "$(terraform -chdir=terraform/environments/production output -raw web_ap
 ```
 
 Present a deployment summary table. Instruct the user to test: visit the web app, sign in with each
-configured provider, create a session, and send a prompt.
+configured provider, create a session, and send a prompt. If internal app hosting is enabled, run
+the checks in "Check the deployment" of `docs/APPS.md`.
 
 ## Phase 14: CI/CD Setup (Optional)
 

@@ -47,6 +47,11 @@ locals {
       name = binding_name
       text = binding.value
     }],
+    [for binding_name, binding in var.dispatch_namespaces : {
+      type      = "dispatch_namespace"
+      name      = binding_name
+      namespace = binding.namespace
+    }],
     # Durable Object bindings (disabled only for initial class creation)
     var.enable_durable_object_bindings ? [for binding_name, binding in var.durable_objects : {
       type       = "durable_object_namespace"
@@ -64,9 +69,10 @@ resource "cloudflare_worker" "this" {
   account_id = var.account_id
   name       = var.worker_name
 
-  # Enable workers.dev subdomain for direct access
+  # A null previews_enabled leaves an existing Worker's preview setting as it is.
   subdomain = {
-    enabled = true
+    enabled          = var.workers_dev_enabled
+    previews_enabled = var.workers_dev_enabled ? null : false
   }
 
   observability = {

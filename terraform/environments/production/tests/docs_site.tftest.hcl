@@ -14,6 +14,8 @@ mock_provider "random" {}
 mock_provider "vercel" {}
 
 variables {
+  cf_access_team_domain       = "https://test-team.cloudflareaccess.com"
+  cf_access_aud               = "test-openinspect-audience"
   cloudflare_api_token        = "test-cloudflare-token"
   cloudflare_account_id       = "test-account"
   cloudflare_worker_subdomain = "test-account"
@@ -69,9 +71,10 @@ run "docs_site_builds_from_the_docs_package" {
 run "docs_site_is_separate_from_the_web_app" {
   command = plan
   variables {
-    docs_site_enabled = true
-    web_platform      = "vercel"
-    vercel_team_id    = "test-team"
+    docs_site_enabled    = true
+    web_platform         = "vercel"
+    vercel_custom_domain = "inspect.example.com"
+    vercel_team_id       = "test-team"
   }
   assert {
     condition     = module.docs_site[0].project_name != module.web_app[0].project_name

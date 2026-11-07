@@ -440,6 +440,11 @@ unsafe_allow_all_users = false
 platform_admin_users  = "security-lead@example.com"
 platform_editor_users = "appsec@example.com,github:platform-engineering"
 
+# Email domains in which a Slack- or Linear-reported email may link a bot actor
+# to the existing user who proved that email at web sign-in. The linked actor
+# inherits that user's roles. Leave empty to keep every bot actor a separate user.
+# identity_link_email_domains = "corp.example"
+
 # Optional Git-backed catalogue. When enabled, Skill and MCP metadata is edited
 # through pull requests; the control plane reconciles it every 15 minutes.
 # The Git MCP definition declares an automatic channel/range, while the runtime
@@ -455,3 +460,27 @@ governance_mcp_builder_url  = "https://mcp-artifact-builder.example.com"
 # tfvars/CI secret, not by committing it here.
 # governance_npm_registry_token = "..."
 # governance_mcp_builder_token  = "..."
+
+# =============================================================================
+# Internal app hosting (optional; see docs/APPS.md)
+# =============================================================================
+# Agent-built apps deploy to https://<name>.<apps_domain> in a dedicated
+# Cloudflare account, behind Cloudflare Access. Terraform creates the visitor
+# policy, the *.<apps_domain> Access floor, and the broker Worker that alone
+# holds the apps-account token.
+# apps_enabled               = true
+# apps_cloudflare_account_id = "0123456789abcdef0123456789abcdef"
+# apps_zone_id               = "fedcba9876543210fedcba9876543210"
+# apps_domain                = "acme-apps.example"
+# apps_access_team_domain    = "https://acme-apps.cloudflareaccess.com"
+# apps_access_include        = [{ email_domain = { domain = "corp.example" } }]
+# apps_access_require        = []          # e.g. device posture rules
+# apps_hosting_backend       = "workers"   # or "dispatch-namespace"
+# app_data_jurisdiction      = ""          # "", "eu" or "fedramp"
+#
+# Keep the apps account's Terraform token out of Git: supply it through a
+# secure tfvars file or the APPS_CLOUDFLARE_API_TOKEN CI secret.
+# apps_cloudflare_api_token = "..."
+#
+# Turn off public sandbox preview tunnels once apps can be deployed.
+# sandbox_tunnels_policy = "disabled"

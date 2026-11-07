@@ -39,6 +39,28 @@ test("Classifier-only Anthropic key reaches Terraform plan and apply", () => {
   );
 });
 
+test("The apps account token reaches Terraform from its own secret", () => {
+  assertInPlanAndApply(
+    "TF_VAR_apps_cloudflare_api_token: ${{ secrets.APPS_CLOUDFLARE_API_TOKEN }}",
+    "apps account token"
+  );
+});
+
+test("Unset apps Access rules reach Terraform as empty lists", () => {
+  assertInPlanAndApply(
+    "TF_VAR_apps_access_include: \"${{ vars.APPS_ACCESS_INCLUDE || '[]' }}\"",
+    "apps Access include rules"
+  );
+  assertInPlanAndApply(
+    "TF_VAR_apps_access_require: \"${{ vars.APPS_ACCESS_REQUIRE || '[]' }}\"",
+    "apps Access require rules"
+  );
+});
+
+test("Plan and apply build the app broker bundle Terraform uploads", () => {
+  assertInPlanAndApply("npm run build -w @open-inspect/app-broker\n", "app broker build");
+});
+
 // Inputs the workflow deliberately does not take from the environment:
 // control_plane_* values are staged per migration (the "Stage SchedulerDO
 // deletion migration" step writes them to an auto.tfvars.json file), and
