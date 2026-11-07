@@ -192,6 +192,27 @@ export default tseslint.config(
     },
   },
 
+  // The app broker runs on workerd in the apps account. Its production modules
+  // never import Node built-ins or the in-memory Cloudflare fake its tests use.
+  {
+    files: ["packages/app-broker/{src,guard,dispatcher}/**/*.ts"],
+    ignores: ["packages/app-broker/**/*.test.ts"],
+    rules: {
+      "no-restricted-imports": [
+        "error",
+        {
+          patterns: [
+            { regex: "^node:", message: "The broker runs on workerd; use Web APIs." },
+            {
+              regex: "(?:^|/)test/",
+              message: "Production broker code must not import test support such as the fake.",
+            },
+          ],
+        },
+      ],
+    },
+  },
+
   // Control-plane data-layer boundary: all production code must use the
   // injected SqlDatabase (ctx.db, a DO's db field, or a db parameter), never
   // the raw env.DB binding — reading the binding elsewhere would silently
