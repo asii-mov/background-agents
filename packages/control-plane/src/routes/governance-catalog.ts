@@ -1,7 +1,7 @@
 import { Hono } from "hono";
 import { admit, dispatch } from "../routing/admit";
 import type { ControlPlaneHonoEnv } from "../routing/hono-env";
-import { activeGlobal } from "./shared";
+import { requirePermission } from "./shared";
 import type { Env } from "../types";
 import { getGovernanceCatalogStatus, reconcileGovernanceCatalog } from "../governance/reconciler";
 import { SCM_AGNOSTIC_USER_OR_SERVICE_ROUTE, type RequestContext, json, error } from "./shared";
@@ -35,18 +35,19 @@ async function handleSync(
   }
 }
 
+const GOVERNANCE_READ = admit({
+  ...SCM_AGNOSTIC_USER_OR_SERVICE_ROUTE,
+  authorization: requirePermission("governance.read"),
+});
+const GOVERNANCE_MANAGE = admit({
+  ...SCM_AGNOSTIC_USER_OR_SERVICE_ROUTE,
+  authorization: requirePermission("governance.manage"),
+});
+
 export const governanceCatalogRoutes = new Hono<ControlPlaneHonoEnv>();
-governanceCatalogRoutes.get(
-  "/governance/catalog",
-  admit({ ...SCM_AGNOSTIC_USER_OR_SERVICE_ROUTE, authorization: activeGlobal() }),
-  (c) => dispatch(c, handleStatus)
+governanceCatalogRoutes.get("/governance/catalog", GOVERNANCE_READ, (c) =>
+  dispatch(c, handleStatus)
 );
-governanceCatalogRoutes.post(
-  "/governance/catalog/sync",
-  admit({
-    ...SCM_AGNOSTIC_USER_OR_SERVICE_ROUTE,
-    authorization: activeGlobal(),
-    requiredPermission: "catalog.write",
-  }),
-  (c) => dispatch(c, handleSync)
+governanceCatalogRoutes.post("/governance/catalog/sync", GOVERNANCE_MANAGE, (c) =>
+  dispatch(c, handleSync)
 );

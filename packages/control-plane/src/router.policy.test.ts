@@ -39,11 +39,11 @@ describe("route policy table", () => {
   });
 
   it("publishes the complete canonical route catalog", () => {
-    expect(routes).toHaveLength(254);
+    expect(routes).toHaveLength(264);
 
     const paths = routes.map((route) => route.path);
-    expect(new Set(paths).size).toBe(193);
-    expect(new Set(routes.map((route) => `${route.method}:${route.path}`)).size).toBe(254);
+    expect(new Set(paths).size).toBe(201);
+    expect(new Set(routes.map((route) => `${route.method}:${route.path}`)).size).toBe(264);
     expect(routeFor("POST", "/sessions/session-1/sandbox-memory/search")).toMatchObject({
       authentication: { kind: "sandbox" },
       supportedScmProviders: "all",
@@ -597,15 +597,41 @@ describe("route policy table", () => {
     ["PUT", "/mcp-servers/mcp-1"],
     ["PUT", "/mcp-servers/mcp-1/credentials"],
     ["DELETE", "/mcp-servers/mcp-1"],
-    ["POST", "/security-pipelines"],
-    ["PUT", "/security-pipelines/pipeline-1"],
-    ["DELETE", "/security-pipelines/pipeline-1"],
-    ["PUT", "/repository-risk"],
-    ["POST", "/approved-components"],
-    ["PUT", "/approved-components/component-1"],
-    ["DELETE", "/approved-components/component-1"],
   ])("requires catalog.write for %s %s", (method, path) => {
     expect(routeFor(method, path)?.requiredPermission).toBe("catalog.write");
+  });
+
+  it.each([
+    ["GET", "/approved-components", "governance.read"],
+    ["GET", "/approved-components/component-1/consumers", "governance.read"],
+    ["GET", "/component-categories", "governance.read"],
+    ["GET", "/security-pipelines", "governance.read"],
+    ["GET", "/repository-risk", "governance.read"],
+    ["POST", "/risk/assess", "governance.read"],
+    ["GET", "/governance/catalog", "governance.read"],
+    ["GET", "/stack-policy/preview", "governance.read"],
+    ["GET", "/stack-policy/export", "governance.read"],
+    ["GET", "/stack-inventory", "governance.read"],
+    ["GET", "/stack-inventory/rollup", "governance.read"],
+    ["GET", "/stack-inventory/repositories/acme/web", "governance.read"],
+    ["POST", "/approved-components", "governance.manage"],
+    ["PUT", "/approved-components/component-1", "governance.manage"],
+    ["DELETE", "/approved-components/component-1", "governance.manage"],
+    ["POST", "/component-categories", "governance.manage"],
+    ["PUT", "/component-categories/web-frontend", "governance.manage"],
+    ["DELETE", "/component-categories/web-frontend", "governance.manage"],
+    ["POST", "/security-pipelines", "governance.manage"],
+    ["PUT", "/security-pipelines/pipeline-1", "governance.manage"],
+    ["DELETE", "/security-pipelines/pipeline-1", "governance.manage"],
+    ["PUT", "/repository-risk", "governance.manage"],
+    ["POST", "/governance/catalog/sync", "governance.manage"],
+  ])("gates %s %s on %s alone", (method, path, permission) => {
+    const route = routeFor(method, path);
+    expect(route?.authorization).toMatchObject({
+      kind: "active-user",
+      allOf: [{ kind: "permission", permission }],
+    });
+    expect(route?.requiredPermission).toBeUndefined();
   });
 
   it.each([

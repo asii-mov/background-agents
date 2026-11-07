@@ -2,7 +2,7 @@ import { parseJsonBody } from "./body";
 import { Hono } from "hono";
 import { admit, dispatch } from "../routing/admit";
 import type { ControlPlaneHonoEnv } from "../routing/hono-env";
-import { activeGlobal } from "./shared";
+import { requirePermission } from "./shared";
 import {
   createSecurityPipelineSchema,
   updateSecurityPipelineSchema,
@@ -90,36 +90,25 @@ async function deletePipeline(
   return deleted ? json({ ok: true }) : error("Security pipeline not found", 404);
 }
 
+const GOVERNANCE_READ = admit({
+  ...SCM_AGNOSTIC_USER_OR_SERVICE_ROUTE,
+  authorization: requirePermission("governance.read"),
+});
+const GOVERNANCE_MANAGE = admit({
+  ...SCM_AGNOSTIC_USER_OR_SERVICE_ROUTE,
+  authorization: requirePermission("governance.manage"),
+});
+
 export const securityPipelineRoutes = new Hono<ControlPlaneHonoEnv>();
-securityPipelineRoutes.get(
-  "/security-pipelines",
-  admit({ ...SCM_AGNOSTIC_USER_OR_SERVICE_ROUTE, authorization: activeGlobal() }),
-  (c) => dispatch(c, listPipelines)
+securityPipelineRoutes.get("/security-pipelines", GOVERNANCE_READ, (c) =>
+  dispatch(c, listPipelines)
 );
-securityPipelineRoutes.post(
-  "/security-pipelines",
-  admit({
-    ...SCM_AGNOSTIC_USER_OR_SERVICE_ROUTE,
-    authorization: activeGlobal(),
-    requiredPermission: "catalog.write",
-  }),
-  (c) => dispatch(c, createPipeline)
+securityPipelineRoutes.post("/security-pipelines", GOVERNANCE_MANAGE, (c) =>
+  dispatch(c, createPipeline)
 );
-securityPipelineRoutes.put(
-  "/security-pipelines/:id",
-  admit({
-    ...SCM_AGNOSTIC_USER_OR_SERVICE_ROUTE,
-    authorization: activeGlobal(),
-    requiredPermission: "catalog.write",
-  }),
-  (c) => dispatch(c, updatePipeline)
+securityPipelineRoutes.put("/security-pipelines/:id", GOVERNANCE_MANAGE, (c) =>
+  dispatch(c, updatePipeline)
 );
-securityPipelineRoutes.delete(
-  "/security-pipelines/:id",
-  admit({
-    ...SCM_AGNOSTIC_USER_OR_SERVICE_ROUTE,
-    authorization: activeGlobal(),
-    requiredPermission: "catalog.write",
-  }),
-  (c) => dispatch(c, deletePipeline)
+securityPipelineRoutes.delete("/security-pipelines/:id", GOVERNANCE_MANAGE, (c) =>
+  dispatch(c, deletePipeline)
 );

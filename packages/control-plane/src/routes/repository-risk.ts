@@ -2,7 +2,7 @@ import { parseJsonBody } from "./body";
 import { Hono } from "hono";
 import { admit, dispatch } from "../routing/admit";
 import type { ControlPlaneHonoEnv } from "../routing/hono-env";
-import { activeGlobal } from "./shared";
+import { requirePermission } from "./shared";
 import { z } from "zod";
 import { RepositoryRiskStore } from "../db/repository-risk";
 import { assessChangeRisk, RISK_LEVELS } from "../risk/change-risk";
@@ -73,23 +73,16 @@ async function assessRisk(
   return json(assessChangeRisk(criticality, parsed.data.paths));
 }
 
+const GOVERNANCE_READ = admit({
+  ...SCM_AGNOSTIC_USER_OR_SERVICE_ROUTE,
+  authorization: requirePermission("governance.read"),
+});
+const GOVERNANCE_MANAGE = admit({
+  ...SCM_AGNOSTIC_USER_OR_SERVICE_ROUTE,
+  authorization: requirePermission("governance.manage"),
+});
+
 export const repositoryRiskRoutes = new Hono<ControlPlaneHonoEnv>();
-repositoryRiskRoutes.get(
-  "/repository-risk",
-  admit({ ...SCM_AGNOSTIC_USER_OR_SERVICE_ROUTE, authorization: activeGlobal() }),
-  (c) => dispatch(c, listProfiles)
-);
-repositoryRiskRoutes.put(
-  "/repository-risk",
-  admit({
-    ...SCM_AGNOSTIC_USER_OR_SERVICE_ROUTE,
-    authorization: activeGlobal(),
-    requiredPermission: "catalog.write",
-  }),
-  (c) => dispatch(c, upsertProfile)
-);
-repositoryRiskRoutes.post(
-  "/risk/assess",
-  admit({ ...SCM_AGNOSTIC_USER_OR_SERVICE_ROUTE, authorization: activeGlobal() }),
-  (c) => dispatch(c, assessRisk)
-);
+repositoryRiskRoutes.get("/repository-risk", GOVERNANCE_READ, (c) => dispatch(c, listProfiles));
+repositoryRiskRoutes.put("/repository-risk", GOVERNANCE_MANAGE, (c) => dispatch(c, upsertProfile));
+repositoryRiskRoutes.post("/risk/assess", GOVERNANCE_READ, (c) => dispatch(c, assessRisk));

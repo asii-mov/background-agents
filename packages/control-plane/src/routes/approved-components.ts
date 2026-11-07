@@ -1,13 +1,17 @@
-import { parseJsonBody } from "./body";
+import { parseBody, parseJsonBody } from "./body";
 import { Hono } from "hono";
 import { admit, dispatch } from "../routing/admit";
 import type { ControlPlaneHonoEnv } from "../routing/hono-env";
-import { activeGlobal, NO_AUTHORIZATION } from "./shared";
+import { NO_AUTHORIZATION, requirePermission } from "./shared";
 import {
   adoptApprovedComponentSchema,
   createApprovedComponentSchema,
   updateApprovedComponentSchema,
 } from "@open-inspect/shared/types/approved-components";
+import {
+  componentCategoryInputSchema,
+  updateComponentCategorySchema,
+} from "@open-inspect/shared/types/stack-policy";
 import {
   ApprovedComponentConflictError,
   ApprovedComponentStore,
@@ -36,6 +40,13 @@ function idFromMatch(match: Record<string, string>): string | null {
   return match.componentId ?? null;
 }
 
+function catalogueWriteError(cause: unknown): Response {
+  if (cause instanceof ApprovedComponentValidationError) return error(cause.message, 400);
+  if (cause instanceof ApprovedComponentConflictError) return error(cause.message, 409);
+  if (cause instanceof GitManagedCatalogueError) return error(cause.message, 409);
+  throw cause;
+}
+
 async function listComponents(
   _request: Request,
   _env: Env,
@@ -61,9 +72,7 @@ async function createComponent(
       201
     );
   } catch (cause) {
-    if (cause instanceof ApprovedComponentValidationError) return error(cause.message, 400);
-    if (cause instanceof ApprovedComponentConflictError) return error(cause.message, 409);
-    throw cause;
+    return catalogueWriteError(cause);
   }
 }
 
@@ -90,10 +99,7 @@ async function updateComponent(
     );
     return updated ? json(updated) : error("Approved component not found", 404);
   } catch (cause) {
-    if (cause instanceof ApprovedComponentConflictError) return error(cause.message, 409);
-    if (cause instanceof GitManagedCatalogueError) return error(cause.message, 409);
-    if (cause instanceof ApprovedComponentValidationError) return error(cause.message, 400);
-    throw cause;
+    return catalogueWriteError(cause);
   }
 }
 
@@ -109,9 +115,7 @@ async function deleteComponent(
     const deleted = await new ApprovedComponentStore(ctx.db).delete(id);
     return deleted ? json({ ok: true }) : error("Approved component not found", 404);
   } catch (cause) {
-    if (cause instanceof GitManagedCatalogueError) return error(cause.message, 409);
-    if (cause instanceof ApprovedComponentValidationError) return error(cause.message, 400);
-    throw cause;
+    return catalogueWriteError(cause);
   }
 }
 
@@ -126,6 +130,71 @@ async function listConsumers(
   const store = new ApprovedComponentStore(ctx.db);
   if (!(await store.get(id))) return error("Approved component not found", 404);
   return json(await store.listConsumers(id));
+}
+
+async function listCategories(
+  _request: Request,
+  _env: Env,
+  _params: object,
+  ctx: RequestContext
+): Promise<Response> {
+  return json(await new ApprovedComponentStore(ctx.db).listCategories());
+}
+
+async function createCategory(
+  request: Request,
+  _env: Env,
+  _params: object,
+  ctx: RequestContext
+): Promise<Response> {
+  const input = await parseBody(request, componentCategoryInputSchema);
+  if (input instanceof Response) return input;
+  try {
+    return json(
+      await new ApprovedComponentStore(ctx.db).createCategory(input, actorUserId(ctx)),
+      201
+    );
+  } catch (cause) {
+    return catalogueWriteError(cause);
+  }
+}
+
+async function updateCategory(
+  request: Request,
+  _env: Env,
+  match: Record<string, string>,
+  ctx: RequestContext
+): Promise<Response> {
+  const id = match.categoryId;
+  if (!id) return error("Category ID required", 400);
+  const input = await parseBody(request, updateComponentCategorySchema);
+  if (input instanceof Response) return input;
+  try {
+    const updated = await new ApprovedComponentStore(ctx.db).updateCategory(
+      id,
+      input,
+      actorUserId(ctx)
+    );
+    return updated ? json(updated) : error("Component category not found", 404);
+  } catch (cause) {
+    return catalogueWriteError(cause);
+  }
+}
+
+async function deleteCategory(
+  _request: Request,
+  _env: Env,
+  match: Record<string, string>,
+  ctx: RequestContext
+): Promise<Response> {
+  const id = match.categoryId;
+  if (!id) return error("Category ID required", 400);
+  try {
+    const deleted = await new ApprovedComponentStore(ctx.db).deleteCategory(id);
+    return deleted ? json({ ok: true }) : error("Component category not found", 404);
+  } catch (cause) {
+    return catalogueWriteError(cause);
+  }
 }
 
 async function listSessionComponents(
@@ -168,51 +237,47 @@ async function adoptSessionComponent(
   }
 }
 
+const GOVERNANCE_READ = admit({
+  ...SCM_AGNOSTIC_USER_OR_SERVICE_ROUTE,
+  authorization: requirePermission("governance.read"),
+});
+const GOVERNANCE_MANAGE = admit({
+  ...SCM_AGNOSTIC_USER_OR_SERVICE_ROUTE,
+  authorization: requirePermission("governance.manage"),
+});
+const SANDBOX = admit({ ...SCM_AGNOSTIC_SANDBOX_ROUTE, authorization: NO_AUTHORIZATION });
+
 export const approvedComponentRoutes = new Hono<ControlPlaneHonoEnv>();
-approvedComponentRoutes.get(
-  "/approved-components",
-  admit({ ...SCM_AGNOSTIC_USER_OR_SERVICE_ROUTE, authorization: activeGlobal() }),
-  (c) => dispatch(c, listComponents)
+approvedComponentRoutes.get("/approved-components", GOVERNANCE_READ, (c) =>
+  dispatch(c, listComponents)
 );
-approvedComponentRoutes.post(
-  "/approved-components",
-  admit({
-    ...SCM_AGNOSTIC_USER_OR_SERVICE_ROUTE,
-    authorization: activeGlobal(),
-    requiredPermission: "catalog.write",
-  }),
-  (c) => dispatch(c, createComponent)
+approvedComponentRoutes.post("/approved-components", GOVERNANCE_MANAGE, (c) =>
+  dispatch(c, createComponent)
 );
-approvedComponentRoutes.put(
-  "/approved-components/:componentId",
-  admit({
-    ...SCM_AGNOSTIC_USER_OR_SERVICE_ROUTE,
-    authorization: activeGlobal(),
-    requiredPermission: "catalog.write",
-  }),
-  (c) => dispatch(c, updateComponent)
+approvedComponentRoutes.put("/approved-components/:componentId", GOVERNANCE_MANAGE, (c) =>
+  dispatch(c, updateComponent)
 );
-approvedComponentRoutes.delete(
-  "/approved-components/:componentId",
-  admit({
-    ...SCM_AGNOSTIC_USER_OR_SERVICE_ROUTE,
-    authorization: activeGlobal(),
-    requiredPermission: "catalog.write",
-  }),
-  (c) => dispatch(c, deleteComponent)
+approvedComponentRoutes.delete("/approved-components/:componentId", GOVERNANCE_MANAGE, (c) =>
+  dispatch(c, deleteComponent)
 );
-approvedComponentRoutes.get(
-  "/approved-components/:componentId/consumers",
-  admit({ ...SCM_AGNOSTIC_USER_OR_SERVICE_ROUTE, authorization: activeGlobal() }),
-  (c) => dispatch(c, listConsumers)
+approvedComponentRoutes.get("/approved-components/:componentId/consumers", GOVERNANCE_READ, (c) =>
+  dispatch(c, listConsumers)
 );
-approvedComponentRoutes.get(
-  "/sessions/:id/approved-components",
-  admit({ ...SCM_AGNOSTIC_SANDBOX_ROUTE, authorization: NO_AUTHORIZATION }),
-  (c) => dispatch(c, listSessionComponents)
+approvedComponentRoutes.get("/component-categories", GOVERNANCE_READ, (c) =>
+  dispatch(c, listCategories)
 );
-approvedComponentRoutes.post(
-  "/sessions/:id/approved-components/:componentId/adopt",
-  admit({ ...SCM_AGNOSTIC_SANDBOX_ROUTE, authorization: NO_AUTHORIZATION }),
-  (c) => dispatch(c, adoptSessionComponent)
+approvedComponentRoutes.post("/component-categories", GOVERNANCE_MANAGE, (c) =>
+  dispatch(c, createCategory)
+);
+approvedComponentRoutes.put("/component-categories/:categoryId", GOVERNANCE_MANAGE, (c) =>
+  dispatch(c, updateCategory)
+);
+approvedComponentRoutes.delete("/component-categories/:categoryId", GOVERNANCE_MANAGE, (c) =>
+  dispatch(c, deleteCategory)
+);
+approvedComponentRoutes.get("/sessions/:id/approved-components", SANDBOX, (c) =>
+  dispatch(c, listSessionComponents)
+);
+approvedComponentRoutes.post("/sessions/:id/approved-components/:componentId/adopt", SANDBOX, (c) =>
+  dispatch(c, adoptSessionComponent)
 );
