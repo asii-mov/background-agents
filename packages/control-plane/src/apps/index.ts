@@ -4,6 +4,7 @@
  */
 
 export { readDeployRequest } from "./bundle";
+export { parseAppsConfig } from "./config";
 export type { BundleRejection, DeployRequestBody } from "./bundle";
 export {
   appsFromEnv,

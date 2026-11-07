@@ -48,7 +48,7 @@ function captureModalLaunches(): Array<Record<string, unknown>> {
 }
 
 async function launchSession(
-  options: { harness?: "claude"; appHosting?: boolean } = {}
+  options: { harness?: "claude"; appHosting?: Partial<Env> } = {}
 ): Promise<Record<string, unknown>> {
   const launches = captureModalLaunches();
   // initNamedSession forwards every key to the DO init request, which reads `harness`.
@@ -60,7 +60,7 @@ async function launchSession(
   await initNamedSession(`stack-policy-launch-${crypto.randomUUID()}`, init, (stub) =>
     runInSessionDO(stub, (instance) => {
       if (options.appHosting) {
-        Object.assign((instance as unknown as SessionDOInternals).appEnv, APP_HOSTING);
+        Object.assign((instance as unknown as SessionDOInternals).appEnv, options.appHosting);
       }
     })
   );
@@ -118,8 +118,20 @@ describe("stack policy at launch", () => {
   });
 
   it("asks for the deploy-app tool only when app hosting is configured", async () => {
-    expect((await launchSession({ appHosting: true })).agent_app_deploy_enabled).toBe(true);
+    expect((await launchSession({ appHosting: APP_HOSTING })).agent_app_deploy_enabled).toBe(true);
     vi.restoreAllMocks();
     expect((await launchSession()).agent_app_deploy_enabled).toBe(false);
+  });
+
+  it.each<[string, Partial<Env>]>([
+    ...Object.keys(APP_HOSTING).map((field): [string, Partial<Env>] => [
+      `without ${field}`,
+      { [field]: "" },
+    ]),
+    ["with a broker URL that has a path", { APP_BROKER_URL: "https://deployer.example.com/x" }],
+    ["with an apps domain that is a URL", { APPS_DOMAIN: "https://apps.example.com" }],
+  ])("leaves the deploy-app tool off %s", async (_case, override) => {
+    const launch = await launchSession({ appHosting: { ...APP_HOSTING, ...override } });
+    expect(launch.agent_app_deploy_enabled).toBe(false);
   });
 });

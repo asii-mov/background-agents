@@ -62,6 +62,7 @@ import { UserStore } from "../db/user-store";
 import { IntegrationSettingsStore, resolveSlackSettings } from "../db/integration-settings";
 import { SecurityPipelineStore } from "../db/security-pipelines";
 import { ApprovedComponentStore } from "../db/approved-components";
+import { parseAppsConfig } from "../apps";
 import { RepositoryRiskStore } from "../db/repository-risk";
 import { assessChangeRisk } from "../risk/change-risk";
 import { SessionIndexStore } from "../db/session-index";
@@ -1135,17 +1136,6 @@ interface LifecycleManagerDeps {
   backgroundTasks: BackgroundTasks;
 }
 
-/** App hosting needs the broker URL, the apps domain and both broker credentials. */
-function isAppHostingConfigured(env: Env): boolean {
-  return [
-    env.APP_BROKER_URL,
-    env.APPS_DOMAIN,
-    env.SERVICE_AUTH_SECRET_APP_BROKER,
-    env.APP_BROKER_ACCESS_CLIENT_ID,
-    env.APP_BROKER_ACCESS_CLIENT_SECRET,
-  ].every(Boolean);
-}
-
 /** Create the lifecycle manager with all required adapters. */
 function createLifecycleManager(deps: LifecycleManagerDeps): SandboxLifecycleManager {
   const {
@@ -1250,7 +1240,7 @@ function createLifecycleManager(deps: LifecycleManagerDeps): SandboxLifecycleMan
     stackPolicyLookup,
     sandboxNetworkPolicyLookup,
     slackAgentNotifyLookup,
-    agentAppDeployEnabled: isAppHostingConfigured(env),
+    agentAppDeployEnabled: parseAppsConfig(env).kind === "available",
     sandboxTunnelsPolicy: parseSandboxTunnelsPolicy(env.SANDBOX_TUNNELS_POLICY),
     recordWarning: deps.recordWarning,
     resumeQueuedWork: deps.resumeQueuedWork,
