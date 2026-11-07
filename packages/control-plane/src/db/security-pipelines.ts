@@ -8,6 +8,7 @@ import {
 } from "@open-inspect/shared/types/security-pipelines";
 import { generateId } from "../auth/crypto";
 import { isUniqueConstraintError } from "./errors";
+import { resolveGovernanceScope } from "./governance-scope";
 import type { SqlDatabase } from "./sql-database";
 
 interface SecurityPipelineRow {
@@ -194,31 +195,20 @@ export class SecurityPipelineStore {
     repositories: Array<{ repoOwner: string; repoName: string }>,
     environmentId: string | null
   ): Promise<SecurityPipelineConfig[]> {
-    const repositoryNames = new Set(
-      repositories.map(({ repoOwner, repoName }) => `${repoOwner}/${repoName}`.toLowerCase())
-    );
-    return (await this.list())
-      .map((pipeline): SecurityPipelineConfig | null => {
-        if (!pipeline.enabled) return null;
-        const environmentMatches =
-          environmentId !== null && pipeline.environmentScopes?.includes(environmentId) === true;
-        const matchingRepoScopes =
-          pipeline.repoScopes?.filter((scope) => repositoryNames.has(scope.toLowerCase())) ?? [];
-        const global = !pipeline.repoScopes && !pipeline.environmentScopes;
-        if (!global && !environmentMatches && matchingRepoScopes.length === 0) return null;
-
-        return {
+    return (await this.list()).flatMap((pipeline): SecurityPipelineConfig[] => {
+      if (!pipeline.enabled) return [];
+      const scope = resolveGovernanceScope(pipeline, repositories, environmentId);
+      if (!scope) return [];
+      return [
+        {
           id: pipeline.id,
           name: pipeline.name,
           commands: pipeline.commands,
           blocking: pipeline.blocking,
           maxRemediationAttempts: pipeline.maxRemediationAttempts,
-          // A global or environment match applies to every repository in the
-          // environment. A repo-only match remains narrowed at runtime so a
-          // multi-repo sandbox executes the command from the right checkout.
-          repoScopes: global || environmentMatches ? null : matchingRepoScopes,
-        };
-      })
-      .filter((pipeline): pipeline is SecurityPipelineConfig => pipeline !== null);
+          repoScopes: scope.repoScopes,
+        },
+      ];
+    });
   }
 }

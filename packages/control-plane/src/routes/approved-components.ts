@@ -12,6 +12,7 @@ import {
   ApprovedComponentConflictError,
   ApprovedComponentStore,
   ApprovedComponentValidationError,
+  GitManagedCatalogueError,
 } from "../db/approved-components";
 import type { Env } from "../types";
 import {
@@ -61,6 +62,7 @@ async function createComponent(
     );
   } catch (cause) {
     if (cause instanceof ApprovedComponentValidationError) return error(cause.message, 400);
+    if (cause instanceof ApprovedComponentConflictError) return error(cause.message, 409);
     throw cause;
   }
 }
@@ -77,18 +79,19 @@ async function updateComponent(
   if (body instanceof Response) return body;
   const parsed = updateApprovedComponentSchema.safeParse(body);
   if (!parsed.success) return error(parsed.error.issues[0]?.message ?? "Invalid component", 400);
-  // The store moves a category's standard once stances are stored; until then the flag is inert.
-  const { revision, demoteCurrentPreferred: _demoteCurrentPreferred, ...definition } = parsed.data;
+  const { revision, demoteCurrentPreferred, ...definition } = parsed.data;
   try {
     const updated = await new ApprovedComponentStore(ctx.db).update(
       id,
       definition,
       revision,
-      actorUserId(ctx)
+      actorUserId(ctx),
+      { demoteCurrentPreferred }
     );
     return updated ? json(updated) : error("Approved component not found", 404);
   } catch (cause) {
     if (cause instanceof ApprovedComponentConflictError) return error(cause.message, 409);
+    if (cause instanceof GitManagedCatalogueError) return error(cause.message, 409);
     if (cause instanceof ApprovedComponentValidationError) return error(cause.message, 400);
     throw cause;
   }
@@ -106,6 +109,7 @@ async function deleteComponent(
     const deleted = await new ApprovedComponentStore(ctx.db).delete(id);
     return deleted ? json({ ok: true }) : error("Approved component not found", 404);
   } catch (cause) {
+    if (cause instanceof GitManagedCatalogueError) return error(cause.message, 409);
     if (cause instanceof ApprovedComponentValidationError) return error(cause.message, 400);
     throw cause;
   }
@@ -158,6 +162,7 @@ async function adoptSessionComponent(
     );
     return consumer ? json(consumer, 201) : error("Session not found", 404);
   } catch (cause) {
+    if (cause instanceof ApprovedComponentConflictError) return error(cause.message, 409);
     if (cause instanceof ApprovedComponentValidationError) return error(cause.message, 403);
     throw cause;
   }
