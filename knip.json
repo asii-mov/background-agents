@@ -2,6 +2,7 @@
   "$schema": "https://unpkg.com/knip@6/schema.json",
   "ignoreDependencies": ["wrangler", "cloudflare", "postcss-load-config", "vitest"],
   "ignoreBinaries": ["ruff", "ssh-keygen"],
+  "ignore": ["docs/plans/governed-apps/harness/**"],
   "workspaces": {
     ".": {
       "entry": [

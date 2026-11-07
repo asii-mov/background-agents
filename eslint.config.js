@@ -78,6 +78,9 @@ export default tseslint.config(
       "**/venv/**",
       ".cache/sandbox-images/**",
       "opencode-reference/**",
+      // Design sketches and out-of-tree verification scripts, not built code.
+      "docs/plans/governed-apps/sketch/**",
+      "docs/plans/governed-apps/harness/**",
       "**/*.d.ts",
       // Bundled/generated files
       "packages/modal-infra/**/*.js",
