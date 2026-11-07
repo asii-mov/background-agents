@@ -75,3 +75,20 @@ resource "terraform_data" "governance_mcp_builder_gate" {
     }
   }
 }
+
+# The *.<apps_domain> Access floor belongs to the apps account's Zero Trust
+# organization. A platform hostname under it would sit behind the wrong Access
+# organization and could collide with an app name.
+resource "terraform_data" "apps_domain_gate" {
+  count = var.apps_enabled ? 1 : 0
+
+  lifecycle {
+    precondition {
+      condition = alltrue([
+        for host in compact([trimprefix(local.web_app_url, "https://"), local.docs_custom_domain == null ? "" : local.docs_custom_domain]) :
+        lower(host) != var.apps_domain && !endswith(lower(host), ".${var.apps_domain}")
+      ])
+      error_message = "apps_domain must not be, or contain, the web app or docs site hostname. Use a separate domain for apps, such as a dedicated registered domain."
+    }
+  }
+}

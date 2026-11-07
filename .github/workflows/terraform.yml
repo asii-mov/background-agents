@@ -133,6 +133,12 @@ jobs:
           terraform test
         working-directory: terraform/modules/modal-app
 
+      - name: Token permissions module tests
+        run: |
+          terraform init -backend=false
+          terraform test
+        working-directory: terraform/modules/cloudflare-token-permissions
+
   plan:
     name: Plan
     runs-on: ubuntu-latest
@@ -161,6 +167,7 @@ jobs:
           npm run build -w @open-inspect/slack-bot
           npm run build -w @open-inspect/github-bot
           npm run build -w @open-inspect/linear-bot
+          npm run build -w @open-inspect/app-broker
 
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v4
@@ -212,6 +219,18 @@ jobs:
           TF_VAR_platform_admin_users: "${{ vars.PLATFORM_ADMIN_USERS }}"
           TF_VAR_platform_editor_users: "${{ vars.PLATFORM_EDITOR_USERS }}"
           TF_VAR_identity_link_email_domains: "${{ vars.IDENTITY_LINK_EMAIL_DOMAINS }}"
+          TF_VAR_apps_enabled: "${{ vars.APPS_ENABLED || 'false' }}"
+          TF_VAR_apps_cloudflare_account_id: "${{ vars.APPS_CLOUDFLARE_ACCOUNT_ID }}"
+          TF_VAR_apps_cloudflare_api_token: ${{ secrets.APPS_CLOUDFLARE_API_TOKEN }}
+          TF_VAR_apps_zone_id: "${{ vars.APPS_ZONE_ID }}"
+          TF_VAR_apps_domain: "${{ vars.APPS_DOMAIN }}"
+          TF_VAR_apps_hosting_backend: "${{ vars.APPS_HOSTING_BACKEND || 'workers' }}"
+          TF_VAR_apps_access_team_domain: "${{ vars.APPS_ACCESS_TEAM_DOMAIN }}"
+          # Access rule lists are HCL or JSON; an empty value would not parse.
+          TF_VAR_apps_access_include: "${{ vars.APPS_ACCESS_INCLUDE || '[]' }}"
+          TF_VAR_apps_access_require: "${{ vars.APPS_ACCESS_REQUIRE || '[]' }}"
+          TF_VAR_app_data_jurisdiction: "${{ vars.APP_DATA_JURISDICTION }}"
+          TF_VAR_sandbox_tunnels_policy: "${{ vars.SANDBOX_TUNNELS_POLICY || 'public' }}"
           TF_VAR_governance_repo_owner: "${{ vars.GOVERNANCE_REPO_OWNER }}"
           TF_VAR_governance_repo_name: "${{ vars.GOVERNANCE_REPO_NAME }}"
           TF_VAR_governance_repo_ref: "${{ vars.GOVERNANCE_REPO_REF || 'main' }}"
@@ -462,6 +481,7 @@ jobs:
           npm run build -w @open-inspect/slack-bot
           npm run build -w @open-inspect/github-bot
           npm run build -w @open-inspect/linear-bot
+          npm run build -w @open-inspect/app-broker
 
       - name: Setup uv
         uses: astral-sh/setup-uv@v7
@@ -509,6 +529,18 @@ jobs:
           TF_VAR_platform_admin_users: "${{ vars.PLATFORM_ADMIN_USERS }}"
           TF_VAR_platform_editor_users: "${{ vars.PLATFORM_EDITOR_USERS }}"
           TF_VAR_identity_link_email_domains: "${{ vars.IDENTITY_LINK_EMAIL_DOMAINS }}"
+          TF_VAR_apps_enabled: "${{ vars.APPS_ENABLED || 'false' }}"
+          TF_VAR_apps_cloudflare_account_id: "${{ vars.APPS_CLOUDFLARE_ACCOUNT_ID }}"
+          TF_VAR_apps_cloudflare_api_token: ${{ secrets.APPS_CLOUDFLARE_API_TOKEN }}
+          TF_VAR_apps_zone_id: "${{ vars.APPS_ZONE_ID }}"
+          TF_VAR_apps_domain: "${{ vars.APPS_DOMAIN }}"
+          TF_VAR_apps_hosting_backend: "${{ vars.APPS_HOSTING_BACKEND || 'workers' }}"
+          TF_VAR_apps_access_team_domain: "${{ vars.APPS_ACCESS_TEAM_DOMAIN }}"
+          # Access rule lists are HCL or JSON; an empty value would not parse.
+          TF_VAR_apps_access_include: "${{ vars.APPS_ACCESS_INCLUDE || '[]' }}"
+          TF_VAR_apps_access_require: "${{ vars.APPS_ACCESS_REQUIRE || '[]' }}"
+          TF_VAR_app_data_jurisdiction: "${{ vars.APP_DATA_JURISDICTION }}"
+          TF_VAR_sandbox_tunnels_policy: "${{ vars.SANDBOX_TUNNELS_POLICY || 'public' }}"
           TF_VAR_governance_repo_owner: "${{ vars.GOVERNANCE_REPO_OWNER }}"
           TF_VAR_governance_repo_name: "${{ vars.GOVERNANCE_REPO_NAME }}"
           TF_VAR_governance_repo_ref: "${{ vars.GOVERNANCE_REPO_REF || 'main' }}"

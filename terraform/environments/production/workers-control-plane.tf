@@ -107,6 +107,7 @@ module "control_plane_worker" {
       SANDBOX_BOOT_TIMEOUT_MS       = { value = tostring(var.sandbox_boot_timeout_ms) }
       TEAMS_ENFORCEMENT             = { value = var.teams_enforcement }
     },
+    local.apps_control_plane_plain_text_bindings,
     trimspace(var.governance_repo_owner) != "" ? {
       GOVERNANCE_REPO_OWNER       = { value = trimspace(var.governance_repo_owner) }
       GOVERNANCE_REPO_NAME        = { value = trimspace(var.governance_repo_name) }
@@ -199,6 +200,7 @@ module "control_plane_worker" {
       GITHUB_APP_PRIVATE_KEY     = { value = var.github_app_private_key }
       GITHUB_APP_INSTALLATION_ID = { value = var.github_app_installation_id }
     },
+    local.apps_control_plane_secrets,
     local.github_oauth_enabled ? {
       GITHUB_CLIENT_SECRET = { value = trimspace(var.github_client_secret) }
     } : {},

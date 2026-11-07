@@ -50,6 +50,15 @@ The application still requires its GitHub or Google sign-in after workforce admi
 `platform_admin_users` and optionally `platform_editor_users` for the additional governance
 controls. These do not replace the upstream workspace owner bootstrap described below.
 
+Slack and Linear report a sender's email, but that report never proves the sender owns the mailbox.
+Set `identity_link_email_domains` to your corporate email domains, such as `corp.example`, to let a
+Slack or Linear sender act as the web user who verified that email at sign-in. The linked sender
+inherits that user's roles. Leave it empty to keep every bot sender a separate user with the
+workspace default role.
+
+To let agents deploy internal apps behind Cloudflare Access, follow
+[Host agent-built internal apps](APPS.md). App hosting needs a second, dedicated Cloudflare account.
+
 Validate access with both an allowed workforce user and a denied user before inviting users. A local
 `next dev` process may use `AUTH_DEV_BYPASS=1` on loopback. Production rejects that flag.
 
@@ -1290,6 +1299,26 @@ GH_BOT_USERNAME
 ENABLE_LINEAR_BOT
 LINEAR_CLIENT_ID
 
+# Workforce access (this fork)
+CF_ACCESS_TEAM_DOMAIN
+CF_ACCESS_AUD
+VERCEL_CUSTOM_DOMAIN
+PLATFORM_ADMIN_USERS
+PLATFORM_EDITOR_USERS
+IDENTITY_LINK_EMAIL_DOMAINS
+
+# Internal app hosting (optional; see docs/APPS.md)
+APPS_ENABLED
+APPS_CLOUDFLARE_ACCOUNT_ID
+APPS_ZONE_ID
+APPS_DOMAIN
+APPS_HOSTING_BACKEND
+APPS_ACCESS_TEAM_DOMAIN
+APPS_ACCESS_INCLUDE
+APPS_ACCESS_REQUIRE
+APP_DATA_JURISDICTION
+SANDBOX_TUNNELS_POLICY
+
 # Access control and branding
 TEAMS_ENFORCEMENT
 ALLOWED_USERS
@@ -1414,6 +1443,12 @@ Secrets for credentials:
 | `PROVIDER_ACCOUNTS_ENCRYPTION_KEY` | Optional existing provider-account key override; Terraform generates one when omitted           |
 | `MODAL_API_SECRET`                 | Generated Modal API secret                                                                      |
 | `NEXTAUTH_SECRET`                  | Generated browser-auth secret (legacy Actions secret name)                                      |
+| `CF_ACCESS_TEAM_DOMAIN`            | Required Access team origin for the web app, e.g. `https://your-team.cloudflareaccess.com`      |
+| `CF_ACCESS_AUD`                    | Required audience tag of the web app's Access application                                       |
+| `VERCEL_CUSTOM_DOMAIN`             | Cloudflare-proxied web hostname _(required if `web_platform = "vercel"`)_                       |
+| `IDENTITY_LINK_EMAIL_DOMAINS`      | Optional email domains in which Slack and Linear senders link to verified web users             |
+| `APPS_ACCESS_INCLUDE`              | App visitor Access include rules as JSON _(required if `APPS_ENABLED` is `true`)_               |
+| `APPS_CLOUDFLARE_API_TOKEN`        | Apps account Terraform token, never the `CLOUDFLARE_API_TOKEN` value _(if `APPS_ENABLED`)_      |
 | `ALLOWED_USERS`                    | Comma-separated GitHub usernames (empty = list unused; see note below)                          |
 | `ALLOWED_EMAIL_DOMAINS`            | Comma-separated email domains (empty = list unused; see note below)                             |
 | `ALLOWED_EMAILS`                   | Comma-separated exact email addresses (for individual users on shared domains)                  |

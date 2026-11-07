@@ -15,12 +15,24 @@ variable "worker_name" {
 }
 
 variable "worker_subdomain" {
-  description = "Cloudflare account workers.dev subdomain label, e.g. 'myaccount' (without '.workers.dev'). worker_url resolves to <worker_name>.<worker_subdomain>.workers.dev."
+  description = "Cloudflare account workers.dev subdomain label, e.g. 'myaccount' (without '.workers.dev'). worker_url resolves to <worker_name>.<worker_subdomain>.workers.dev. Leave null when workers_dev_enabled is false."
   type        = string
+  default     = null
 
   validation {
-    condition     = can(regex("^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$", var.worker_subdomain))
+    condition     = var.worker_subdomain == null || can(regex("^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$", var.worker_subdomain))
     error_message = "worker_subdomain must be a single workers.dev subdomain label (e.g. 'myaccount'): lowercase alphanumeric and hyphens only, no dots — do not include '.workers.dev'."
+  }
+}
+
+variable "workers_dev_enabled" {
+  description = "Serve the Worker on its workers.dev hostname. False also turns preview URLs off, so a custom domain is the Worker's only ingress."
+  type        = bool
+  default     = true
+
+  validation {
+    condition     = !var.workers_dev_enabled || var.worker_subdomain != null
+    error_message = "worker_subdomain is required while workers_dev_enabled is true."
   }
 }
 
@@ -84,6 +96,14 @@ variable "secrets" {
   }))
   default   = {}
   sensitive = true
+}
+
+variable "dispatch_namespaces" {
+  description = "Map of Workers for Platforms dispatch namespace bindings keyed by binding name"
+  type = map(object({
+    namespace = string
+  }))
+  default = {}
 }
 
 variable "durable_objects" {

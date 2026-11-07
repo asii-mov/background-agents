@@ -18,6 +18,8 @@ mock_provider "random" {}
 mock_provider "vercel" {}
 
 variables {
+  cf_access_team_domain       = "https://test-team.cloudflareaccess.com"
+  cf_access_aud               = "test-openinspect-audience"
   cloudflare_api_token        = "test-cloudflare-token"
   cloudflare_account_id       = "test-account"
   cloudflare_worker_subdomain = "test-account"

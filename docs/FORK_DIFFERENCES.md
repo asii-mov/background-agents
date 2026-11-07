@@ -77,6 +77,7 @@ The fork keeps the core Open-Inspect product:
 | AppSec checks          | Adds centrally assigned, argument-vector security pipelines. Checks run after generation and before the managed push path. Failures return to the agent for a bounded number of repair attempts.                                                                     |
 | Pull-request risk      | Combines repository criticality with changed-path criticality. High-risk changes become draft pull requests with a security-review note.                                                                                                                             |
 | Sandbox network policy | Adds global, repository, and environment egress settings. Modal enforces blocked, domain allowlist, and CIDR allowlist policies. Unsupported providers reject restrictive policies.                                                                                  |
+| Internal app hosting   | Agents deploy internal apps to `<name>.<apps_domain>` in a dedicated Cloudflare account. Only a Terraform-owned broker Worker holds its token. A `*.<apps_domain>` Access floor, a per-app Access app, and a guard that checks the visitor's token gate each app.    |
 | Agent verification     | Adds a checked repository map, a project verification Skill, and loopback Playwright tests for core sessions and governance settings.                                                                                                                                |
 
 ## User-visible behavior changes
@@ -92,12 +93,21 @@ The fork keeps the core Open-Inspect product:
 - A restrictive network policy fails closed when the selected sandbox provider cannot enforce it.
 - Blocking AppSec findings stop the managed push and pull-request path.
 - A pull request with a risk score of at least `8` must remain a draft.
+- With `apps_enabled`, an agent can deploy an internal app that opens at
+  `https://<name>.<apps_domain>` for users that the apps visitor Access policy admits.
+- With `sandbox_tunnels_policy = "disabled"`, sessions cannot open public preview tunnels. The
+  control plane tells the agent to deploy an app instead.
 
 ## New storage and services
 
 The fork adds D1 migrations for platform roles, required Skills, governed MCP entries, security
 pipelines, repository risk, approved components, and Git catalogue state. It also adds the
 `@open-inspect/mcp-artifact-builder` service for verified local MCP dependency artifacts.
+
+Internal app hosting adds the `@open-inspect/app-broker` Worker in a dedicated apps Cloudflare
+account, with that account's Access organization and, optionally, a Workers for Platforms dispatch
+namespace and dispatcher Worker. Terraform creates them only when `apps_enabled` is true. The
+control plane receives the broker URL, an Access service token, and a request-signing secret.
 
 ## Limits that remain
 
@@ -119,6 +129,7 @@ pipelines, repository risk, approved components, and Git catalogue state. It als
 - [Git-backed Skills and MCP governance](GIT_GOVERNANCE_CATALOG.md) defines the Git catalogue format
   and reconciliation behavior.
 - [Managed Skills](MANAGED_SKILLS.md) describes Skill authoring, assignment, and runtime delivery.
+- [Host agent-built internal apps](APPS.md) sets up the apps account, the broker, and Access.
 - [OpenInspect repository map](REPO_MAP.md) maps user-visible capabilities to their source owners
   and verification.
 

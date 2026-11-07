@@ -1020,3 +1020,129 @@ variable "docs_custom_domain" {
   type        = string
   default     = null
 }
+
+# =============================================================================
+# Internal app hosting (optional; see docs/APPS.md)
+# =============================================================================
+
+variable "apps_enabled" {
+  description = "Host agent-built internal apps in the dedicated apps Cloudflare account, behind Cloudflare Access. Requires every other apps_* input except apps_access_require."
+  type        = bool
+  default     = false
+}
+
+variable "apps_cloudflare_account_id" {
+  description = "ID of the dedicated apps Cloudflare account. It must not be the platform account."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = !var.apps_enabled || (can(regex("^[0-9a-f]{32}$", var.apps_cloudflare_account_id)) && var.apps_cloudflare_account_id != var.cloudflare_account_id)
+    error_message = "apps_enabled requires apps_cloudflare_account_id: the 32-character ID of a Cloudflare account other than cloudflare_account_id."
+  }
+}
+
+variable "apps_cloudflare_api_token" {
+  description = "Terraform's API token for the apps account. It configures only the cloudflare.apps provider and never reaches a Worker. It needs Account API Tokens Write to mint the broker's token."
+  type        = string
+  sensitive   = true
+  default     = ""
+
+  validation {
+    condition     = !var.apps_enabled || (trimspace(var.apps_cloudflare_api_token) != "" && var.apps_cloudflare_api_token != var.cloudflare_api_token)
+    error_message = "apps_enabled requires apps_cloudflare_api_token, a token for the apps account that differs from cloudflare_api_token."
+  }
+}
+
+variable "apps_zone_id" {
+  description = "ID of the apps account's zone that holds apps_domain."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = !var.apps_enabled || can(regex("^[0-9a-f]{32}$", var.apps_zone_id))
+    error_message = "apps_enabled requires apps_zone_id, the 32-character ID of the zone that holds apps_domain."
+  }
+}
+
+variable "apps_domain" {
+  description = "Domain the apps are served under: app <name> is https://<name>.<apps_domain>, and the broker is deployer.<apps_domain>. Every hostname under it is behind Access."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.apps_domain == "" || can(regex("^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$", var.apps_domain))
+    error_message = "apps_domain must be a bare lowercase hostname such as 'acme-apps.example', without a scheme, port, path, or trailing dot."
+  }
+
+  validation {
+    condition     = !var.apps_enabled || var.apps_domain != ""
+    error_message = "apps_enabled requires apps_domain."
+  }
+}
+
+variable "apps_hosting_backend" {
+  description = "Where app scripts live in the apps account: 'workers' (one Worker per app) or 'dispatch-namespace' (Workers for Platforms)."
+  type        = string
+  default     = "workers"
+
+  validation {
+    condition     = contains(["workers", "dispatch-namespace"], var.apps_hosting_backend)
+    error_message = "apps_hosting_backend must be 'workers' or 'dispatch-namespace'."
+  }
+}
+
+variable "apps_access_team_domain" {
+  description = "Team HTTPS origin of the apps account's Zero Trust organization, e.g. https://acme-apps.cloudflareaccess.com. App guards verify visitor tokens against it."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.apps_access_team_domain == "" || can(regex("^https://[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\\.cloudflareaccess\\.com/?$", var.apps_access_team_domain))
+    error_message = "apps_access_team_domain must be a Cloudflare team HTTPS origin, such as https://your-apps-team.cloudflareaccess.com, without a port, path, query, or fragment."
+  }
+
+  validation {
+    condition     = !var.apps_enabled || var.apps_access_team_domain != ""
+    error_message = "apps_enabled requires apps_access_team_domain."
+  }
+}
+
+variable "apps_access_include" {
+  description = "Include rules of the Access policy that admits app visitors, in cloudflare_zero_trust_access_policy v5 form, e.g. [{ email_domain = { domain = \"corp.example\" } }]. Security owns this list."
+  type        = any
+  default     = []
+
+  validation {
+    condition     = !var.apps_enabled || length(var.apps_access_include) > 0
+    error_message = "apps_enabled requires at least one apps_access_include rule."
+  }
+}
+
+variable "apps_access_require" {
+  description = "Require rules of the app visitor policy, such as device posture. Posture rules evaluate only devices enrolled in the apps account's Zero Trust organization."
+  type        = any
+  default     = []
+}
+
+variable "app_data_jurisdiction" {
+  description = "Jurisdiction for every D1 database and R2 bucket the broker creates: '' (none), 'eu', or 'fedramp'."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = contains(["", "eu", "fedramp"], var.app_data_jurisdiction)
+    error_message = "app_data_jurisdiction must be '', 'eu', or 'fedramp'."
+  }
+}
+
+variable "sandbox_tunnels_policy" {
+  description = "'public' keeps upstream's public sandbox preview tunnels. 'disabled' rejects tunnelPorts and points the agent to deploy-app; use it with apps_enabled."
+  type        = string
+  default     = "public"
+
+  validation {
+    condition     = contains(["public", "disabled"], var.sandbox_tunnels_policy)
+    error_message = "sandbox_tunnels_policy must be 'public' or 'disabled'."
+  }
+}

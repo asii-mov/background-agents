@@ -120,4 +120,14 @@ locals {
   slack_bot_script_path     = "${var.project_root}/packages/slack-bot/dist/index.js"
   linear_bot_script_path    = "${var.project_root}/packages/linear-bot/dist/index.js"
   github_bot_script_path    = "${var.project_root}/packages/github-bot/dist/index.js"
+
+  # Internal app hosting (apps-account.tf, apps.tf)
+  apps_wfp = var.apps_enabled && var.apps_hosting_backend == "dispatch-namespace"
+  # APP_RESOURCE_PREFIX and APP_BROKER_HOST_LABEL in packages/shared/src/app-broker.ts
+  apps_script_prefix = "app-"
+  apps_broker_host   = "deployer.${var.apps_domain}"
+  # APP_SCRIPT_COMPATIBILITY_DATE in packages/app-broker/src/backends.ts
+  apps_compatibility_date    = "2026-06-01"
+  app_broker_script_path     = "${var.project_root}/packages/app-broker/dist/index.js"
+  app_dispatcher_script_path = "${var.project_root}/packages/app-broker/dist/dispatcher.js"
 }
