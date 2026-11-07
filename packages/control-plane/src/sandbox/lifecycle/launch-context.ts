@@ -11,13 +11,14 @@ import {
 import { repoImageBuildScope, type ImageBuildScope } from "../../image-builds/model";
 import type { Logger } from "../../logger";
 import { sessionHasRepository, type SessionRow } from "../../session/types";
+import type { SessionGovernance, StackPolicyLookup } from "../governance";
 import {
   SandboxProviderError,
   type CreateSandboxConfig,
   type SandboxProviderCapabilities,
   type SessionRepositoryInfo,
 } from "../provider";
-import { parsePersistedSandboxSettings } from "../settings";
+import { parsePersistedSandboxSettings, type SandboxTunnelsPolicy } from "../settings";
 import {
   evaluateImageBuildForSpawn,
   type ImageBuildLookup,
@@ -61,8 +62,11 @@ export interface SandboxLaunchConfig {
   model: string;
   mcpServerLookup?: McpServerLookup;
   securityPipelineLookup?: SecurityPipelineLookup;
+  stackPolicyLookup?: StackPolicyLookup;
   sandboxNetworkPolicyLookup?: SandboxNetworkPolicyLookup;
   slackAgentNotifyLookup?: SlackAgentNotifyLookup;
+  /** Defaults to "public". */
+  sandboxTunnelsPolicy?: SandboxTunnelsPolicy;
 }
 
 export interface SandboxLaunchContextDependencies {
@@ -257,28 +261,30 @@ export class SandboxLaunchContext {
     }
   }
 
-  async loadSecurityPipelines(
+  /** Fails closed: a lookup that throws stops the launch rather than starting ungoverned. */
+  async loadGovernance(
     session: SessionRow,
     repositories: SessionRepositoryInfo[]
-  ): Promise<SecurityPipelineConfig[] | undefined> {
-    const pipelines = await this.config.securityPipelineLookup?.getForSession(
-      repositories,
-      session.environment_id
-    );
-    return pipelines?.length ? pipelines : undefined;
+  ): Promise<SessionGovernance> {
+    const members = repositories.map(({ repoOwner, repoName }) => ({ repoOwner, repoName }));
+    const [securityPipelines, stackPolicy] = await Promise.all([
+      this.config.securityPipelineLookup?.getForSession(members, session.environment_id),
+      this.config.stackPolicyLookup?.compileForSession(members, session.environment_id),
+    ]);
+    return {
+      ...(securityPipelines?.length ? { securityPipelines } : {}),
+      ...(stackPolicy ? { stackPolicy } : {}),
+    };
   }
 
-  assertHarnessGovernance(
-    session: SessionRow,
-    servers: McpServerConfig[] | undefined,
-    pipelines: SecurityPipelineConfig[] | undefined
-  ): void {
-    if (
-      session.harness === "claude" &&
-      (servers?.some((server) => server.artifactSha256) || pipelines?.length)
-    ) {
+  /**
+   * Pipelines and the stack policy run in the harness-agnostic bridge and pre-push gate. Only
+   * pinned MCP artifacts, which the Claude harness does not install, still refuse Claude.
+   */
+  assertHarnessGovernance(session: SessionRow, servers: McpServerConfig[] | undefined): void {
+    if (session.harness === "claude" && servers?.some((server) => server.artifactSha256)) {
       throw new SandboxProviderError(
-        "Claude does not yet support governed MCP artifacts or security pipelines",
+        "Claude does not yet support governed MCP artifacts",
         "permanent"
       );
     }
@@ -288,7 +294,10 @@ export class SandboxLaunchContext {
   resolveSandboxSettings(session: SessionRow): ResolvedSandboxSettings {
     let sandboxSettings: SandboxSettings;
     try {
-      const settings = parsePersistedSandboxSettings(session.sandbox_settings);
+      const settings = parsePersistedSandboxSettings(
+        session.sandbox_settings,
+        this.config.sandboxTunnelsPolicy
+      );
       const unsupported = unsupportedSandboxSettings(settings, this.provider.name);
       if (unsupported.length > 0) {
         this.getLogger().warn("Ignoring persisted sandbox settings unsupported by the provider", {

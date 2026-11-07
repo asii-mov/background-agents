@@ -7,6 +7,8 @@ import {
   buildModalWorkspaceSlug,
   createModalClient,
 } from "./client";
+import { GOVERNANCE, SECURITY_PIPELINES, STACK_POLICY } from "./governance.test-helpers";
+import { ModalSandboxProvider } from "./providers/modal-provider";
 import { RequestDeadlineError } from "./request-deadline";
 import { scmCloneIdentity } from "./sandbox-env";
 
@@ -579,6 +581,76 @@ describe("ModalClient", () => {
       { repo_owner: "testowner", repo_name: "testrepo", branch: "main" },
       { repo_owner: "testowner", repo_name: "backend", branch: "develop" },
     ]);
+  });
+
+  it("delivers the session governance and the deploy-app gate on create and restore", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(
+      async () =>
+        new Response(
+          JSON.stringify({
+            success: true,
+            data: { sandbox_id: "sandbox-456", status: "spawning", created_at: 1 },
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } }
+        )
+    );
+    const provider = new ModalSandboxProvider(
+      createModalClient("secret", "acme", "prod-web"),
+      "modal",
+      "github"
+    );
+    const launch = {
+      sessionId: "session-123",
+      sandboxId: "sandbox-456",
+      repoOwner: "testowner",
+      repoName: "testrepo",
+      controlPlaneUrl: "https://control-plane.test",
+      sandboxAuthToken: "auth-token",
+      harness: "claude" as const,
+      provider: "anthropic",
+      model: "claude-sonnet-4-6",
+      governance: GOVERNANCE,
+      agentAppDeployEnabled: true,
+    };
+
+    await provider.createSandbox(launch);
+    await provider.restoreFromSnapshot({ ...launch, snapshotImageId: "img-1" });
+
+    const [create, restore] = fetchMock.mock.calls.map(([, init]) =>
+      JSON.parse((init as RequestInit).body as string)
+    );
+    const governed = { security_pipelines: SECURITY_PIPELINES, stack_policy: STACK_POLICY };
+    expect(create).toMatchObject({ ...governed, agent_app_deploy_enabled: true });
+    expect(restore.session_config).toMatchObject(governed);
+    expect(restore.agent_app_deploy_enabled).toBe(true);
+  });
+
+  it("omits governance keys that the session does not carry", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          success: true,
+          data: { sandbox_id: "sb-1", status: "spawning", created_at: 1 },
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } }
+      )
+    );
+
+    await createModalClient("secret", "acme", "prod-web").createSandbox({
+      scmIdentity: GITHUB_IDENTITY,
+      sessionId: "session-123",
+      repoOwner: "testowner",
+      repoName: "testrepo",
+      controlPlaneUrl: "https://control-plane.test",
+      sandboxAuthToken: "auth-token",
+      harness: "opencode" as const,
+      governance: {},
+    });
+
+    const body = JSON.parse((fetchMock.mock.calls[0]?.[1] as RequestInit).body as string);
+    expect(body).not.toHaveProperty("security_pipelines");
+    expect(body).not.toHaveProperty("stack_policy");
+    expect(body.agent_app_deploy_enabled).toBe(false);
   });
 
   it("sends a null repositories create field for single-repo sessions", async () => {

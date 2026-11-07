@@ -26,6 +26,7 @@ import {
   type DaytonaCreateSandboxParams,
   type DaytonaRestConfig,
 } from "../daytona-rest-client";
+import { GOVERNANCE, expectGovernedSandboxEnv } from "../governance.test-helpers";
 
 // ==================== Mock Factories ====================
 
@@ -243,6 +244,19 @@ describe("DaytonaSandboxProvider", () => {
       expect(sessionConfig.mcp_servers).toEqual([
         { id: "mcp-1", name: "Tool", type: "local", enabled: true },
       ]);
+    });
+
+    it("delivers the session governance and the deploy-app gate", async () => {
+      const client = createMockClient();
+      const provider = new DaytonaSandboxProvider(client, defaultProviderConfig);
+
+      await provider.createSandbox({
+        ...baseCreateConfig,
+        governance: GOVERNANCE,
+        agentAppDeployEnabled: true,
+      });
+
+      expectGovernedSandboxEnv(vi.mocked(client.createSandbox).mock.calls[0][0].env);
     });
 
     it("includes user env vars (repo secrets) with system vars taking precedence", async () => {

@@ -1,7 +1,7 @@
 """Type definitions for sandbox operations."""
 
 from enum import StrEnum
-from typing import TypedDict
+from typing import Any, TypedDict
 
 from pydantic import BaseModel
 
@@ -101,6 +101,8 @@ class SessionConfig(BaseModel):
     model: str = "claude-sonnet-4-6"
     mcp_servers: list[McpServerConfig] | None = None
     security_pipelines: list[SecurityPipelineConfig] | None = None
+    # Compiled by the control plane; the bridge and supervisor parse it strictly.
+    stack_policy: dict[str, Any] | None = None
     # Ordered member list for multi-repo sessions; absent for scalar sessions
     # (the runtime synthesizes a one-entry list from repo_owner/repo_name).
     repositories: list[SessionRepositoryConfig] | None = None

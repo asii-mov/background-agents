@@ -19,7 +19,9 @@ import {
  */
 
 import { checkAutofixQueueHealth } from "./autofix/queue-health";
+import { ApprovedComponentStore } from "./db/approved-components";
 import { SessionIndexStore } from "./db/session-index";
+import { StackInventoryStore } from "./db/stack-inventory";
 import type { SqlDatabase } from "./db/sql-database";
 import { IMAGE_BUILD_SCHEDULER_CRON, runImageBuildScheduler } from "./image-builds/scheduler";
 import type { CorrelationContext, Logger } from "./logger";
@@ -85,7 +87,20 @@ export const SCHEDULED_JOBS: readonly ScheduledJob[] = [
   {
     name: "abandoned_draft_sweep",
     cron: ABANDONED_DRAFT_SWEEP_CRON,
-    async run({ db, sessions, log }, nowMs) {
+    async run({ db, sessions, backgroundTasks, log }, nowMs) {
+      backgroundTasks.submit(
+        async () => {
+          const observations = await new StackInventoryStore(
+            db,
+            new ApprovedComponentStore(db)
+          ).prune(nowMs);
+          log.info("Pruned stale stack observations", {
+            event: "stack_inventory.pruned",
+            observations,
+          });
+        },
+        { name: "stack_observation_prune" }
+      );
       await new AbandonedDraftSweep(
         new SessionIndexStore(db),
         new SessionDraftExpiryClient(sessions),

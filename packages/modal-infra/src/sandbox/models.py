@@ -34,6 +34,7 @@ class SandboxConfig:
     agent_slack_notify_enabled: bool = (
         False  # Whether to install the agent-initiated slack-notify tool
     )
+    agent_app_deploy_enabled: bool = False  # Whether to install the deploy-app tool
     settings: dict[str, Any] | None = (
         None  # Sandbox settings (tunnelPorts, etc.) from control plane
     )

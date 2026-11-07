@@ -25,6 +25,7 @@ import {
   parseRuntimeVersionNumber,
 } from "../../../image-builds/model";
 import { VERCEL_SANDBOX_VERSION } from "./bootstrap";
+import { GOVERNANCE, expectGovernedSandboxEnv } from "../../governance.test-helpers";
 
 function createSessionResponse(
   sessionId = "vercel-session-1",
@@ -258,6 +259,19 @@ describe("VercelSandboxProvider", () => {
         }),
       })
     );
+  });
+
+  it("delivers the session governance and the deploy-app gate", async () => {
+    const client = createMockClient();
+    const provider = new VercelSandboxProvider(client, providerConfig);
+
+    await provider.createSandbox({
+      ...baseCreateConfig,
+      governance: GOVERNANCE,
+      agentAppDeployEnabled: true,
+    });
+
+    expectGovernedSandboxEnv(vi.mocked(client.createSandbox).mock.calls[0][0].env);
   });
 
   it("uses one fallback timestamp for a zero provider creation time", async () => {

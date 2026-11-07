@@ -11,7 +11,7 @@ import type { SandboxSettings } from "@open-inspect/shared/types/integrations";
 import type { CorrelationContext } from "../logger";
 import { RequestDeadlineError } from "./request-deadline";
 import type { McpServerConfig } from "@open-inspect/shared/types/integrations";
-import type { SecurityPipelineConfig } from "@open-inspect/shared/types/security-pipelines";
+import type { SessionGovernance } from "./governance";
 
 /** Default sandbox lifetime in seconds (2 hours). */
 export const DEFAULT_SANDBOX_TIMEOUT_SECONDS = 7200;
@@ -149,10 +149,12 @@ export interface CreateSandboxConfig {
    * control-plane endpoint.
    */
   agentSlackNotifyEnabled?: boolean;
+  /** Install the deploy-app tool: app hosting is configured for this deployment. */
+  agentAppDeployEnabled?: boolean;
   /** MCP servers to inject into the agent session */
   mcpServers?: McpServerConfig[];
-  /** Centrally assigned AppSec pipelines run after agent generation. */
-  securityPipelines?: SecurityPipelineConfig[];
+  /** Centrally governed pipelines and stack policy the sandbox enforces. */
+  governance?: SessionGovernance;
   /** Sandbox settings (tunnel ports, etc.) resolved from integration settings */
   sandboxSettings?: SandboxSettings;
   /** Previous logical allocation identity, used by providers supporting ambiguous-create recovery. */
@@ -248,7 +250,8 @@ export interface RestoreConfig {
   branch?: string | null;
   /** MCP servers to inject into the sandbox */
   mcpServers?: McpServerConfig[];
-  securityPipelines?: SecurityPipelineConfig[];
+  /** Resolved fresh on each restore — see CreateSandboxConfig. */
+  governance?: SessionGovernance;
   /** Correlation context for downstream tracing */
   correlation?: CorrelationContext;
   /** Whether to enable code-server (browser-based editor) in the sandbox */
@@ -257,6 +260,8 @@ export interface RestoreConfig {
   vncEnabled?: boolean;
   /** Resolved fresh on each restore — see CreateSandboxConfig. */
   agentSlackNotifyEnabled?: boolean;
+  /** See CreateSandboxConfig. */
+  agentAppDeployEnabled?: boolean;
   /** Sandbox settings (tunnel ports, etc.) resolved from integration settings */
   sandboxSettings?: SandboxSettings;
   /** Previous logical allocation identity, used by providers supporting ambiguous-create recovery. */

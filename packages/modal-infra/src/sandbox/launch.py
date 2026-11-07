@@ -46,6 +46,7 @@ _RESERVED_LAUNCH_ENV_VARS = {
     "IMAGE_BUILD_MODE",
     "TERMINAL_ENABLED",
     "AGENT_SLACK_NOTIFY_ENABLED",
+    "AGENT_APP_DEPLOY_ENABLED",
     "SESSION_CONFIG",
     "CODE_SERVER_PASSWORD",
     CODE_SERVER_PORT_ENV_VAR,
@@ -198,6 +199,9 @@ class SandboxLauncher:
 
         if config.agent_slack_notify_enabled:
             env_vars["AGENT_SLACK_NOTIFY_ENABLED"] = "true"
+
+        if config.agent_app_deploy_enabled:
+            env_vars["AGENT_APP_DEPLOY_ENABLED"] = "true"
 
         tunnels = SandboxTunnels(
             code_server_enabled=config.code_server_enabled,

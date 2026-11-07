@@ -12,6 +12,7 @@ import {
   OpenComputerNotFoundError,
 } from "../opencomputer-rest-client";
 import { PrebuiltImageUnavailableError, type CreateSandboxConfig } from "../provider";
+import { GOVERNANCE, expectGovernedSandboxEnv } from "../governance.test-helpers";
 
 function createMockClient(overrides: Partial<OpenComputerRestClient> = {}): OpenComputerRestClient {
   const client = {
@@ -180,6 +181,22 @@ describe("OpenComputerSandboxProvider", () => {
       model: "claude-sonnet-4-6",
       branch: "main",
     });
+  });
+
+  it("delivers the session governance and the deploy-app gate", async () => {
+    const client = createMockClient();
+    const provider = new OpenComputerSandboxProvider(client, {
+      scmProvider: "github",
+      sandboxAccessPasswordSecret: "secret",
+    });
+
+    await provider.createSandbox({
+      ...baseConfig,
+      governance: GOVERNANCE,
+      agentAppDeployEnabled: true,
+    });
+
+    expectGovernedSandboxEnv(vi.mocked(client.createSandbox).mock.calls[0][0].env);
   });
 
   it("reports an unknown lifetime when a v2 response omits endAt", async () => {

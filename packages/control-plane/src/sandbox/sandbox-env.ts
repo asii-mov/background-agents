@@ -1,8 +1,10 @@
 import type { HarnessId } from "@open-inspect/shared/harnesses";
 import type { McpServerConfig } from "@open-inspect/shared/types/integrations";
 import type { SecurityPipelineConfig } from "@open-inspect/shared/types/security-pipelines";
+import type { CompiledStackPolicy } from "@open-inspect/shared/types/stack-policy";
 import { computeHmacHex } from "@open-inspect/shared/auth";
 import type { SourceControlProviderName } from "../source-control";
+import type { SessionGovernance } from "./governance";
 import {
   DEFAULT_SANDBOX_TIMEOUT_SECONDS,
   type CreateSandboxConfig,
@@ -49,6 +51,8 @@ export interface SessionConfigPayload {
   mcp_servers?: McpServerConfig[];
   /** Omitted from the serialized payload when undefined. */
   security_pipelines?: SecurityPipelineConfig[];
+  /** Omitted from the serialized payload when undefined, so older runtimes never see it. */
+  stack_policy?: CompiledStackPolicy;
   /** Omitted from the serialized payload when undefined. */
   branch?: string | null;
   /** Ordered member list; only present for multi-repo sessions. */
@@ -71,9 +75,19 @@ export interface SessionConfigInput {
   provider: string;
   model: string;
   mcpServers?: McpServerConfig[];
-  securityPipelines?: SecurityPipelineConfig[];
+  governance?: SessionGovernance;
   branch?: string | null;
   repositories?: SessionRepositoryInfo[];
+}
+
+/** The `SESSION_CONFIG` keys a {@link SessionGovernance} travels in; absent parts stay unset. */
+export function governanceWireFields(
+  governance: SessionGovernance | undefined
+): Pick<SessionConfigPayload, "security_pipelines" | "stack_policy"> {
+  return {
+    security_pipelines: governance?.securityPipelines,
+    stack_policy: governance?.stackPolicy,
+  };
 }
 
 /**
@@ -93,7 +107,7 @@ export function buildSessionConfig(input: SessionConfigInput): SessionConfigPayl
     provider: input.provider,
     model: input.model,
     mcp_servers: input.mcpServers,
-    security_pipelines: input.securityPipelines,
+    ...governanceWireFields(input.governance),
     bridge_early_connect: true,
   };
   if (input.branch !== undefined) {
@@ -327,6 +341,7 @@ export function buildSandboxEnvVars(
   delete envVars.NOVNC_PORT;
   delete envVars.TERMINAL_ENABLED;
   delete envVars.TTYD_PROXY_PORT;
+  delete envVars.AGENT_APP_DEPLOY_ENABLED;
   // Boot mode is the control plane's to decide. These are applied by the caller
   // after this returns (only when the corresponding mode is real), so unlike the
   // system keys below they are not overlaid and a repo secret of the same name
@@ -379,6 +394,10 @@ export function buildSandboxEnvVars(
 
   if (config.agentSlackNotifyEnabled) {
     envVars.AGENT_SLACK_NOTIFY_ENABLED = "true";
+  }
+
+  if (config.agentAppDeployEnabled) {
+    envVars.AGENT_APP_DEPLOY_ENABLED = "true";
   }
 
   applyScmCloneEnv(envVars, options.scmIdentity);

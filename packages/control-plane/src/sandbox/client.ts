@@ -9,15 +9,16 @@ import type { HarnessId } from "@open-inspect/shared/harnesses";
 import { generateInternalToken } from "@open-inspect/shared/auth";
 import type { ImageBuildScopeKind } from "@open-inspect/shared/types/image-builds";
 import type { McpServerConfig, SandboxSettings } from "@open-inspect/shared/types/integrations";
-import type { SecurityPipelineConfig } from "@open-inspect/shared/types/security-pipelines";
 import { z } from "zod";
 import { createLogger } from "../logger";
 import type { CorrelationContext } from "../logger";
 import {
   buildSessionConfig,
+  governanceWireFields,
   toRepositoryConfigPayload,
   type ScmCloneIdentity,
 } from "./sandbox-env";
+import type { SessionGovernance } from "./governance";
 import type { SessionRepositoryInfo } from "./provider";
 import { parsePendingVmReference } from "./providers/pending-vm-reference";
 import { withRequestDeadline } from "./request-deadline";
@@ -187,8 +188,9 @@ export interface CreateSandboxRequest {
   codeServerEnabled?: boolean;
   vncEnabled?: boolean;
   agentSlackNotifyEnabled?: boolean;
+  agentAppDeployEnabled?: boolean;
   mcpServers?: McpServerConfig[];
-  securityPipelines?: SecurityPipelineConfig[];
+  governance?: SessionGovernance;
   sandboxSettings?: SandboxSettings;
   repositories?: SessionRepositoryInfo[];
   signal?: AbortSignal;
@@ -229,8 +231,9 @@ export interface RestoreSandboxRequest {
   codeServerEnabled?: boolean;
   vncEnabled?: boolean;
   agentSlackNotifyEnabled?: boolean;
+  agentAppDeployEnabled?: boolean;
   mcpServers?: McpServerConfig[];
-  securityPipelines?: SecurityPipelineConfig[];
+  governance?: SessionGovernance;
   sandboxSettings?: SandboxSettings;
   repositories?: SessionRepositoryInfo[];
   signal?: AbortSignal;
@@ -524,8 +527,9 @@ export class ModalClient {
           code_server_enabled: request.codeServerEnabled ?? false,
           vnc_enabled: request.vncEnabled ?? false,
           agent_slack_notify_enabled: request.agentSlackNotifyEnabled ?? false,
+          agent_app_deploy_enabled: request.agentAppDeployEnabled ?? false,
           mcp_servers: request.mcpServers || null,
-          security_pipelines: request.securityPipelines || null,
+          ...governanceWireFields(request.governance),
           sandbox_settings: request.sandboxSettings ?? null,
           sandbox_backend: request.sandboxBackend,
           retire_sandbox_id: request.retireSandboxId,
@@ -603,6 +607,7 @@ export class ModalClient {
           code_server_enabled: request.codeServerEnabled ?? false,
           vnc_enabled: request.vncEnabled ?? false,
           agent_slack_notify_enabled: request.agentSlackNotifyEnabled ?? false,
+          agent_app_deploy_enabled: request.agentAppDeployEnabled ?? false,
           sandbox_settings: request.sandboxSettings ?? null,
           sandbox_backend: request.sandboxBackend,
           retire_sandbox_id: request.retireSandboxId,
