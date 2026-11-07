@@ -76,6 +76,11 @@ function toComponent(row: ApprovedComponentRow): ApprovedComponent {
     repoScopes: parseScopes(row.repo_scope),
     environmentScopes: parseScopes(row.environment_scope),
     enabled: row.enabled === 1,
+    // Until the stack-policy columns exist, every row is a plain API-owned catalogue entry.
+    categoryId: null,
+    stance: "allowed",
+    signals: [],
+    sourceKind: "app",
     createdBy: row.created_by,
     updatedBy: row.updated_by,
     createdAt: row.created_at,

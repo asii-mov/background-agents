@@ -1,0 +1,57 @@
+{
+  "$comment": "Generated from packages/shared/src/types/app-data.ts by `npm run generate:app-data-contract -w @open-inspect/shared`. Do not edit.",
+  "manifestFile": "openinspect.app.json",
+  "dataStoreKinds": [
+    "d1",
+    "kv",
+    "r2"
+  ],
+  "bindingNamePattern": "^[A-Z][A-Z0-9_]{0,31}$",
+  "platformBindingNames": [
+    "ASSETS",
+    "CF_ACCESS_TEAM_DOMAIN",
+    "CF_ACCESS_AUD",
+    "APP_HOSTNAME",
+    "OI_APP_NAME"
+  ],
+  "reservedBindingPrefixes": [
+    "CF_",
+    "CLOUDFLARE_",
+    "OI_",
+    "OPENINSPECT_"
+  ],
+  "deniedSecretNamePattern": "(^|_)(DATABASE_URL|DB_URL|CONNECTION_STRING|API_TOKEN_CLOUDFLARE|CLOUDFLARE_API_TOKEN)$",
+  "migrationFilePattern": "^\\d{4}_[a-z0-9-]+\\.sql$",
+  "identityHeaders": {
+    "sub": "x-openinspect-user-sub",
+    "email": "x-openinspect-user-email"
+  },
+  "forbiddenIdentityHeaders": [
+    "cf-access-authenticated-user-email",
+    "x-forwarded-email",
+    "x-forwarded-user",
+    "x-auth-user"
+  ],
+  "forbiddenConnectionSchemes": [
+    "postgres",
+    "postgresql",
+    "mysql",
+    "mongodb",
+    "mongodb+srv",
+    "redis",
+    "rediss"
+  ],
+  "deniedConfigFiles": [
+    "wrangler.toml",
+    "wrangler.json",
+    "wrangler.jsonc"
+  ],
+  "limits": {
+    "maxBindings": 8,
+    "maxSecrets": 16,
+    "maxMigrationFiles": 200,
+    "maxMigrationBytes": 262144,
+    "maxManifestBytes": 16384,
+    "maxSecretValueBytes": 8192
+  }
+}

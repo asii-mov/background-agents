@@ -48,7 +48,9 @@ export type RouteAuthorizationRequirement =
     }
   | TeamAdmissionRequirement
   | { kind: "environment"; idParam: string; need: "read" | "manage" | "use" }
-  | { kind: "session"; sessionIdParam: string; action: SessionAction; enforceAlways?: boolean };
+  | { kind: "session"; sessionIdParam: string; action: SessionAction; enforceAlways?: boolean }
+  /** The scoped `apps.manage` pair: `own` covers apps the actor or the actor's team owns. */
+  | { kind: "app"; operation: "manage"; appParam: string };
 
 type BotServiceName = Exclude<ServiceName, "web">;
 const DEFAULT_AUDIT_ALLOWED = false;
@@ -111,6 +113,8 @@ export function activeSelf(options?: { auditAllowed?: boolean }): RouteAuthoriza
 export const ACTIVE_SELF = activeSelf();
 
 const AUDITED_ALLOWED_PERMISSIONS = new Set<PermissionId>([
+  "apps.manage.any",
+  "apps.manage.own",
   "automations.create",
   "automations.manage.any",
   "automations.manage.own",
@@ -122,6 +126,7 @@ const AUDITED_ALLOWED_PERMISSIONS = new Set<PermissionId>([
   "environments.secrets.manage",
   "environments.settings.manage",
   "global_secrets.manage",
+  "governance.manage",
   "integrations.manage",
   "mcp_servers.manage",
   "models.preferences.manage",
@@ -191,6 +196,16 @@ export function requireAutomation(
         ? { kind: "actor", actorlessGrants: [{ service: "slack-bot" }] }
         : { kind: "deny" },
     auditAllowed: operation !== "read",
+  };
+}
+
+/** Require management of the app named by a path parameter. Services never manage apps. */
+export function requireApp(operation: "manage", appParam = "name"): RouteAuthorization {
+  return {
+    kind: "active-user",
+    allOf: [{ kind: "app", operation, appParam }],
+    service: { kind: "deny" },
+    auditAllowed: true,
   };
 }
 

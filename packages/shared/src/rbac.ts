@@ -42,6 +42,10 @@ export function isWorkspaceAdmin(roleKey: string | null | undefined): boolean {
 /** Canonical permission identifiers accepted by the RBAC policy and persistence layers. */
 export const PERMISSION_IDS = [
   "analytics.read",
+  "apps.deploy",
+  "apps.manage.any",
+  "apps.manage.own",
+  "apps.read",
   "automations.create",
   "automations.manage.any",
   "automations.manage.own",
@@ -56,6 +60,8 @@ export const PERMISSION_IDS = [
   "environments.settings.manage",
   "environments.use",
   "global_secrets.manage",
+  "governance.manage",
+  "governance.read",
   "image_builds.read",
   "integrations.manage",
   "integrations.read",
@@ -97,6 +103,10 @@ export const SESSION_WEBSOCKET_CONNECT_PERMISSION = "sessions.read" as const sat
 
 /** Maps ownership-sensitive capabilities to their workspace-wide and owner-only grants. */
 export const SCOPED_PERMISSION_PAIRS = {
+  "apps.manage": {
+    any: "apps.manage.any",
+    own: "apps.manage.own",
+  },
   "automations.manage": {
     any: "automations.manage.any",
     own: "automations.manage.own",
@@ -146,6 +156,9 @@ const VIEWER_PERMISSIONS = new Set<PermissionId>([
 
 const MEMBER_PERMISSIONS = new Set<PermissionId>([
   ...VIEWER_PERMISSIONS,
+  "apps.deploy",
+  "apps.manage.own",
+  "apps.read",
   "automations.create",
   "automations.manage.own",
   "automations.trigger.own",

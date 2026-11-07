@@ -35,3 +35,7 @@ packages/docs/.source/
 *.min.css
 packages/sandbox-runtime/src/sandbox_runtime/memory_contract.json
 packages/sandbox-runtime/src/sandbox_runtime/tools/_memory-contract.js
+packages/sandbox-runtime/src/sandbox_runtime/stack_policy_contract.json
+packages/sandbox-runtime/src/sandbox_runtime/app_deploy_contract.json
+packages/sandbox-runtime/src/sandbox_runtime/tools/_app-deploy-contract.js
+packages/sandbox-runtime/src/sandbox_runtime/conformance/app_data_contract.json

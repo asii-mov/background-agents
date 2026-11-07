@@ -352,7 +352,7 @@ describe("isServiceName", () => {
     for (const name of ["web", "slack-bot", "github-bot", "linear-bot"]) {
       expect(isServiceName(name)).toBe(true);
     }
-    for (const name of ["", "WEB", "modal", "sandbox", "slackbot", "unknown"]) {
+    for (const name of ["", "WEB", "modal", "sandbox", "slackbot", "unknown", "control-plane"]) {
       expect(isServiceName(name)).toBe(false);
     }
   });

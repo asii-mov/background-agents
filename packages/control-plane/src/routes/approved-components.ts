@@ -77,7 +77,8 @@ async function updateComponent(
   if (body instanceof Response) return body;
   const parsed = updateApprovedComponentSchema.safeParse(body);
   if (!parsed.success) return error(parsed.error.issues[0]?.message ?? "Invalid component", 400);
-  const { revision, ...definition } = parsed.data;
+  // The store moves a category's standard once stances are stored; until then the flag is inert.
+  const { revision, demoteCurrentPreferred: _demoteCurrentPreferred, ...definition } = parsed.data;
   try {
     const updated = await new ApprovedComponentStore(ctx.db).update(
       id,

@@ -1,0 +1,215 @@
+{
+  "$comment": "Generated from packages/shared/src/types/stack-policy.ts by `npm run generate:stack-contract -w @open-inspect/shared`. Do not edit.",
+  "schemaVersion": 1,
+  "exportSchemaVersion": 1,
+  "ecosystems": [
+    "npm",
+    "pypi"
+  ],
+  "signalKinds": [
+    "package",
+    "file",
+    "source",
+    "manifest"
+  ],
+  "dependencyScopes": [
+    "runtime",
+    "dev",
+    "peer",
+    "optional",
+    "transitive"
+  ],
+  "dataStoreKinds": [
+    "d1",
+    "kv",
+    "r2"
+  ],
+  "appManifestFile": "openinspect.app.json",
+  "sourceCountExcludedBasenameGlobs": [
+    "*.config.*",
+    ".*"
+  ],
+  "sourceCountExcludedDirectories": [
+    "node_modules",
+    ".git",
+    ".venv",
+    "venv",
+    "__pycache__",
+    "dist",
+    "build",
+    ".svelte-kit"
+  ],
+  "wellKnownToolchainFiles": [
+    "package.json",
+    "tsconfig.json",
+    "jsconfig.json",
+    "bun.lock",
+    "bun.lockb",
+    "bunfig.toml",
+    "package-lock.json",
+    "npm-shrinkwrap.json",
+    "yarn.lock",
+    ".yarnrc.yml",
+    "pnpm-lock.yaml",
+    "pnpm-workspace.yaml",
+    ".nvmrc",
+    ".node-version",
+    "pyproject.toml",
+    "uv.lock",
+    "pylock.toml",
+    "poetry.lock",
+    "Pipfile",
+    "Pipfile.lock",
+    "environment.yml",
+    "environment.yaml",
+    "conda-lock.yml",
+    "requirements*.txt"
+  ],
+  "derivedFileRules": [
+    {
+      "file": "requirements*.txt",
+      "derivedWhenSibling": [
+        "uv.lock",
+        "pylock.toml"
+      ]
+    },
+    {
+      "file": "constraints*.txt",
+      "derivedWhenSibling": [
+        "uv.lock",
+        "pylock.toml"
+      ]
+    }
+  ],
+  "maxObservedFacts": 5000,
+  "golden": {
+    "normalization": [
+      {
+        "ecosystem": "npm",
+        "input": "React",
+        "expected": "react"
+      },
+      {
+        "ecosystem": "npm",
+        "input": "@Acme/UI",
+        "expected": "@acme/ui"
+      },
+      {
+        "ecosystem": "pypi",
+        "input": "Typing_Extensions",
+        "expected": "typing-extensions"
+      },
+      {
+        "ecosystem": "pypi",
+        "input": "zope.interface",
+        "expected": "zope-interface"
+      }
+    ],
+    "packageSignal": [
+      {
+        "signal": "react",
+        "name": "react",
+        "matches": true
+      },
+      {
+        "signal": "react",
+        "name": "react-dom",
+        "matches": false
+      },
+      {
+        "signal": "@acme/*",
+        "name": "@acme/ui",
+        "matches": true
+      },
+      {
+        "signal": "@acme/*",
+        "name": "@acme-labs/ui",
+        "matches": false
+      }
+    ],
+    "fileGlob": [
+      {
+        "pattern": "requirements*.txt",
+        "basename": "requirements-dev.txt",
+        "matches": true
+      },
+      {
+        "pattern": "requirements*.txt",
+        "basename": "requirements.txt",
+        "matches": true
+      },
+      {
+        "pattern": "bun.lock",
+        "basename": "bun.lockb",
+        "matches": false
+      },
+      {
+        "pattern": "bun.lock?",
+        "basename": "bun.lockb",
+        "matches": true
+      },
+      {
+        "pattern": "Pipfile",
+        "basename": "pipfile",
+        "matches": false
+      }
+    ],
+    "sourceExclusion": [
+      {
+        "path": "svelte.config.js",
+        "counted": false
+      },
+      {
+        "path": ".eslintrc.cjs",
+        "counted": false
+      },
+      {
+        "path": "src/routes/+page.js",
+        "counted": true
+      },
+      {
+        "path": "dist/app.js",
+        "counted": false
+      },
+      {
+        "path": "packages/web/node_modules/x/index.ts",
+        "counted": false
+      }
+    ],
+    "derived": [
+      {
+        "path": "svc/requirements.txt",
+        "siblings": [
+          "svc/uv.lock"
+        ],
+        "derived": true
+      },
+      {
+        "path": "svc/requirements-dev.txt",
+        "siblings": [
+          "svc/pylock.toml"
+        ],
+        "derived": true
+      },
+      {
+        "path": "svc/requirements.txt",
+        "siblings": [],
+        "derived": false
+      },
+      {
+        "path": "svc/requirements.txt",
+        "siblings": [
+          "uv.lock"
+        ],
+        "derived": false
+      },
+      {
+        "path": "web/package-lock.json",
+        "siblings": [
+          "web/bun.lock"
+        ],
+        "derived": false
+      }
+    ]
+  }
+}
