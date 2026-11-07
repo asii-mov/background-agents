@@ -46,7 +46,6 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
-import { usePlatformRole } from "@/hooks/use-platform-role";
 import { useCurrentUserAuthorization } from "@/hooks/use-current-user-authorization";
 
 type ScopeMode = "global" | "selected";
@@ -547,8 +546,7 @@ function McpServerForm({
  */
 export function McpServersSettings() {
   const { hasPermission } = useCurrentUserAuthorization();
-  const { canWriteCatalog } = usePlatformRole();
-  const canManage = hasPermission("mcp_servers.manage") && canWriteCatalog;
+  const canManage = hasPermission("mcp_servers.manage");
   const { servers, loading, mutate } = useMcpServers();
   const { repos, loading: loadingRepos } = useRepos();
   const { environments, loading: loadingEnvironments } = useEnvironments();

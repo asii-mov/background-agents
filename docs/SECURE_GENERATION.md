@@ -240,27 +240,27 @@ an immediate egress revocation is required.
 
 ## Management API
 
-| Resource                                     | Read              | Mutate              | Notes                                                                |
-| -------------------------------------------- | ----------------- | ------------------- | -------------------------------------------------------------------- |
-| `/platform/me`                               | signed-in user    | —                   | Effective role                                                       |
-| `/platform/users`                            | admin             | admin               | Role update is `PATCH /platform/users/:id/role`                      |
-| `/capabilities`                              | user/service      | —                   | Skills, MCPs, and approved components                                |
-| `/skills`                                    | user/service      | editor/admin        | Supports required Skills and revision CAS                            |
-| `/mcp-servers`                               | user/service      | editor/admin        | Lifecycle, scope, provenance, revision CAS                           |
-| `/approved-components`                       | `governance.read` | `governance.manage` | Lifecycle, provenance, scope, stance, signals, revision CAS          |
-| `/approved-components/:id/consumers`         | `governance.read` | —                   | Revision-aware consumer inventory                                    |
-| `/component-categories`                      | `governance.read` | `governance.manage` | Technology slots and their `advise` or `block` enforcement           |
-| `/stack-policy/preview`                      | `governance.read` | —                   | Instructions a session for `?repo=` would receive                    |
-| `/stack-policy/export`                       | `governance.read` | —                   | Compiled policy for the CI check ([Stack policy](STACK_POLICY.md))   |
-| `/stack-inventory`                           | `governance.read` | —                   | Observed stack; `/rollup` per category, `/repositories/:owner/:name` |
-| `/governance/catalog`                        | `governance.read` | `governance.manage` | Git catalogue status; mutate is `POST /governance/catalog/sync`      |
-| `/sessions/:id/approved-components`          | sandbox           | sandbox             | Scoped search and adoption                                           |
-| `/sessions/:id/stack-observations`           | —                 | sandbox             | Baseline and push stack reports                                      |
-| `/sessions/:id/mcp-artifacts/:mcp/:revision` | sandbox           | sandbox             | Exact session-pinned MCP artifact                                    |
-| `/security-pipelines`                        | `governance.read` | `governance.manage` | Scope and revision CAS                                               |
-| `/repository-risk`                           | `governance.read` | `governance.manage` | Repository criticality profiles                                      |
-| `/risk/assess`                               | `governance.read` | —                   | Deterministic preview                                                |
-| `/integration-settings/sandbox`              | user/service      | mixed               | Network policy changes require editor/admin                          |
+| Resource                                     | Read              | Mutate               | Notes                                                                |
+| -------------------------------------------- | ----------------- | -------------------- | -------------------------------------------------------------------- |
+| `/platform/me`                               | signed-in user    | —                    | Effective role                                                       |
+| `/platform/users`                            | admin             | admin                | Role update is `PATCH /platform/users/:id/role`                      |
+| `/capabilities`                              | user/service      | —                    | Skills, MCPs, and approved components                                |
+| `/skills`                                    | user/service      | `skills.manage`      | Supports required Skills and revision CAS                            |
+| `/mcp-servers`                               | user/service      | `mcp_servers.manage` | Lifecycle, scope, provenance, revision CAS                           |
+| `/approved-components`                       | `governance.read` | `governance.manage`  | Lifecycle, provenance, scope, stance, signals, revision CAS          |
+| `/approved-components/:id/consumers`         | `governance.read` | —                    | Revision-aware consumer inventory                                    |
+| `/component-categories`                      | `governance.read` | `governance.manage`  | Technology slots and their `advise` or `block` enforcement           |
+| `/stack-policy/preview`                      | `governance.read` | —                    | Instructions a session for `?repo=` would receive                    |
+| `/stack-policy/export`                       | `governance.read` | —                    | Compiled policy for the CI check ([Stack policy](STACK_POLICY.md))   |
+| `/stack-inventory`                           | `governance.read` | —                    | Observed stack; `/rollup` per category, `/repositories/:owner/:name` |
+| `/governance/catalog`                        | `governance.read` | `governance.manage`  | Git catalogue status; mutate is `POST /governance/catalog/sync`      |
+| `/sessions/:id/approved-components`          | sandbox           | sandbox              | Scoped search and adoption                                           |
+| `/sessions/:id/stack-observations`           | —                 | sandbox              | Baseline and push stack reports                                      |
+| `/sessions/:id/mcp-artifacts/:mcp/:revision` | sandbox           | sandbox              | Exact session-pinned MCP artifact                                    |
+| `/security-pipelines`                        | `governance.read` | `governance.manage`  | Scope and revision CAS                                               |
+| `/repository-risk`                           | `governance.read` | `governance.manage`  | Repository criticality profiles                                      |
+| `/risk/assess`                               | `governance.read` | —                    | Deterministic preview                                                |
+| `/integration-settings/sandbox`              | user/service      | mixed                | Network policy changes require editor/admin                          |
 
 ## Verification
 

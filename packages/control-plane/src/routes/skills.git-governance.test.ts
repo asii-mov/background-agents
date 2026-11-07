@@ -1,11 +1,9 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type * as AuthenticateModule from "../auth/authenticate";
-import type { SqlStatement } from "../db/sql-database";
 import {
   authorizationDatabase,
   createTestEnv,
   createTestRequestHandler,
-  emptyStatement,
   TEST_BACKGROUND_TASK_CONTEXT,
   TEST_USER_ID,
 } from "../router.test-support";
@@ -21,29 +19,12 @@ vi.mock("../auth/authenticate", async (importOriginal) => ({
 
 const handleRequest = createTestRequestHandler([skillRoutes]);
 
-function platformEditorStatement(sql: string): SqlStatement {
-  if (!sql.includes("platform_role FROM users WHERE id")) return emptyStatement();
-  const statement: SqlStatement = {
-    ...emptyStatement(),
-    bind: () => statement,
-    first: async <T>() =>
-      ({
-        id: TEST_USER_ID,
-        display_name: null,
-        email: null,
-        email_verified: 0,
-        platform_role: "editor",
-      }) as T,
-  };
-  return statement;
-}
-
 const gitManagedEnv: Env = createTestEnv({
   GOVERNANCE_REPO_OWNER: "security",
   GOVERNANCE_REPO_NAME: "agent-governance",
   GOVERNANCE_REPO_REF: "main",
   GOVERNANCE_REPO_PATH: ".openinspect",
-  DB: authorizationDatabase({ statement: platformEditorStatement }),
+  DB: authorizationDatabase(),
 });
 
 describe("Git-managed skill catalog writes", () => {

@@ -627,23 +627,18 @@ describe("route policy table", () => {
   });
 
   it.each([
-    ["POST", "/skills"],
-    ["POST", "/skills/import/preview"],
-    ["POST", "/skills/import"],
-    ["POST", "/skills/skill-1/reimport/preview"],
-    ["POST", "/skills/skill-1/reimport"],
-    ["PATCH", "/skills/skill-1"],
-    ["PUT", "/skills/skill-1"],
-    ["DELETE", "/skills/skill-1"],
-    ["POST", "/mcp-servers"],
-    ["PUT", "/mcp-servers/mcp-1"],
-    ["PUT", "/mcp-servers/mcp-1/credentials"],
-    ["DELETE", "/mcp-servers/mcp-1"],
-  ])("requires catalog.write for %s %s", (method, path) => {
-    expect(routeFor(method, path)?.requiredPermission).toBe("catalog.write");
-  });
-
-  it.each([
+    ["POST", "/skills", "skills.manage"],
+    ["POST", "/skills/import/preview", "skills.manage"],
+    ["POST", "/skills/import", "skills.manage"],
+    ["POST", "/skills/skill-1/reimport/preview", "skills.manage"],
+    ["POST", "/skills/skill-1/reimport", "skills.manage"],
+    ["PATCH", "/skills/skill-1", "skills.manage"],
+    ["PUT", "/skills/skill-1", "skills.manage"],
+    ["DELETE", "/skills/skill-1", "skills.manage"],
+    ["POST", "/mcp-servers", "mcp_servers.manage"],
+    ["PUT", "/mcp-servers/mcp-1", "mcp_servers.manage"],
+    ["PUT", "/mcp-servers/mcp-1/credentials", "mcp_servers.manage"],
+    ["DELETE", "/mcp-servers/mcp-1", "mcp_servers.manage"],
     ["GET", "/approved-components", "governance.read"],
     ["GET", "/approved-components/component-1/consumers", "governance.read"],
     ["GET", "/component-categories", "governance.read"],

@@ -7,13 +7,15 @@ import * as matchers from "@testing-library/jest-dom/matchers";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { SkillSummary } from "@open-inspect/shared/types/skills";
 import { SkillsCatalog } from "./skills-catalog";
+import { SkillsSettings } from "./index";
 
 expect.extend(matchers);
 
-const { useSkillCatalogPageMock, useSkillMock, governance } = vi.hoisted(() => ({
+const { useSkillCatalogPageMock, useSkillMock, governance, permissions } = vi.hoisted(() => ({
   useSkillCatalogPageMock: vi.fn(),
   useSkillMock: vi.fn(),
   governance: { configured: false },
+  permissions: new Set<string>(),
 }));
 
 vi.mock("@/hooks/use-managed-skills", () => ({
@@ -23,8 +25,10 @@ vi.mock("@/hooks/use-managed-skills", () => ({
   useSkill: useSkillMock,
   useSkillCatalogPage: useSkillCatalogPageMock,
 }));
-vi.mock("@/hooks/use-platform-role", () => ({
-  usePlatformRole: () => ({ canWriteCatalog: true }),
+vi.mock("@/hooks/use-current-user-authorization", () => ({
+  useCurrentUserAuthorization: () => ({
+    hasPermission: (permission: string) => permissions.has(permission),
+  }),
 }));
 vi.mock("@/hooks/use-governance-catalog", () => ({
   useGovernanceCatalog: () => ({ status: governance }),
@@ -55,7 +59,7 @@ function skill(id: string, name: string): SkillSummary {
 
 beforeEach(() => {
   governance.configured = false;
-  governance.configured = false;
+  permissions.clear();
   useSkillCatalogPageMock.mockReset();
   useSkillCatalogPageMock.mockImplementation((cursor: string | null) =>
     cursor
@@ -85,6 +89,30 @@ beforeEach(() => {
 afterEach(cleanup);
 
 describe("SkillsCatalog", () => {
+  it("shows catalogue edit controls to a user granted skills.manage", () => {
+    permissions.add("skills.read");
+    permissions.add("skills.manage");
+    render(<SkillsSettings />);
+
+    expect(screen.getByRole("button", { name: "New skill" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Import from repository" })).toBeInTheDocument();
+    expect(screen.getByRole("switch", { name: "Disable first-skill" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Delete" })).toBeInTheDocument();
+  });
+
+  it("withholds catalogue edit controls without skills.manage", () => {
+    permissions.add("skills.read");
+    render(<SkillsSettings />);
+
+    expect(screen.getByText("first-skill")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "New skill" })).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Import from repository" })
+    ).not.toBeInTheDocument();
+    expect(screen.queryByRole("switch", { name: "Disable first-skill" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Delete" })).not.toBeInTheDocument();
+  });
+
   it("makes the shared catalogue read-only when Git governance is configured", () => {
     governance.configured = true;
     render(<SkillsCatalog canManage />);

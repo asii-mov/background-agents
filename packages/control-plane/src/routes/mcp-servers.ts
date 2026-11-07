@@ -236,7 +236,6 @@ const MCP_READ = admit({
 const MCP_MANAGE = admit({
   ...GITHUB_USER_OR_SERVICE_ROUTE,
   authorization: requirePermission("mcp_servers.manage"),
-  requiredPermission: "catalog.write",
 });
 
 export const mcpServerRoutes = new Hono<ControlPlaneHonoEnv>();

@@ -16,12 +16,9 @@ import { SkillEditor } from "./skill-editor";
 import { SkillImport } from "./skill-import";
 import { SkillDetails } from "./skill-details";
 import { errorMessage } from "./utils";
-import { usePlatformRole } from "@/hooks/use-platform-role";
 import { useGovernanceCatalog } from "@/hooks/use-governance-catalog";
 
-export function SkillsCatalog({ canManage: canManageSkills }: { canManage: boolean }) {
-  const { canWriteCatalog } = usePlatformRole();
-  const canManage = canManageSkills && canWriteCatalog;
+export function SkillsCatalog({ canManage }: { canManage: boolean }) {
   const { status: governance } = useGovernanceCatalog();
   const gitManaged = governance?.configured === true;
   const [cursorHistory, setCursorHistory] = useState<string[]>([]);

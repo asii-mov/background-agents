@@ -707,7 +707,6 @@ const SKILLS_READ = admit({
 const SKILLS_MANAGE = admit({
   ...SCM_AGNOSTIC_HUMAN_USER_ROUTE,
   authorization: requirePermission("skills.manage"),
-  requiredPermission: "catalog.write",
 });
 const PROFILES_MANAGE_OWN = admit({
   ...SCM_AGNOSTIC_HUMAN_USER_ROUTE,
