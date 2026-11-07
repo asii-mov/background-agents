@@ -228,10 +228,10 @@ export const SETTINGS_GROUPS = [
       {
         id: "appsec",
         label: "AppSec",
-        description: "Govern security pipelines, repository risk and approved components",
-        keywords: "security governance catalog approvals risk",
+        description: "Set technology standards, track adoption and verify generated code",
+        keywords: "security governance catalog approvals risk stack policy standards adoption data",
         icon: GitPrIcon,
-        visibility: publicSettings,
+        visibility: anyOf("governance.read"),
         panel: lazyPanel(() =>
           import("./appsec-governance-settings").then(
             ({ AppSecGovernanceSettings }) => AppSecGovernanceSettings

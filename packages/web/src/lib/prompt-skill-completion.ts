@@ -1,6 +1,9 @@
 import type { ResolvedSkill } from "@open-inspect/shared/types/skills";
 
-export type PromptSkillSuggestion = Pick<ResolvedSkill, "skillId" | "name" | "description">;
+export type PromptSkillSuggestion = Pick<
+  ResolvedSkill,
+  "skillId" | "name" | "description" | "required"
+>;
 export type PromptSkillSuggestionSource =
   | { status: "loading" }
   | { status: "error" }

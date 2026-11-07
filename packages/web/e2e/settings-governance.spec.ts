@@ -105,6 +105,7 @@ test("lets an administrator assign a role, create a pipeline, and save repositor
   api.role = "admin";
   await page.goto("/settings?tab=appsec");
 
+  await page.getByRole("tab", { name: "Pipelines and risk" }).click();
   await expect(page.getByRole("heading", { name: "Platform ownership" })).toBeVisible();
   const staffRole = page.getByRole("combobox", { name: "Role for Staff Engineer" });
   await expect(staffRole).toContainText("Member");
@@ -142,14 +143,23 @@ test("lets an administrator assign a role, create a pipeline, and save repositor
   ]);
 });
 
-test("hides AppSec catalogue writes from members", async ({ page, api }) => {
+test("gives members no AppSec entry and no governance data from a direct link", async ({
+  page,
+  api,
+}) => {
   api.role = "member";
   await page.goto("/settings?tab=appsec");
 
-  await expect(page.getByRole("heading", { name: "AppSec governance" })).toBeVisible();
-  await expect(page.getByRole("button", { name: /Add pipeline/ })).toHaveCount(0);
-  await expect(page.getByRole("button", { name: "Save criticality" })).toHaveCount(0);
-  await expect(page.getByRole("heading", { name: "Platform ownership" })).toHaveCount(0);
+  await expect(page).not.toHaveURL(/tab=appsec/);
+  await expect(page.getByRole("heading", { name: "Settings" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "AppSec", exact: true })).toHaveCount(0);
+  await expect(page.getByRole("heading", { name: "AppSec governance" })).toHaveCount(0);
+  const governanceReads = api.requests.filter(({ path }) =>
+    /^\/api\/(approved-components|component-categories|stack-policy|stack-inventory|app-data|security-pipelines|repository-risk)/.test(
+      path
+    )
+  );
+  expect(governanceReads).toEqual([]);
 });
 
 test("saves a supported outbound allowlist", async ({ page, api }) => {

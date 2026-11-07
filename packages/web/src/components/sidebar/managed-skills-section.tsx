@@ -19,6 +19,8 @@ export function ManagedSkillsSection({ sessionId }: { sessionId: string }) {
     return <div className="text-xs text-muted-foreground">Loading managed skills...</div>;
   }
   if (!provenance) return null;
+  // Required skills are workspace governance that loads regardless of selection.
+  const skills = provenance.skills.filter((skill) => !skill.required);
 
   const profileLabel =
     provenance.selection.mode === "profile"
@@ -27,13 +29,13 @@ export function ManagedSkillsSection({ sessionId }: { sessionId: string }) {
         ? "None"
         : "All applicable";
   return (
-    <CollapsibleSection title={`Managed skills (${provenance.skills.length})`} defaultOpen={false}>
+    <CollapsibleSection title={`Managed skills (${skills.length})`} defaultOpen={false}>
       <div className="space-y-3">
         <div className="flex items-center justify-between text-xs">
           <span className="text-muted-foreground">Selection</span>
           <span className="max-w-[11rem] truncate text-foreground">{profileLabel}</span>
         </div>
-        {provenance.skills.map((skill) => (
+        {skills.map((skill) => (
           <div key={skill.skillId} className="border-l border-border pl-3">
             <div className="flex items-center justify-between gap-2">
               <span className="truncate font-mono text-xs font-medium text-foreground">
@@ -51,7 +53,7 @@ export function ManagedSkillsSection({ sessionId }: { sessionId: string }) {
             )}
           </div>
         ))}
-        {provenance.skills.length === 0 && (
+        {skills.length === 0 && (
           <p className="text-xs text-muted-foreground">No managed skills were pinned.</p>
         )}
       </div>

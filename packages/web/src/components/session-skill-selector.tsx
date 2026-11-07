@@ -33,6 +33,7 @@ export function SessionSkillSelector({
   const { profiles, loading } = useSkillProfiles();
   const valueKey = selectionValue(value);
   const ignoredCount = preview?.ignoredProfileSkillIds.length ?? 0;
+  const selectableCount = preview?.skills.filter((skill) => !skill.required).length ?? 0;
 
   const options: ComboboxOption[] = [
     {
@@ -71,7 +72,7 @@ export function SessionSkillSelector({
       <span className="max-w-[9rem] truncate">{selectedLabel}</span>
       {target && (
         <span className="text-xs text-muted-foreground">
-          {previewLoading ? "..." : preview ? `(${preview.skills.length})` : ""}
+          {previewLoading ? "..." : preview ? `(${selectableCount})` : ""}
         </span>
       )}
       {ignoredCount > 0 && (

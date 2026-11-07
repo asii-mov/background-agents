@@ -1,6 +1,14 @@
 import type { Page, Request, Route } from "@playwright/test";
 import { analyticsDashboard } from "../src/lib/analytics.test-fixture";
 import { permissionsForBuiltInRole } from "../../shared/src/rbac";
+import {
+  approvedComponents,
+  componentCategories,
+  stackInventory,
+  stackPolicyPreview,
+  stackRollup,
+  type StackPolicyState,
+} from "./verification-stack-policy";
 
 type PlatformRole = "member" | "editor" | "admin";
 type NetworkPolicy =
@@ -31,6 +39,8 @@ export interface VerificationApiState {
   sandboxNetworkPolicy: NetworkPolicy;
   sandboxWriteError: string | null;
   automation: VerificationAutomationState;
+  stackPolicy: StackPolicyState;
+  sessionSkills: Array<Record<string, unknown>>;
 }
 
 const userId = "0123456789abcdef0123456789abcdef";
@@ -226,6 +236,8 @@ async function handleApi(route: Route, state: VerificationApiState): Promise<voi
               ...permissionsForBuiltInRole("member"),
               "skills.manage",
               "mcp_servers.manage",
+              "governance.read",
+              "governance.manage",
             ],
           }
         : {
@@ -376,7 +388,7 @@ async function handleApi(route: Route, state: VerificationApiState): Promise<voi
       resolverVersion: 2,
       selection: { mode: "all" },
       resolvedAt: now,
-      skills: [],
+      skills: state.sessionSkills,
     });
     return;
   }
@@ -666,7 +678,38 @@ async function handleApi(route: Route, state: VerificationApiState): Promise<voi
     return;
   }
   if (method === "GET" && url.pathname === "/api/approved-components") {
-    await json(route, []);
+    await json(route, approvedComponents());
+    return;
+  }
+  if (method === "GET" && url.pathname === "/api/component-categories") {
+    await json(route, componentCategories(state.stackPolicy));
+    return;
+  }
+  if (method === "PUT" && url.pathname === "/api/component-categories/web-frontend") {
+    const input = body as { enforcement?: "advise" | "block"; revision?: number };
+    if (state.role === "member" || !input.enforcement) {
+      await json(route, { error: "Forbidden" }, 403);
+      return;
+    }
+    state.stackPolicy.webFrontendEnforcement = input.enforcement;
+    state.stackPolicy.webFrontendRevision += 1;
+    await json(route, componentCategories(state.stackPolicy)[3]);
+    return;
+  }
+  if (method === "GET" && url.pathname === "/api/stack-policy/preview") {
+    await json(route, stackPolicyPreview(state.stackPolicy, url.searchParams.get("repo")));
+    return;
+  }
+  if (method === "GET" && url.pathname === "/api/stack-inventory") {
+    await json(route, stackInventory());
+    return;
+  }
+  if (method === "GET" && url.pathname === "/api/stack-inventory/rollup") {
+    await json(route, stackRollup());
+    return;
+  }
+  if (method === "GET" && url.pathname === "/api/app-data/inventory") {
+    await json(route, { error: "Not found" }, 404);
     return;
   }
   if (method === "GET" && url.pathname === "/api/security-pipelines") {
@@ -754,6 +797,8 @@ export async function installVerificationApi(page: Page): Promise<VerificationAp
     sandboxNetworkPolicy: { mode: "unrestricted" },
     sandboxWriteError: null,
     automation: { triggered: false },
+    stackPolicy: { webFrontendEnforcement: "advise", webFrontendRevision: 1 },
+    sessionSkills: [],
   };
   await page.route("**/api/**", (route) => handleApi(route, state));
   return state;

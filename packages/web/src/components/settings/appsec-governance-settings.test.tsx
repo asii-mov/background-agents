@@ -10,10 +10,14 @@ import { AppSecGovernanceSettings } from "./appsec-governance-settings";
 
 expect.extend(matchers);
 
-const role = vi.hoisted(() => ({ canWriteCatalog: false, canManagePlatform: false }));
+const grants = vi.hoisted(() => ({ permissions: new Set<string>(["governance.read"]) }));
 
 vi.mock("sonner", () => ({ toast: { success: vi.fn(), error: vi.fn() } }));
-vi.mock("@/hooks/use-platform-role", () => ({ usePlatformRole: () => role }));
+vi.mock("@/hooks/use-current-user-authorization", () => ({
+  useCurrentUserAuthorization: () => ({
+    hasPermission: (permission: string) => grants.permissions.has(permission),
+  }),
+}));
 
 const pipeline = {
   id: "pipeline-1",
@@ -46,46 +50,87 @@ function renderSettings() {
   );
 }
 
+const EMPTY_GOVERNANCE_READS = new Set([
+  "/api/repository-risk",
+  "/api/approved-components",
+  "/api/component-categories",
+]);
+
+function governanceRead(path: string): Response | null {
+  if (EMPTY_GOVERNANCE_READS.has(path)) return response([]);
+  if (path === "/api/stack-policy/preview") return response({ policy: null });
+  return null;
+}
+
+async function openPipelines() {
+  await userEvent.setup().click(await screen.findByRole("tab", { name: "Pipelines and risk" }));
+}
+
 afterEach(() => {
   cleanup();
   vi.restoreAllMocks();
-  role.canWriteCatalog = false;
-  role.canManagePlatform = false;
+  grants.permissions = new Set(["governance.read"]);
 });
 
 describe("AppSecGovernanceSettings", () => {
-  it("shows centrally assigned policy to members without mutation controls", async () => {
+  it("opens on the stack policy and offers every governance view", async () => {
     vi.stubGlobal(
       "fetch",
       vi.fn(async (input: RequestInfo | URL) => {
-        if (String(input) === "/api/security-pipelines") return response([pipeline]);
-        if (String(input) === "/api/repository-risk") return response([]);
-        if (String(input) === "/api/approved-components") return response([]);
+        if (String(input) === "/api/security-pipelines") return response([]);
+        const read = governanceRead(String(input));
+        if (read) return read;
         throw new Error(`Unexpected request ${String(input)}`);
       })
     );
 
     renderSettings();
 
+    expect(
+      await screen.findByRole("heading", { name: "Technology standards" })
+    ).toBeInTheDocument();
+    expect(screen.getAllByRole("tab").map((tab) => tab.textContent)).toEqual([
+      "Stack policy",
+      "Adoption",
+      "App data",
+      "Pipelines and risk",
+    ]);
+  });
+
+  it("shows read-only governance without mutation controls", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        if (String(input) === "/api/security-pipelines") return response([pipeline]);
+        const read = governanceRead(String(input));
+        if (read) return read;
+        throw new Error(`Unexpected request ${String(input)}`);
+      })
+    );
+
+    renderSettings();
+    await openPipelines();
+
     expect(await screen.findByText("AppSec baseline")).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /Add pipeline/i })).not.toBeInTheDocument();
     expect(screen.queryByText("Platform ownership")).not.toBeInTheDocument();
   });
 
-  it("lets catalogue editors create an argv-based managed pipeline", async () => {
-    role.canWriteCatalog = true;
+  it("lets governance managers create an argv-based managed pipeline", async () => {
+    grants.permissions = new Set(["governance.read", "governance.manage"]);
     const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const path = String(input);
       const method = init?.method ?? "GET";
       if (path === "/api/security-pipelines" && method === "GET") return response([]);
-      if (path === "/api/repository-risk" && method === "GET") return response([]);
-      if (path === "/api/approved-components" && method === "GET") return response([]);
+      const read = method === "GET" ? governanceRead(path) : null;
+      if (read) return read;
       if (path === "/api/security-pipelines" && method === "POST") return response(pipeline, 201);
       throw new Error(`Unexpected request ${method} ${path}`);
     });
     vi.stubGlobal("fetch", fetchMock);
     const user = userEvent.setup();
     renderSettings();
+    await openPipelines();
 
     await user.click(await screen.findByRole("button", { name: /Add pipeline/i }));
     await user.clear(screen.getByPlaceholderText("AppSec baseline"));

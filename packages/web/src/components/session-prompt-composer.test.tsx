@@ -115,7 +115,14 @@ function ComposerHarness({
       skillSuggestions={{
         status: "ready",
         skills: withSkill
-          ? [{ skillId: "skill-1", name: "review-pr", description: "Review a pull request" }]
+          ? [
+              {
+                skillId: "skill-1",
+                name: "review-pr",
+                description: "Review a pull request",
+                required: false,
+              },
+            ]
           : [],
       }}
       attachments={{
