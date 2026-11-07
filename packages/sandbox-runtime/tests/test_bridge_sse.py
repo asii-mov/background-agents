@@ -27,6 +27,7 @@ from sandbox_runtime.harness.opencode_stream import (
     _PromptState,
 )
 from sandbox_runtime.opencode_identifier import OpenCodeIdentifier
+from sandbox_runtime.security_pipeline import SecurityCommandResult, SecurityPipelineReport
 from tests.conftest import (
     MockResponse,
     oc_message_id,
@@ -36,6 +37,21 @@ from tests.conftest import (
 )
 
 MOCK_HTTP_TIMEOUT_SECONDS = 30.0
+
+
+def _command_result(*, exit_code: int) -> SecurityCommandResult:
+    return SecurityCommandResult(
+        "pipeline-1",
+        "Application security",
+        "scanner",
+        ("scanner",),
+        exit_code,
+        "verified scanner finding",
+        False,
+        True,
+    )
+
+
 PROMPT_TIMEOUT_TEST_BUDGET_SECONDS = 0.8
 
 
@@ -922,15 +938,11 @@ class TestSSEStreaming:
             await emit({"type": "token", "messageId": prompt.message_id, "content": "agent output"})
             return TurnOutcome(success=True)
 
-        failed_report = MagicMock()
-        failed_report.failures = (object(),)
-        failed_report.blocking_failures = (object(),)
-        failed_report.remediation_prompt.return_value = "Fix the verified scanner finding"
-        passed_report = MagicMock()
-        passed_report.failures = ()
-        passed_report.blocking_failures = ()
+        failed_report = SecurityPipelineReport((_command_result(exit_code=1),))
+        passed_report = SecurityPipelineReport((_command_result(exit_code=0),))
         runner = MagicMock()
-        runner.pipelines = (object(),)
+        runner.has_checks = True
+        runner.stack = None
         runner.max_remediation_attempts = 1
         runner.run = AsyncMock(side_effect=[failed_report, passed_report])
         bridge.security_pipelines = runner
@@ -944,7 +956,8 @@ class TestSSEStreaming:
             }
         )
 
-        assert prompts == ["Build the feature", "Fix the verified scanner finding"]
+        assert prompts == ["Build the feature", failed_report.remediation_prompt()]
+        assert "verified scanner finding" in prompts[1]
         assert runner.run.await_count == 2
         events = [call.args[0] for call in bridge._send_event.await_args_list]
         assert [event["scope"] for event in events if event["type"] == "warning"] == [
@@ -968,11 +981,10 @@ class TestSSEStreaming:
             await emit({"type": "token", "messageId": prompt.message_id, "content": "agent output"})
             return TurnOutcome(success=True)
 
-        failed_report = MagicMock()
-        failed_report.failures = (object(),)
-        failed_report.blocking_failures = (object(),)
+        failed_report = SecurityPipelineReport((_command_result(exit_code=1),))
         runner = MagicMock()
-        runner.pipelines = (object(),)
+        runner.has_checks = True
+        runner.stack = None
         runner.max_remediation_attempts = 0
         runner.run = AsyncMock(return_value=failed_report)
         bridge.security_pipelines = runner

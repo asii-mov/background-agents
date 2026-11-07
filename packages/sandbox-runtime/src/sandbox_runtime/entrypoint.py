@@ -171,6 +171,7 @@ def build_supervisor(shutdown_event: asyncio.Event) -> SandboxSupervisor:
         shutdown_event,
         log,
         memory=_build_memory(config, claude_config_dir, log),
+        policy_dir=harness_config_dir(config.harness, claude_config_dir),
         boot_events=warnings,
         docker_service=DockerService(log) if config.docker_enabled else None,
     )

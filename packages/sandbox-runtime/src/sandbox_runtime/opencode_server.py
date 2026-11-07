@@ -20,7 +20,7 @@ import httpx
 from .constants import OPENCODE_PORT
 from .git_excludes import install_runtime_git_excludes
 from .mcp_packages import McpPackageInstaller
-from .memories import memory_path
+from .platform_context import opencode_instruction_files
 from .process_output import iter_process_lines
 from .sandbox_bin import install_bin_scripts
 
@@ -31,7 +31,10 @@ if TYPE_CHECKING:
     from .runtime_config import OpenCodeConfig
 
 _LOG_FORWARD_STREAM_LIMIT_BYTES = 1024 * 1024
-AGENT_TOOLS_GATED_ON_ENV = {"slack-notify.js": "AGENT_SLACK_NOTIFY_ENABLED"}
+AGENT_TOOLS_GATED_ON_ENV = {
+    "slack-notify.js": "AGENT_SLACK_NOTIFY_ENABLED",
+    "deploy-app.js": "AGENT_APP_DEPLOY_ENABLED",
+}
 AGENT_TOOLS_REQUIRING_REPOSITORY: set[str] = set()
 
 
@@ -529,9 +532,9 @@ class OpenCodeServer:
             },
         }
 
-        memory_file = memory_path(resolve_opencode_global_config_dir())
-        if memory_file.is_file() and memory_file.stat().st_size:
-            opencode_config["instructions"] = [str(memory_file)]
+        instructions = opencode_instruction_files(resolve_opencode_global_config_dir())
+        if instructions:
+            opencode_config["instructions"] = instructions
 
         # Inject MCP servers
         mcp_servers = self._resolve_mcp_servers()

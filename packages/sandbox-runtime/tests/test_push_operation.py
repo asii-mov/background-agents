@@ -431,3 +431,116 @@ async def test_security_pipeline_gates_push_before_git(operation, exit_code):
     else:
         assert result.error is None
         push.assert_awaited_once()
+
+
+class TestStackPolicyBeforePush:
+    """The stack stage judges the pushed commit against a real bare remote."""
+
+    @pytest.fixture
+    def setup(self, tmp_path: Path):
+        from sandbox_runtime.security_pipeline import SecurityPipelineRunner
+        from tests.stack_fixtures import git, init_repo, package_json, stage
+
+        workspace = tmp_path / "workspace"
+        repo = workspace / "web"
+        base = init_repo(repo, {"package.json": package_json(svelte="^5")})
+        remote = tmp_path / "remote.git"
+        git(tmp_path, "init", "-q", "--bare", str(remote))
+        manifest = tmp_path / "manifest.json"
+        manifest.write_text(
+            json.dumps(
+                {
+                    "repositories": [
+                        {
+                            "owner": "acme",
+                            "name": "web",
+                            "branch": "main",
+                            "path": str(repo),
+                            "baseSha": base,
+                        }
+                    ]
+                }
+            )
+        )
+        operation = PushOperation(
+            repo_path=workspace,
+            manifest_path=manifest,
+            logger=MagicMock(),
+            security_pipelines=SecurityPipelineRunner((), workspace, MagicMock(), stack=stage()),
+        )
+        spec = _push_spec(
+            targetBranch="feature",
+            refspec="HEAD:refs/heads/feature",
+            remoteUrl=str(remote),
+            redactedRemoteUrl=str(remote),
+            repoOwner="acme",
+            repoName="web",
+        )
+        return operation, spec, repo, remote
+
+    @staticmethod
+    def _remote_branch(remote: Path) -> str:
+        from tests.stack_fixtures import git
+
+        return git(remote, "for-each-ref", "--format=%(objectname)", "refs/heads/feature")
+
+    async def test_uncommitted_react_in_the_worktree_does_not_stop_the_push(self, setup):
+        from tests.stack_fixtures import commit, git, package_json, write
+
+        operation, spec, repo, remote = setup
+        commit(repo, {"src/app.ts": "export {}\n"})
+        write(repo, {"package.json": package_json(react="^18")})
+
+        result = await operation.execute(spec)
+
+        assert result.error is None
+        assert self._remote_branch(remote) == git(repo, "rev-parse", "HEAD")
+
+    async def test_committed_react_in_a_blocking_category_is_rejected_before_git_push(self, setup):
+        from tests.stack_fixtures import commit, package_json
+
+        operation, spec, repo, remote = setup
+        commit(repo, {"package.json": package_json(react="^18")})
+
+        result = await operation.execute(spec)
+
+        assert result.error is not None
+        assert result.error.startswith("Push blocked by your organization's technology standards.")
+        assert "`react` was added to `package.json`" in result.error
+        assert self._remote_branch(remote) == ""
+        operation.log.warn.assert_called_with(
+            "git.push_error",
+            reason="stack_policy_failed",
+            repo_owner="acme",
+            repo_name="web",
+            failed_checks=1,
+        )
+
+    async def test_react_that_predates_the_session_never_blocks_a_push(self, tmp_path, setup):
+        from tests.stack_fixtures import commit, git, package_json
+
+        operation, spec, repo, remote = setup
+        legacy_base = commit(repo, {"legacy/package.json": package_json(react="^17")}, "legacy")
+        manifest = json.loads(operation.manifest_path.read_text())
+        manifest["repositories"][0]["baseSha"] = legacy_base
+        operation.manifest_path.write_text(json.dumps(manifest))
+        commit(repo, {"src/fix.ts": "export {}\n"})
+
+        result = await operation.execute(spec)
+
+        assert result.error is None
+        assert self._remote_branch(remote) == git(repo, "rev-parse", "HEAD")
+
+    async def test_a_successful_push_carries_the_facts_of_the_pushed_commit(self, setup):
+        from tests.stack_fixtures import commit
+
+        operation, spec, repo, _remote = setup
+        pushed = commit(repo, {"bun.lock": "{}"})
+
+        result = await operation.execute(spec)
+
+        assert result.error is None
+        assert result.report is not None
+        (stack_result,) = result.report.stack_results
+        assert stack_result.commit_sha == pushed
+        assert Path("bun.lock") in {Path(path) for path in stack_result.facts.paths}

@@ -9,7 +9,7 @@ from typing import Any, NoReturn
 from .log_config import StructuredLogger
 from .process_output import communicate_owned_subprocess, spawn_owned_subprocess
 from .repo_config import find_repo_entry, load_repo_manifest
-from .security_pipeline import SecurityPipelineRunner
+from .security_pipeline import CheckTarget, SecurityPipelineReport, SecurityPipelineRunner
 
 GIT_PUSH_TIMEOUT_SECONDS = 300.0
 GIT_PUSH_TERMINATE_GRACE_SECONDS = 5.0
@@ -71,6 +71,11 @@ class PushRequest:
     def repo_full_name(self) -> str:
         return f"{self.repo_owner}/{self.repo_name}"
 
+    @property
+    def source_revision(self) -> str:
+        """The local side of the refspec: what this push sends."""
+        return self.refspec.split(":", 1)[0].removeprefix("+") or "HEAD"
+
     def repo_fields(self) -> dict[str, Any]:
         """Include partial identity too, so rejected requests retain their metadata."""
         fields: dict[str, Any] = {}
@@ -85,6 +90,8 @@ class PushRequest:
 class PushResult:
     request: PushRequest
     error: str | None = None
+    #: The pre-push check report, when checks ran and the push went ahead.
+    report: SecurityPipelineReport | None = None
 
 
 class PushRejected(Exception):
@@ -125,7 +132,7 @@ class PushOperation:
         )
         try:
             repo_dir = self._resolve_push_checkout(request)
-            await self._enforce_security_pipelines_before_push(request, repo_dir)
+            report = await self._enforce_security_pipelines_before_push(request, repo_dir)
             await self._run_git_push(request, repo_dir)
         except PushRejected as rejection:
             return PushResult(request, str(rejection))
@@ -139,40 +146,48 @@ class PushOperation:
             repo_owner=request.repo_owner,
             repo_name=request.repo_name,
         )
-        return PushResult(request)
+        return PushResult(request, report=report)
 
     async def _enforce_security_pipelines_before_push(
         self, request: PushRequest, repo_dir: Path
-    ) -> None:
+    ) -> SecurityPipelineReport | None:
         """Reject a push unless blocking centrally assigned checks pass.
 
         The create-pull-request tool waits for this bridge operation, so the
         agent receives the verified diagnostics in the same turn, can patch
-        the findings, and can retry. No branch or PR is created first.
+        the findings, and can retry. No branch or PR is created first. The
+        stack stage judges the pushed commit, never the worktree.
         """
-        if not self.security_pipelines or not self.security_pipelines.pipelines:
-            return
-        repo_full_name = request.repo_full_name if request.has_repo_identity else None
-        if repo_full_name is None:
-            for repository in load_repo_manifest(self.manifest_path):
-                if repository.path == repo_dir:
-                    repo_full_name = f"{repository.owner}/{repository.name}"
-                    break
+        if not self.security_pipelines or not self.security_pipelines.has_checks:
+            return None
+        member = next(
+            (entry for entry in load_repo_manifest(self.manifest_path) if entry.path == repo_dir),
+            None,
+        )
+        owner, name = (
+            (member.owner, member.name)
+            if member is not None
+            else (request.repo_owner or None, request.repo_name or None)
+        )
         report = await self.security_pipelines.run(
-            workdir=repo_dir,
-            repo_full_name=repo_full_name,
+            CheckTarget(
+                repo_dir,
+                owner,
+                name,
+                base_sha=member.base_sha if member is not None else None,
+                revision=request.source_revision,
+            )
         )
         if report.blocking_failures:
+            reason, message = report.push_rejection()
             self._reject_push(
-                reason="security_pipeline_failed",
-                message=(
-                    "Push blocked by centrally managed application-security checks.\n\n"
-                    f"{report.remediation_prompt()}"
-                ),
+                reason=reason,
+                message=message,
                 repo_owner=request.repo_owner,
                 repo_name=request.repo_name,
                 failed_checks=len(report.blocking_failures),
             )
+        return report
 
     def _reject_push(self, *, reason: str, message: str, **log_fields: Any) -> NoReturn:
         self.log.warn("git.push_error", reason=reason, **log_fields)
