@@ -17,7 +17,6 @@ from sandbox_runtime import app_deploy
 from sandbox_runtime.app_deploy import (
     APP_DEPLOY_CONTRACT,
     APP_DEPLOY_ENABLED_ENV,
-    BRIDGE_ERROR_GUIDANCE,
     DeployRequest,
     EnvSessionClient,
     ToolFailure,
@@ -486,7 +485,7 @@ async def test_a_transport_error_hides_internal_hosts(tmp_path: Path) -> None:
     assert envelope == {
         "ok": False,
         "reason": "bridge_error",
-        "agentMessage": BRIDGE_ERROR_GUIDANCE,
+        "agentMessage": APP_DEPLOY_CONTRACT["bridgeErrorGuidance"],
     }
 
 

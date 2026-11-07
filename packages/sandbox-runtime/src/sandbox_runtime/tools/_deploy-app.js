@@ -13,9 +13,6 @@ const PYTHON_STARTUP_MARGIN_MS = 15_000;
 const TIMEOUT_MS = APP_DEPLOY_CONTRACT.tool.timeoutSeconds * 1000 + PYTHON_STARTUP_MARGIN_MS;
 const MAX_OUTPUT_BYTES = 1024 * 1024;
 
-const BRIDGE_ERROR_GUIDANCE =
-  "deploy-app could not reach the publishing service. Call deploy-app once more; if it fails again, tell the user that publishing is unavailable right now.";
-
 /** OpenCode `args`; every input is an optional string. `z` is the plugin's `tool.schema`. */
 export function deployAppArgs(z) {
   return Object.fromEntries(
@@ -40,7 +37,11 @@ export function runDeployApp(args, execFile = nodeExecFile) {
           return;
         }
         resolve(
-          JSON.stringify({ ok: false, reason: "bridge_error", agentMessage: BRIDGE_ERROR_GUIDANCE })
+          JSON.stringify({
+            ok: false,
+            reason: "bridge_error",
+            agentMessage: APP_DEPLOY_CONTRACT.bridgeErrorGuidance,
+          })
         );
       }
     );

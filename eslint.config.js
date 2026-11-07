@@ -5,6 +5,14 @@ import reactHooksPlugin from "eslint-plugin-react-hooks";
 import eslintConfigPrettier from "eslint-config-prettier";
 import globals from "globals";
 
+// App hosting's internals (broker client, store, bundle parser) stay behind apps/index.
+const appsInternalImports = [
+  {
+    regex: "^(?:\\.\\.?/(?:.*/)?|@/)apps/(?!index(?:\\.[cm]?[jt]sx?)?$)",
+    message: "Import app hosting from apps/index; its modules are internal.",
+  },
+];
+
 const sandboxImplementationImports = [
   {
     regex: "(?:^|/)sandbox-repository(?:\\.[cm]?[jt]sx?)?$",
@@ -298,6 +306,7 @@ export default tseslint.config(
         {
           patterns: [
             ...sandboxImplementationImports,
+            ...appsInternalImports,
             {
               // Last-segment match: covers any relative depth (./, ../, ../../)
               // and extension-bearing specifiers. The basename is unique in
@@ -337,6 +346,7 @@ export default tseslint.config(
         {
           patterns: [
             ...sandboxImplementationImports,
+            ...appsInternalImports,
             {
               regex: "(?:^|/)components(?:\\.[cm]?[jt]sx?)?$",
               message:
@@ -360,6 +370,7 @@ export default tseslint.config(
         {
           patterns: [
             ...sandboxImplementationImports,
+            ...appsInternalImports,
             {
               regex: "(?:^|/)durable-object(?:\\.[cm]?[jt]sx?)?$",
               message:
@@ -380,6 +391,7 @@ export default tseslint.config(
         {
           patterns: [
             ...sandboxImplementationImports,
+            ...appsInternalImports,
             {
               // Last-segment match: covers any relative depth (./, ../, ../../)
               // and extension-bearing specifiers. The basename is unique in
@@ -405,7 +417,12 @@ export default tseslint.config(
   // The Cloudflare host composes the session runtime, not individual implementations.
   {
     files: ["packages/control-plane/src/cloudflare/durable-object.ts"],
-    rules: { "no-restricted-imports": ["error", { patterns: sandboxImplementationImports }] },
+    rules: {
+      "no-restricted-imports": [
+        "error",
+        { patterns: [...sandboxImplementationImports, ...appsInternalImports] },
+      ],
+    },
   },
 
   // React-specific configuration for browser packages

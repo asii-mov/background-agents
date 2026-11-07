@@ -766,7 +766,7 @@ async function enforceRouteAuthorization(
           failure = await enforceTeamRequirement(requirement, params, ctx, evidence);
           break;
         case "app":
-          failure = await enforceAppRequirement(requirement, params, ctx, evidence);
+          failure = await enforceAppRequirement(requirement, params, ctx, evidence, ctx.appOwners);
           break;
         case "session":
           failure = await enforceSessionRequirement(

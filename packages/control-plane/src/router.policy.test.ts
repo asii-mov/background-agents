@@ -39,16 +39,34 @@ describe("route policy table", () => {
   });
 
   it("publishes the complete canonical route catalog", () => {
-    expect(routes).toHaveLength(254);
+    expect(routes).toHaveLength(259);
 
     const paths = routes.map((route) => route.path);
-    expect(new Set(paths).size).toBe(193);
-    expect(new Set(routes.map((route) => `${route.method}:${route.path}`)).size).toBe(254);
+    expect(new Set(paths).size).toBe(198);
+    expect(new Set(routes.map((route) => `${route.method}:${route.path}`)).size).toBe(259);
     expect(routeFor("POST", "/sessions/session-1/sandbox-memory/search")).toMatchObject({
       authentication: { kind: "sandbox" },
       supportedScmProviders: "all",
       cacheControl: "private, no-store",
     });
+  });
+
+  it("admits app deploys by sandbox token and app management by app ownership", () => {
+    expect(routeFor("POST", "/sessions/session-1/apps")).toMatchObject({
+      authentication: { kind: "sandbox" },
+      authorization: { kind: "none" },
+    });
+    expect(routeFor("GET", "/apps")?.authorization).toMatchObject({
+      allOf: [{ kind: "permission", permission: "apps.read" }],
+    });
+    for (const action of ["takedown", "release-hold"]) {
+      expect(routeFor("POST", `/apps/notes/${action}`)?.authorization).toEqual({
+        kind: "active-user",
+        allOf: [{ kind: "app", operation: "manage", appParam: "name" }],
+        service: { kind: "deny" },
+        auditAllowed: true,
+      });
+    }
   });
 
   it("gates run analytics with analytics.read", () => {

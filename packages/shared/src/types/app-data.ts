@@ -69,6 +69,9 @@ export const DENIED_SECRET_NAME_PATTERN =
 /** `0001_create-notes.sql`; ordering is lexical, so the numeric prefix is the order. */
 export const MIGRATION_FILE_PATTERN = /^\d{4}_[a-z0-9-]+\.sql$/;
 
+/** Where a D1 declaration's migration files live when the manifest names no directory. */
+export const DEFAULT_MIGRATIONS_DIR = "migrations";
+
 export const APP_DATA_LIMITS = {
   maxBindings: 8,
   maxSecrets: 16,
@@ -128,7 +131,10 @@ export const EXTERNAL_DATA_STORE_REJECTION =
 
 export const appDataDeclarationSchema = z.discriminatedUnion("kind", [
   /** A dedicated SQLite database. Schema lives in `<migrations>/*.sql`, applied by the platform. */
-  z.strictObject({ kind: z.literal("d1"), migrations: relativeDirSchema.default("migrations") }),
+  z.strictObject({
+    kind: z.literal("d1"),
+    migrations: relativeDirSchema.default(DEFAULT_MIGRATIONS_DIR),
+  }),
   /** A dedicated key-value namespace, for caches and small ephemeral state rather than records. */
   z.strictObject({ kind: z.literal("kv") }),
   /** A dedicated private bucket for files. Never public; served only through the app. */

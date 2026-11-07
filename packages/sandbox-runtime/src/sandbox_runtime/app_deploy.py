@@ -37,15 +37,6 @@ APP_DEPLOY_CONTRACT: Final[Mapping[str, Any]] = json.loads(
 
 APP_DEPLOY_ENABLED_ENV: Final = "AGENT_APP_DEPLOY_ENABLED"
 
-# Mirrors the `migrations` default of the d1 declaration in @open-inspect/shared
-# app-data.ts, which the generated contracts do not export.
-DEFAULT_MIGRATIONS_DIR: Final = "migrations"
-
-BRIDGE_ERROR_GUIDANCE: Final = (
-    "deploy-app could not reach the publishing service. Call deploy-app once more; if it "
-    "fails again, tell the user that publishing is unavailable right now."
-)
-
 _DEPLOY_ARG_KEYS: Final = ("projectDir", "name", "assetsDir", "workerFile")
 _WELL_KNOWN_DIR: Final = ".well-known"
 
@@ -213,7 +204,9 @@ def _read_app_manifest(
     return parsed
 
 
-def _d1_migration_dirs(app_manifest: dict[str, Any] | None) -> list[tuple[str, str]]:
+def _d1_migration_dirs(
+    app_manifest: dict[str, Any] | None, contract: Mapping[str, Any]
+) -> list[tuple[str, str]]:
     """``(binding, migrations dir)`` for each D1 declaration, by binding name.
 
     Malformed declarations are left for the control plane to reject with its message.
@@ -225,7 +218,7 @@ def _d1_migration_dirs(app_manifest: dict[str, Any] | None) -> list[tuple[str, s
     for binding, declaration in sorted(data.items()):
         if not isinstance(declaration, dict) or declaration.get("kind") != "d1":
             continue
-        directory = declaration.get("migrations", DEFAULT_MIGRATIONS_DIR)
+        directory = declaration.get("migrations", contract["defaultMigrationsDir"])
         if isinstance(directory, str):
             dirs.append((binding, directory))
     return dirs
@@ -274,7 +267,7 @@ def pack_bundle(
     migration_pattern = re.compile(contract["migrationFilePattern"])
     project_root_resolved = request.project_dir.resolve()
     migrations: list[dict[str, str]] = []
-    for binding, directory in _d1_migration_dirs(app_manifest):
+    for binding, directory in _d1_migration_dirs(app_manifest, contract):
         migrations_dir = request.project_dir / directory
         if not migrations_dir.resolve().is_relative_to(project_root_resolved):
             return ToolFailure(
@@ -387,7 +380,7 @@ def failure_envelope(
     retry_after_seconds: Any = None,
     detail: Any = None,
 ) -> dict[str, Any]:
-    guidance = contract["reasons"].get(failure.reason, BRIDGE_ERROR_GUIDANCE)
+    guidance = contract["reasons"].get(failure.reason, contract["bridgeErrorGuidance"])
     envelope: dict[str, Any] = {
         "ok": False,
         "reason": failure.reason,

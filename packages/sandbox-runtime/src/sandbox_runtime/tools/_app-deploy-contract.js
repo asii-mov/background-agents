@@ -30,6 +30,7 @@ export const APP_DEPLOY_CONTRACT = {
     }
   },
   "appManifestFile": "openinspect.app.json",
+  "defaultMigrationsDir": "migrations",
   "migrationFilePattern": "^\\d{4}_[a-z0-9-]+\\.sql$",
   "parts": {
     "manifest": "manifest",
@@ -73,6 +74,7 @@ export const APP_DEPLOY_CONTRACT = {
     "migration_failed": "D1 rejected the migration. Read the message, fix the SQL in that file (it was never applied), and deploy again.",
     "data_unavailable": "Data provisioning did not complete. Wait briefly and deploy again; every step is safe to repeat."
   },
+  "bridgeErrorGuidance": "deploy-app could not reach the publishing service. Call deploy-app once more; if it fails again, tell the user that publishing is unavailable right now.",
   "statusFallback": {
     "400": "invalid_bundle",
     "403": "permission_denied",
