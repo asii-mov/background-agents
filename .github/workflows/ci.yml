@@ -14,6 +14,7 @@ on:
       - "knip.json"
       - "package-lock.json"
       - "package.json"
+      - "packages/app-broker/**"
       - "packages/control-plane/**"
       - "packages/github-bot/**"
       - "packages/linear-bot/**"
@@ -54,6 +55,7 @@ on:
       - "knip.json"
       - "package-lock.json"
       - "package.json"
+      - "packages/app-broker/**"
       - "packages/control-plane/**"
       - "packages/github-bot/**"
       - "packages/linear-bot/**"
@@ -400,3 +402,9 @@ jobs:
 
       - name: Run linear-bot tests
         run: npm test -w @open-inspect/linear-bot
+
+      - name: Run app-broker tests
+        run: npm test -w @open-inspect/app-broker
+
+      - name: Build app-broker
+        run: npm run build -w @open-inspect/app-broker

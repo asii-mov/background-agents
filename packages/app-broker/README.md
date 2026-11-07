@@ -4,9 +4,41 @@ The app broker is the Worker that deploys internal apps into the dedicated apps 
 It is the only holder of the apps-account API token. The control plane calls it over a signed,
 Access-protected interface; nothing else talks to `api.cloudflare.com` for apps.
 
-This package currently holds the broker's test assets. The Worker, the platform guard and the
-dispatcher land under `src/`, `guard/` and `dispatcher/`, and `npm run build` needs their
-`build.mjs`.
+The package holds three Workers:
+
+- `src/` is the broker. It serves `POST /deploy`, `POST /takedown`, `POST /data` and `GET /health`
+  as `@open-inspect/shared/app-broker` defines them. Every request must carry a sig1 signature from
+  `control-plane`.
+- `guard/` is the platform guard, the main module of every app script. It answers 404 on any host
+  but the app's own, verifies the visitor's Access token against the app's own AUD, and sets
+  `x-openinspect-user-sub` and `x-openinspect-user-email` before the app's code runs.
+- `dispatcher/` is the Workers for Platforms dispatcher. It maps `<name>.<apps domain>` to the app's
+  namespace script with the broker's own name rule.
+
+`npm run build` writes `dist/index.js` (the broker, with the guard inlined), `dist/guard.mjs`,
+`dist/guard-core.mjs` and `dist/dispatcher.js`. Build `@open-inspect/shared` first.
+
+## What the broker guarantees
+
+Every script, hostname and Access app it touches derives from the app name: the script is
+`<APPS_SCRIPT_PREFIX><name>` and the hostname is `<name>.<APPS_DOMAIN>`. No request field can name
+either. Data ops act only on resources whose Cloudflare name starts with `app-`, checked again on
+the name Cloudflare reports for an id.
+
+A deploy runs in this order, and every step is safe to repeat:
+
+1. Bound D1 databases and KV namespaces resolve to `app-` resources.
+2. The Terraform `*.<domain>` floor Access app exists with exactly the visitor policy.
+3. The per-app Access app exists with exactly that policy. Duplicates are removed and drift is
+   repaired.
+4. The script is uploaded with the guard as its main module and the per-app AUD as `CF_ACCESS_AUD`.
+   A plain Worker is created with workers.dev and previews off, and the setting is read back after
+   the deployment. If it reads on, the script is removed and nothing is published.
+5. The Access app is checked again, then the hostname is attached. This is the first moment the app
+   resolves.
+
+Takedown reverses it: detach the hostname, remove the script, then detach again and delete the
+per-app Access app. The floor is never touched.
 
 ## Fake Cloudflare
 
