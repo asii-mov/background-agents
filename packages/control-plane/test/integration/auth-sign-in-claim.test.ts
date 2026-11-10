@@ -224,21 +224,24 @@ describe("email claim (bot-first users with an attributed email)", () => {
     expect(await countTableRows("users")).toBe(1);
   });
 
-  it("signs a Slack-first user into their bot-created row once OAuth proves the allowed-domain email", async () => {
-    const slack = await new UserStore(env.DB).resolveOrCreateUser(
-      { provider: "slack", providerUserId: "U0SLACKFIRST", providerEmail: "octocat@example.com" },
-      parseEmailLinkPolicy("example.com")
-    );
-    expect(await getUserRow(slack.id)).toMatchObject({
-      email: "octocat@example.com",
-      email_verified: 0,
-    });
+  it("joins a Slack-first user's Slack identity to the account their OAuth sign-in owns", async () => {
+    const users = new UserStore(env.DB);
+    const links = parseEmailLinkPolicy("example.com");
+    const slackActor = {
+      provider: "slack",
+      providerUserId: "U0SLACKFIRST",
+      providerEmail: "octocat@example.com",
+    } as const;
+    await users.resolveOrCreateUser(slackActor, links);
 
     const { sessionUser } = await signIn("github");
+    const slack = await users.resolveOrCreateUser(slackActor, links);
 
-    expect(sessionUser?.id).toBe(slack.id);
-    expect(await getUserRow(slack.id)).toMatchObject({ email_verified: 1 });
-    expect(await countTableRows("users")).toBe(1);
+    expect(sessionUser).not.toBeNull();
+    expect(slack).toMatchObject({ id: sessionUser?.id, linkedByEmailDomain: "example.com" });
+    expect(await getIdentityRow("github", GITHUB_SUBJECT)).toMatchObject({
+      user_id: sessionUser?.id,
+    });
   });
 
   it("never signs a colleague into the row of a Slack actor that reported their email first", async () => {
