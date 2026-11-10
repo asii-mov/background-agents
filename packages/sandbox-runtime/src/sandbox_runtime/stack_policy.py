@@ -22,6 +22,7 @@ from .stack_facts import (
     MAX_LISTED_PATHS,
     STACK_CONTRACT,
     CommitSource,
+    DeclaredDependency,
     DependencyScope,
     DirectorySource,
     TreeFacts,
@@ -324,6 +325,7 @@ class Baseline:
     keys: frozenset[HitKey]
     project_dirs: frozenset[PurePosixPath]
     unreadable: frozenset[PurePosixPath]
+    unidentified: frozenset[DeclaredDependency]
     truncated: bool
     submodules: frozenset[PurePosixPath]
 
@@ -333,6 +335,7 @@ class Baseline:
             frozenset(hit.key for hit in policy.hits(facts, repo_full_name)),
             facts.project_dirs,
             frozenset(facts.unreadable),
+            frozenset(dependency for dependency in facts.declared if not dependency.identified),
             facts.truncated,
             frozenset(facts.submodules),
         )
@@ -343,13 +346,16 @@ class Baseline:
             self.keys & other.keys,
             self.project_dirs & other.project_dirs,
             self.unreadable & other.unreadable,
+            self.unidentified & other.unidentified,
             self.truncated and other.truncated,
             self.submodules & other.submodules,
         )
 
 
 #: Nothing pre-existed: a scratch workspace, unrelated history, or a baseline that cannot be read.
-EMPTY_BASELINE: Final = Baseline(frozenset(), frozenset(), frozenset(), False, frozenset())
+EMPTY_BASELINE: Final = Baseline(
+    frozenset(), frozenset(), frozenset(), frozenset(), False, frozenset()
+)
 
 
 def _project_dir(
@@ -412,7 +418,8 @@ class StackConformanceResult:
     findings: tuple[StackFinding, ...]
     facts: TreeFacts
     any_blocking_rule: bool
-    #: Incompleteness the baseline did not already have: a new unreadable manifest, a failed scan.
+    #: Incompleteness the baseline did not already have: a new unreadable manifest, a new
+    #: dependency from a URL, git or tarball source, a failed scan.
     new_gaps: tuple[str, ...]
 
     def _with_severity(self, *severities: Severity) -> list[StackFinding]:
@@ -459,8 +466,9 @@ class StackConformanceResult:
             paragraphs.append(
                 "These could not be checked against the standards: "
                 + "; ".join(self.new_gaps)
-                + ". Make each manifest valid (JSON or TOML) and within size limits, and replace"
-                " each submodule with the files this change needs."
+                + ". Make each manifest valid (JSON or TOML) and within size limits, depend on"
+                " each package by its registry name and version, and replace each submodule"
+                " with the files this change needs."
             )
         return "\n\n".join(paragraphs)
 
@@ -519,6 +527,12 @@ def evaluate(
         f"`{path}` is a git submodule, whose files cannot be checked"
         for path in current.submodules
         if path not in baseline.submodules
+    )
+    gaps.extend(
+        f"`{dependency.manifest_path}` installs `{dependency.name}` from a URL, git or tarball "
+        "source, so its package could not be identified"
+        for dependency in current.declared
+        if not dependency.identified and dependency not in baseline.unidentified
     )
     if current.truncated and not baseline.truncated:
         gaps.append(f"the tree lists more than {MAX_LISTED_PATHS} files")

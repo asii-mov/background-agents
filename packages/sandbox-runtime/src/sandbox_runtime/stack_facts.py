@@ -63,6 +63,8 @@ class DeclaredDependency:
     manifest_path: PurePosixPath
     scope: DependencyScope
     declared_range: str | None
+    #: False when the spec (a URL, git or tarball source) hides which package ``name`` installs.
+    identified: bool = True
 
 
 @dataclass(frozen=True)
@@ -189,6 +191,13 @@ def _string_list(value: Any, context: str) -> list[str]:
     return value
 
 
+_NPM_REGISTRY_TARBALL: Final = re.compile(
+    r"^https?://registry\.npmjs\.org/((?:@[^/@]+/)?([^/@]+))/-/\2-\d[^/]*\.tgz$"
+)
+_TARBALL_SUFFIXES: Final = (".tgz", ".tar.gz", ".tar")
+_LOCAL_SPEC_PREFIXES: Final = ("workspace:", "file:", "link:", "portal:", ".", "/", "~")
+
+
 class NpmEcosystem:
     """``package.json`` dependency fields in every directory (workspaces included). Resolved
     versions from ``package-lock.json`` / ``npm-shrinkwrap.json`` (v2/v3) and ``bun.lock``.
@@ -236,13 +245,15 @@ class NpmEcosystem:
                 continue
             for name, spec in _mapping(entries, field_name).items():
                 declared = spec if isinstance(spec, str) else None
+                installed, identified = self._installed_name(name, declared)
                 dependencies.append(
                     DeclaredDependency(
                         self.id,
-                        self.normalize(self._installed_name(name, declared)),
+                        self.normalize(installed),
                         path,
                         scope,
                         declared,
+                        identified,
                     )
                 )
         return ManifestContents(tuple(dependencies))
@@ -273,13 +284,22 @@ class NpmEcosystem:
         return ManifestContents(tuple(dependencies))
 
     @staticmethod
-    def _installed_name(name: str, spec: str | None) -> str:
-        """``"ui": "npm:react@18"`` installs react under another name; match what is installed."""
-        if spec is None or not spec.startswith("npm:"):
-            return name
-        target = spec[len("npm:") :]
-        version_at = target.find("@", 1)
-        return target[:version_at] if version_at > 0 else target
+    def _installed_name(name: str, spec: str | None) -> tuple[str, bool]:
+        """The package ``spec`` installs under ``name``, and whether the spec identifies it.
+        ``"ui": "npm:react@18"`` installs react. A URL, git or tarball spec installs an unknown
+        package. A local directory is in the tree, scanned like a workspace."""
+        if spec is None:
+            return name, True
+        if spec.startswith("npm:"):
+            target = spec[len("npm:") :]
+            version_at = target.find("@", 1)
+            return (target[:version_at] if version_at > 0 else target), True
+        registry_tarball = _NPM_REGISTRY_TARBALL.match(spec)
+        if registry_tarball:
+            return registry_tarball.group(1), True
+        if spec.lower().endswith(_TARBALL_SUFFIXES):
+            return name, False
+        return name, spec.startswith(_LOCAL_SPEC_PREFIXES) or not any(c in spec for c in ":/")
 
     def parse_lockfile(self, path: PurePosixPath, content: bytes) -> list[tuple[str, str]]:
         if path.name == "bun.lock":
