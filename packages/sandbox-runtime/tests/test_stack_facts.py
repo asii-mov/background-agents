@@ -17,7 +17,7 @@ from sandbox_runtime.stack_facts import (
     derived_paths,
 )
 from sandbox_runtime.stack_policy import Signal
-from tests.stack_fixtures import commit, git, init_repo, package_json, write
+from tests.stack_fixtures import add_submodule, commit, git, init_repo, package_json, write
 
 GOLDEN = STACK_CONTRACT["golden"]
 
@@ -418,3 +418,21 @@ async def test_commit_source_lists_only_blobs_of_that_revision(tmp_path):
     commit(tmp_path, {"b/package.json": package_json()})
 
     assert await CommitSource(tmp_path, first).list_paths() == [PurePosixPath("a/package.json")]
+
+
+async def test_submodules_and_nested_repositories_make_the_facts_incomplete(tmp_path):
+    repo = tmp_path / "repo"
+    init_repo(repo)
+    add_submodule(repo, "vendor/ui")
+    head = commit(repo, {}, "add submodule")
+    init_repo(repo / "cloned")
+
+    committed = await collect_tree_facts(CommitSource(repo, head))
+    worktree = await collect_tree_facts(WorktreeSource(repo))
+
+    assert committed.submodules == (PurePosixPath("vendor/ui"),)
+    assert worktree.submodules == (PurePosixPath("cloned"), PurePosixPath("vendor/ui"))
+    assert not committed.complete
+    assert not worktree.complete
+    assert declared(committed) == declared(worktree) == set()
+    assert PurePosixPath("vendor/ui") not in committed.paths + worktree.paths

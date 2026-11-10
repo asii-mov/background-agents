@@ -25,6 +25,7 @@ from sandbox_runtime.stack_policy import (
     parse_stack_policy,
 )
 from tests.stack_fixtures import (
+    add_submodule,
     commit,
     file,
     git,
@@ -311,6 +312,38 @@ async def test_an_unreadable_manifest_that_predates_the_session_never_blocks(tmp
     base = init_repo(tmp_path, {"templates/package.json": "{{ name }}"})
 
     result = await judge(stage(), tmp_path, base, mode, {"README.md": "edited\n"})
+
+    assert result.passed
+    assert not result.blocking
+
+
+@pytest.mark.parametrize("mode", MODES)
+async def test_a_new_submodule_blocks_only_when_a_blocking_rule_applies(tmp_path, mode):
+    repo = tmp_path / "repo"
+    base = init_repo(repo, {"package.json": package_json(svelte="^5")})
+    add_submodule(repo, "ui")
+
+    blocked = await judge(stage(), repo, base, mode, {})
+    advised = await stage(seed_rules(frontend_blocks=False)).check(
+        CheckTarget(
+            repo, "acme", "web", base_sha=base, revision="HEAD" if mode == "pre_push" else None
+        )
+    )
+
+    assert blocked.blocking
+    assert "`ui` is a git submodule" in blocked.remediation_section()
+    assert advised.passed
+    assert not advised.blocking
+
+
+@pytest.mark.parametrize("mode", MODES)
+async def test_a_submodule_that_predates_the_session_never_blocks(tmp_path, mode):
+    repo = tmp_path / "repo"
+    init_repo(repo)
+    add_submodule(repo, "vendor/ui")
+    base = commit(repo, {}, "add submodule")
+
+    result = await judge(stage(), repo, base, mode, {"README.md": "edited\n"})
 
     assert result.passed
     assert not result.blocking
