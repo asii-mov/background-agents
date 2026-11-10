@@ -71,4 +71,18 @@ describe("the live smoke's API steps against the fake", () => {
     expect(fake.d1("app-oi-smoke-run1")).toBeNull();
     expect(fake.violations).toEqual([]);
   });
+
+  it.each([
+    [204, true],
+    [404, false],
+  ])("reads an empty HTTP %i body as success %s", async (status, success) => {
+    const api = createCloudflareClient({
+      baseUrl: FAKE_CLOUDFLARE_API_BASE_URL,
+      accountId: OPTIONS.accountId,
+      token: OPTIONS.apiToken,
+      fetch: async () => new Response(null, { status }),
+    });
+
+    expect(await api.request("DELETE", "/workers/domains/d1")).toMatchObject({ status, success });
+  });
 });

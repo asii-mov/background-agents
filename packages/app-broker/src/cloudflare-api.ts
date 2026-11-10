@@ -203,10 +203,13 @@ function parseRetryAfter(header: string | null): number | null {
   return Number(header.trim());
 }
 
+/** Some deletes succeed with an empty body (204, or 200 per the docs) instead of an envelope. */
 async function readEnvelope(response: Response): Promise<Envelope> {
+  const text = await response.text();
+  if (response.ok && text === "") return { success: true, errors: [], result: null };
   let raw: unknown = null;
   try {
-    raw = await response.json();
+    raw = JSON.parse(text);
   } catch {
     raw = null;
   }

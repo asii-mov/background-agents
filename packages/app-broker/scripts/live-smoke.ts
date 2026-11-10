@@ -116,16 +116,19 @@ export function createCloudflareClient(input: {
         headers["content-type"] = "application/json";
       }
       const response = await fetchImpl(url, { method, headers, body });
+      const text = await response.text();
+      // Some deletes succeed with an empty body (204) instead of an envelope.
+      const noContent = response.ok && text === "";
       let parsed: unknown = null;
       try {
-        parsed = await response.json();
+        parsed = JSON.parse(text);
       } catch {
         parsed = null;
       }
       const envelope = isRecord(parsed) ? parsed : {};
       return {
         status: response.status,
-        success: envelope.success === true,
+        success: noContent || envelope.success === true,
         result: envelope.result,
         errors: Array.isArray(envelope.errors) ? envelope.errors : [],
         headers: response.headers,
