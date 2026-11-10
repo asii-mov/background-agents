@@ -395,9 +395,11 @@ def failure_envelope(
 
 def _success_envelope(body: Mapping[str, Any]) -> dict[str, Any]:
     note = (
-        " A new address can take a minute or two to start working."
+        " This is a new address: it takes about 3 minutes to start working while its certificate"
+        " is issued. Tell the user to wait about 3 minutes before opening the link, and not to"
+        " keep retrying it in the first few seconds."
         if body.get("firstDeploy")
-        else ""
+        else " The app already had this address, so the update is live now."
     )
     return {
         **body,

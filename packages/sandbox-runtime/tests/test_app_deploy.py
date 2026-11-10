@@ -369,7 +369,7 @@ async def test_deploy_posts_the_bundle_and_returns_the_url(tmp_path: Path) -> No
     assert envelope["ok"] is True
     assert envelope["url"] == "https://notes.apps.example"
     assert "https://notes.apps.example" in envelope["agentMessage"]
-    assert "minute" in envelope["agentMessage"]
+    assert "about 3 minutes" in envelope["agentMessage"]
     request = seen[0]
     assert request.method == "POST"
     assert str(request.url) == "https://cp.example/sessions/s%2F1/apps"
@@ -405,6 +405,22 @@ async def test_every_server_reason_maps_to_its_guidance(tmp_path: Path, reason: 
         "reason": reason,
         "agentMessage": f"{REASONS[reason]} (server says why)",
     }
+
+
+async def test_a_redeploy_is_live_now(tmp_path: Path) -> None:
+    session = _FakeSession(
+        lambda: httpx.Response(
+            200, json={"ok": True, "url": "https://notes.apps.example", "firstDeploy": False}
+        )
+    )
+
+    envelope = await deploy_app(
+        session, {"name": "notes", "assetsDir": "dist"}, root=_static_site(tmp_path)
+    )
+
+    assert envelope["ok"] is True
+    assert "live now" in envelope["agentMessage"]
+    assert "minutes" not in envelope["agentMessage"]
 
 
 @pytest.mark.parametrize(
