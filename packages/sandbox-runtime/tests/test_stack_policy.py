@@ -307,6 +307,24 @@ async def test_a_new_unreadable_manifest_blocks_only_when_a_blocking_rule_applie
 
 
 @pytest.mark.parametrize("mode", MODES)
+async def test_a_dependency_installed_from_git_tells_the_agent_to_use_the_registry(tmp_path, mode):
+    base = init_repo(tmp_path, {"web/package.json": package_json(svelte="^5")})
+
+    result = await judge(
+        stage(),
+        tmp_path,
+        base,
+        mode,
+        {"web/package.json": package_json(ui="github:facebook/react")},
+    )
+
+    assert result.blocking
+    remediation = result.remediation_section()
+    assert "`web/package.json` installs `ui` from a URL, git or tarball source" in remediation
+    assert "registry name" in remediation
+
+
+@pytest.mark.parametrize("mode", MODES)
 async def test_an_unreadable_manifest_that_predates_the_session_never_blocks(tmp_path, mode):
     base = init_repo(tmp_path, {"templates/package.json": "{{ name }}"})
 

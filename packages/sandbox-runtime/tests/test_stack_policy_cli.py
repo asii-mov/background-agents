@@ -245,6 +245,104 @@ GOLDEN = [
     ),
 ]
 
+UNIDENTIFIED_GAP = (
+    "Could not check the stack policy: `web/package.json` installs `ui` from a URL, git or "
+    "tarball source"
+)
+UNIDENTIFIED_SPECS = [
+    "https://registry.npmjs.org/react/-/react-dom-18.3.1.tgz",
+    "https://cdn.example.test/react-18.3.1.tgz",
+    "http://cdn.example.test/react.tgz",
+    "git+https://github.com/facebook/react.git",
+    "git+ssh://git@github.com/facebook/react.git",
+    "git://github.com/facebook/react.git",
+    "git@github.com:facebook/react.git",
+    "github:facebook/react#v18.3.1",
+    "gitlab:acme/react",
+    "bitbucket:acme/react",
+    "facebook/react",
+    "file:vendor/react-18.3.1.tgz",
+    "./vendor/react-18.3.1.tgz",
+    "react-18.3.1.TGZ",
+    "vendor/react-18.3.1.tar.gz",
+]
+GOLDEN += [
+    *(
+        Golden(
+            f"unidentified-spec-blocks-under-a-blocking-rule: {spec}",
+            introduce({"web/package.json": SVELTE}, {"web/package.json": package_json(ui=spec)}),
+            {},
+            1,
+            line=f"error: {UNIDENTIFIED_GAP}",
+        )
+        for spec in UNIDENTIFIED_SPECS
+    ),
+    Golden(
+        "unidentified-spec-warns-without-a-blocking-rule",
+        introduce(
+            {"web/package.json": SVELTE},
+            {"web/package.json": package_json(ui="github:facebook/react")},
+        ),
+        {},
+        0,
+        rules=seed_rules(frontend_blocks=False),
+        line=f"warning: {UNIDENTIFIED_GAP}",
+    ),
+    Golden(
+        "unidentified-spec-at-base-passes",
+        introduce(
+            {"web/package.json": package_json(ui="github:acme/ui")}, {"README.md": "edited\n"}
+        ),
+        {},
+        0,
+    ),
+    Golden(
+        "unidentified-spec-at-base-does-not-license-another",
+        introduce(
+            {"web/package.json": package_json(ui="github:acme/ui")},
+            {"web/package.json": package_json(ui="github:facebook/react")},
+        ),
+        {},
+        1,
+        line=f"error: {UNIDENTIFIED_GAP}",
+    ),
+    *(
+        Golden(
+            f"registry-tarball-url-names-the-package: {spec}",
+            introduce({"web/package.json": SVELTE}, {"web/package.json": package_json(ui=spec)}),
+            {("React", "web/package.json"): "violation"},
+            1,
+            line="error: web/package.json: React is not allowed for Web frontend.",
+        )
+        for spec in (
+            "https://registry.npmjs.org/react/-/react-18.3.1.tgz",
+            "https://registry.npmjs.org/react-dom/-/react-dom-18.3.1.tgz",
+        )
+    ),
+    Golden(
+        "file-directory-dependency-is-scanned-like-a-workspace",
+        introduce(
+            {"web/package.json": SVELTE},
+            {
+                "web/package.json": package_json(ui="file:packages/ui"),
+                "web/packages/ui/package.json": REACT,
+            },
+        ),
+        {("React", "web/packages/ui/package.json"): "violation"},
+        1,
+        line="error: web/packages/ui/package.json: React",
+    ),
+    *(
+        Golden(
+            f"registry-and-local-specs-are-identified: {spec}",
+            introduce({"web/package.json": SVELTE}, {"web/package.json": package_json(ui=spec)}),
+            {},
+            0,
+        )
+        for spec in ("^1.2.0 || >=2", "latest", "workspace:*", "link:../ui", "file:../ui")
+    ),
+]
+
 
 @pytest.mark.parametrize("case", GOLDEN, ids=lambda case: case.id)
 async def test_the_ci_verdict_matches_the_sandbox_push_gate(tmp_path, case):
