@@ -18,6 +18,7 @@ from sandbox_runtime.security_pipeline import CheckTarget
 from sandbox_runtime.stack_policy_cli import load_policy_export
 from tests.stack_fixtures import (
     GIT_ENVIRONMENT,
+    add_submodule,
     commit,
     git,
     init_repo,
@@ -131,6 +132,21 @@ def fork_before_base_gained_react(repo: Path) -> tuple[str, str]:
     return base, commit(repo, {"web/package.json": REACT}, "pull request change")
 
 
+def add_a_submodule(repo: Path) -> tuple[str, str]:
+    base = init_repo(repo, {"package.json": SVELTE})
+    git(repo, "checkout", "-q", "-b", "feature")
+    add_submodule(repo, "ui")
+    return base, commit(repo, {}, "pull request change")
+
+
+def edit_beside_a_submodule(repo: Path) -> tuple[str, str]:
+    init_repo(repo, {"package.json": SVELTE})
+    add_submodule(repo, "ui")
+    base = commit(repo, {}, "add submodule")
+    git(repo, "checkout", "-q", "-b", "feature")
+    return base, commit(repo, {"README.md": "edited\n"}, "pull request change")
+
+
 def unrelated_history(repo: Path) -> tuple[str, str]:
     base = init_repo(repo, {"web/package.json": REACT})
     git(repo, "checkout", "-q", "--orphan", "rewrite")
@@ -220,6 +236,19 @@ GOLDEN = [
         "unreadable-manifest-at-base-passes",
         introduce({"templates/package.json": "{{ name }}"}, {"README.md": "edited\n"}),
         {},
+        0,
+    ),
+    Golden(
+        "new-submodule-blocks-under-a-blocking-rule",
+        add_a_submodule,
+        {("Svelte", "package.json"): "standard"},
+        1,
+        line="error: Could not check the stack policy: `ui` is a git submodule",
+    ),
+    Golden(
+        "submodule-at-base-passes",
+        edit_beside_a_submodule,
+        {("Svelte", "package.json"): "standard"},
         0,
     ),
     Golden(

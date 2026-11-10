@@ -60,6 +60,14 @@ def init_repo(repo: Path, files: dict[str, str | None] | None = None) -> str:
     return commit(repo, files or {"README.md": "fixture\n"}, "initial")
 
 
+def add_submodule(repo: Path, path: str) -> None:
+    """Stage a submodule at ``path`` whose own repository declares React. Its upstream lives
+    beside ``repo``, so ``repo.parent`` must belong to the test."""
+    upstream = repo.parent / f"{path.replace('/', '-')}-upstream"
+    init_repo(upstream, {"package.json": package_json(react="^18.3.0")})
+    git(repo, "-c", "protocol.file.allow=always", "submodule", "add", "-q", str(upstream), path)
+
+
 def package_json(**dependencies: str) -> str:
     return json.dumps({"name": "app", "dependencies": dependencies})
 
