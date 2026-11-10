@@ -98,10 +98,12 @@ class TreeFacts:
     project_dirs: frozenset[PurePosixPath]
     unreadable: tuple[PurePosixPath, ...] = ()
     truncated: bool = False
+    #: Gitlinks and nested repositories: their files belong to another repository, never read.
+    submodules: tuple[PurePosixPath, ...] = ()
 
     @property
     def complete(self) -> bool:
-        return not self.unreadable and not self.truncated
+        return not self.unreadable and not self.truncated and not self.submodules
 
 
 EMPTY_TREE_FACTS: Final = TreeFacts((), frozenset(), {}, (), (), (), frozenset())
@@ -443,6 +445,11 @@ def _in_excluded_directory(path: PurePosixPath) -> bool:
 class TreeSource(Protocol):
     async def list_paths(self) -> list[PurePosixPath]: ...
 
+    @property
+    def submodules(self) -> Sequence[PurePosixPath]:
+        """The submodules the last ``list_paths`` met, which it left out of its paths."""
+        ...
+
     async def read_files(
         self, paths: Sequence[PurePosixPath], max_bytes: int
     ) -> dict[PurePosixPath, bytes | None]:
@@ -534,17 +541,28 @@ async def _read_worktree_files(
 
 @dataclass(frozen=True)
 class WorktreeSource:
-    """Per-turn subject: ``git ls-files --cached --others --exclude-standard``, minus deleted
-    files. A force-added file under an ignored path is listed; ignored node_modules is not."""
+    """Per-turn subject: ``git ls-files --stage`` and ``--others --exclude-standard``, minus
+    deleted files. A force-added file under an ignored path is listed; ignored node_modules is not.
+    A staged gitlink or an untracked nested repository (listed as ``dir/``) is a submodule."""
 
     checkout: Path
+    submodules: list[PurePosixPath] = field(default_factory=list, init=False, repr=False)
 
     async def list_paths(self) -> list[PurePosixPath]:
-        _, listed = await run_git(
-            self.checkout, "ls-files", "-z", "--cached", "--others", "--exclude-standard"
-        )
+        _, staged = await run_git(self.checkout, "ls-files", "-z", "--stage")
+        _, others = await run_git(self.checkout, "ls-files", "-z", "--others", "--exclude-standard")
         _, deleted = await run_git(self.checkout, "ls-files", "-z", "--deleted")
-        return sorted(set(_decode_paths(listed)) - set(_decode_paths(deleted)))
+        listed: set[PurePosixPath] = set()
+        submodules: set[PurePosixPath] = set()
+        for record in staged.split(b"\0"):
+            header, _, raw_path = record.partition(b"\t")
+            if raw_path:
+                gitlink = header.startswith(b"160000 ")
+                (submodules if gitlink else listed).update(_decode_paths(raw_path))
+        for raw_path in others.split(b"\0"):
+            (submodules if raw_path.endswith(b"/") else listed).update(_decode_paths(raw_path))
+        self.submodules[:] = sorted(submodules)
+        return sorted(listed - set(_decode_paths(deleted)))
 
     async def read_files(
         self, paths: Sequence[PurePosixPath], max_bytes: int
@@ -558,6 +576,7 @@ class DirectorySource:
     prunes dependency, build and hidden directories (runtime tooling such as ``.opencode``)."""
 
     root: Path
+    submodules: tuple[PurePosixPath, ...] = field(default=(), init=False, repr=False)
 
     async def list_paths(self) -> list[PurePosixPath]:
         return await asyncio.to_thread(self._walk)
@@ -597,20 +616,24 @@ class CommitSource:
     checkout: Path
     revision: str
     _entries: dict[PurePosixPath, _TreeEntry] = field(default_factory=dict, repr=False)
+    submodules: list[PurePosixPath] = field(default_factory=list, init=False, repr=False)
 
     async def list_paths(self) -> list[PurePosixPath]:
         _, raw = await run_git(
             self.checkout, "ls-tree", "-r", "-z", "-l", "--full-tree", self.revision
         )
         self._entries.clear()
+        self.submodules.clear()
         for record in raw.split(b"\0"):
             if not record:
                 continue
             header, _, raw_path = record.partition(b"\t")
             mode, kind, oid, size = header.split()
+            path = PurePosixPath(raw_path.decode("utf-8", errors="surrogateescape"))
+            if kind == b"commit":
+                self.submodules.append(path)
             if kind != b"blob":
                 continue
-            path = PurePosixPath(raw_path.decode("utf-8", errors="surrogateescape"))
             self._entries[path] = _TreeEntry(
                 oid.decode(), int(size), readable=mode in (b"100644", b"100755")
             )
@@ -765,4 +788,5 @@ async def collect_tree_facts(
         project_dirs=frozenset(path.parent for path in candidates if is_toolchain_file(path)),
         unreadable=tuple(sorted(unreadable)),
         truncated=truncated,
+        submodules=tuple(sorted(source.submodules)),
     )

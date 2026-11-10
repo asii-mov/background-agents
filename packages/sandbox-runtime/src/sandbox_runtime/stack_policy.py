@@ -325,6 +325,7 @@ class Baseline:
     project_dirs: frozenset[PurePosixPath]
     unreadable: frozenset[PurePosixPath]
     truncated: bool
+    submodules: frozenset[PurePosixPath]
 
     @classmethod
     def of(cls, policy: StackPolicy, repo_full_name: str | None, facts: TreeFacts) -> Baseline:
@@ -333,6 +334,7 @@ class Baseline:
             facts.project_dirs,
             frozenset(facts.unreadable),
             facts.truncated,
+            frozenset(facts.submodules),
         )
 
     def __and__(self, other: Baseline) -> Baseline:
@@ -342,11 +344,12 @@ class Baseline:
             self.project_dirs & other.project_dirs,
             self.unreadable & other.unreadable,
             self.truncated and other.truncated,
+            self.submodules & other.submodules,
         )
 
 
 #: Nothing pre-existed: a scratch workspace, unrelated history, or a baseline that cannot be read.
-EMPTY_BASELINE: Final = Baseline(frozenset(), frozenset(), frozenset(), False)
+EMPTY_BASELINE: Final = Baseline(frozenset(), frozenset(), frozenset(), False, frozenset())
 
 
 def _project_dir(
@@ -456,7 +459,8 @@ class StackConformanceResult:
             paragraphs.append(
                 "These could not be checked against the standards: "
                 + "; ".join(self.new_gaps)
-                + ". Make each manifest valid (JSON or TOML) and within size limits."
+                + ". Make each manifest valid (JSON or TOML) and within size limits, and replace"
+                " each submodule with the files this change needs."
             )
         return "\n\n".join(paragraphs)
 
@@ -511,6 +515,11 @@ def evaluate(
         for path in current.unreadable
         if path not in baseline.unreadable
     ]
+    gaps.extend(
+        f"`{path}` is a git submodule, whose files cannot be checked"
+        for path in current.submodules
+        if path not in baseline.submodules
+    )
     if current.truncated and not baseline.truncated:
         gaps.append(f"the tree lists more than {MAX_LISTED_PATHS} files")
     return StackConformanceResult(
