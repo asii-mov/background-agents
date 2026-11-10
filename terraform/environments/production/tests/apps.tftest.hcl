@@ -342,7 +342,7 @@ run "apps_constants_match_the_broker" {
 
   assert {
     condition = [
-      for match in regexall("\"([a-z]+)\"", regex("DATA_JURISDICTIONS = \\[([^\\]]*)\\]", file("${var.project_root}packages/app-broker/src/env.ts"))[0]) : match[0]
+      for match in regexall("\"([a-z]+)\"", regex("DATA_JURISDICTIONS = \\[([^\\]]*)\\]", file("${var.project_root}packages/shared/src/types/app-data.ts"))[0]) : match[0]
     ] == ["eu", "fedramp"]
     error_message = "The broker's jurisdictions changed; update the app_data_jurisdiction validation to accept exactly them and ''."
   }
