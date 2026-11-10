@@ -245,7 +245,8 @@ export const HOSTING_BACKEND_KINDS = ["workers", "dispatch-namespace"] as const;
 export type HostingBackendKind = (typeof HOSTING_BACKEND_KINDS)[number];
 export type AppHoldKind = "owner_unpublished" | "admin_takedown";
 
-export interface AppSummary {
+/** What every `apps.read` holder sees of an app. */
+interface AppSummaryBase {
   name: AppName;
   url: string;
   status: AppStatus;
@@ -256,8 +257,6 @@ export interface AppSummary {
   bundleBytes: number;
   version: number;
   lastDeployedAt: number | null;
-  lastSessionId: string | null;
-  lastRepo: { owner: string; name: string } | null;
   lastErrorReason: AppDeployFailureReason | null;
   takedown: {
     kind: AppHoldKind;
@@ -267,6 +266,20 @@ export interface AppSummary {
     cleanupComplete: boolean;
   } | null;
 }
+
+/** An app as a viewer who may manage it sees it, with the session and repo that last deployed it. */
+export interface AppSummary extends AppSummaryBase {
+  lastSessionId: string | null;
+  lastRepo: { owner: string; name: string } | null;
+}
+
+/** An app as a viewer who may not manage it sees it: no session or repository linkage. */
+export interface RedactedAppSummary extends AppSummaryBase {
+  lastSessionId?: never;
+  lastRepo?: never;
+}
+
+export type AppDirectoryEntry = AppSummary | RedactedAppSummary;
 
 export interface AppDeploymentView {
   id: string;
@@ -278,6 +291,12 @@ export interface AppDeploymentView {
   failureReason: AppDeployFailureReason | null;
   createdAt: number;
 }
+
+export interface RedactedAppDeploymentView extends Omit<AppDeploymentView, "requestedBy"> {
+  requestedBy: { userId: string; sessionId?: never };
+}
+
+export type AppDeploymentEntry = AppDeploymentView | RedactedAppDeploymentView;
 
 export const appTakedownRequestSchema = z.strictObject({
   reason: z.string().trim().min(1).max(500),

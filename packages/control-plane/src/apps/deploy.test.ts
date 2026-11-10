@@ -33,6 +33,7 @@ const MIGRATIONS_DIR = resolve(
 );
 
 const NOTES = "notes" as AppName;
+const MANAGER = () => true;
 
 function body(name: AppName = NOTES): DeployRequestBody {
   const bytes = new TextEncoder().encode("<h1>notes</h1>");
@@ -170,7 +171,7 @@ describe("app deploy and takedown", () => {
       firstDeploy: true,
     });
     expect(second).toMatchObject({ ok: true, version: 2, firstDeploy: false });
-    const app = await getApp(deps, NOTES);
+    const app = await getApp(deps, NOTES, MANAGER);
     expect(app?.app).toMatchObject({
       status: "live",
       version: 2,
@@ -191,7 +192,7 @@ describe("app deploy and takedown", () => {
 
     expect(outcome).toMatchObject({ ok: false, reason: "name_taken" });
     expect(host.calls.filter((call) => call.op === "deploy")).toHaveLength(1);
-    expect((await getApp(deps, NOTES))?.app.owner.userId).toBe("alice");
+    expect((await getApp(deps, NOTES, MANAGER))?.app.owner.userId).toBe("alice");
   });
 
   it("lets a teammate redeploy a team-owned app", async () => {
@@ -202,7 +203,7 @@ describe("app deploy and takedown", () => {
     const outcome = await deploy(await session(bob));
 
     expect(outcome).toMatchObject({ ok: true, version: 2 });
-    expect((await getApp(deps, NOTES))?.app.owner).toMatchObject({
+    expect((await getApp(deps, NOTES, MANAGER))?.app.owner).toMatchObject({
       userId: "alice",
       teamId: "platform",
     });
@@ -226,7 +227,7 @@ describe("app deploy and takedown", () => {
     expect(viewer).toMatchObject({ ok: false, reason: "permission_denied" });
     expect(ownerless).toMatchObject({ ok: false, reason: "permission_denied" });
     expect(host.calls).toEqual([]);
-    expect(await listApps(deps)).toEqual([]);
+    expect(await listApps(deps, MANAGER)).toEqual([]);
   });
 
   it("records a refused publish as failed and commits nothing", async () => {
@@ -236,7 +237,7 @@ describe("app deploy and takedown", () => {
 
     expect(outcome).toMatchObject({ ok: false, reason: "access_guard_failed" });
     expect(outcome.ok === false && outcome.message).not.toContain("floor missing");
-    const app = await getApp(deps, NOTES);
+    const app = await getApp(deps, NOTES, MANAGER);
     expect(app?.app).toMatchObject({
       status: "failed",
       version: 0,
@@ -260,7 +261,7 @@ describe("app deploy and takedown", () => {
       retryAfterSeconds: 5,
     });
     expect(retried).toMatchObject({ ok: true, version: 2 });
-    expect((await getApp(deps, NOTES))?.deployments.map((row) => row.status)).toEqual([
+    expect((await getApp(deps, NOTES, MANAGER))?.deployments.map((row) => row.status)).toEqual([
       "live",
       "failed",
     ]);
@@ -284,7 +285,7 @@ describe("app deploy and takedown", () => {
     host.deployFailures.push(new AppHostError("hostname_conflict", "taken"));
 
     expect(await deploy(alice)).toMatchObject({ ok: false, reason: "hostname_conflict" });
-    expect((await getApp(deps, NOTES))?.app).toMatchObject({
+    expect((await getApp(deps, NOTES, MANAGER))?.app).toMatchObject({
       status: "live",
       version: 1,
       lastErrorReason: "hostname_conflict",
@@ -297,7 +298,7 @@ describe("app deploy and takedown", () => {
     host.backend = "dispatch-namespace";
 
     expect(await deploy(alice)).toMatchObject({ ok: false, reason: "hosting_backend_changed" });
-    expect((await getApp(deps, NOTES))?.app).toMatchObject({
+    expect((await getApp(deps, NOTES, MANAGER))?.app).toMatchObject({
       status: "live",
       version: 1,
       backend: "workers",
@@ -333,7 +334,7 @@ describe("app deploy and takedown", () => {
       detail: { missing: ["STRIPE_KEY"] },
     });
     expect(host.calls).toEqual([]);
-    expect((await getApp(deps, NOTES))?.deployments).toMatchObject([
+    expect((await getApp(deps, NOTES, MANAGER))?.deployments).toMatchObject([
       { status: "failed", failureReason: "secret_missing" },
     ]);
   });
@@ -350,7 +351,7 @@ describe("app deploy and takedown", () => {
 
     expect(outcome).toMatchObject({ ok: false, reason: "app_taken_down" });
     expect(host.published.has(NOTES)).toBe(false);
-    const app = await getApp(deps, NOTES);
+    const app = await getApp(deps, NOTES, MANAGER);
     expect(app?.app).toMatchObject({
       status: "taken_down",
       takedown: { kind: "admin_takedown", cleanupComplete: true },
@@ -391,7 +392,10 @@ describe("app deploy and takedown", () => {
 
     expect(down).toMatchObject({ ok: true, app: { takedown: { kind: "owner_unpublished" } } });
     expect(redeployed).toMatchObject({ ok: true, version: 2 });
-    expect((await getApp(deps, NOTES))?.app).toMatchObject({ status: "live", takedown: null });
+    expect((await getApp(deps, NOTES, MANAGER))?.app).toMatchObject({
+      status: "live",
+      takedown: null,
+    });
   });
 
   it("never lets an owner's unpublish replace an administrator's hold", async () => {
@@ -402,7 +406,7 @@ describe("app deploy and takedown", () => {
     await takedown(NOTES, admin, "any");
     await takedown(NOTES, alice, "own");
 
-    expect((await getApp(deps, NOTES))?.app.takedown).toMatchObject({
+    expect((await getApp(deps, NOTES, MANAGER))?.app.takedown).toMatchObject({
       kind: "admin_takedown",
       byUserId: "ada",
     });
@@ -462,7 +466,7 @@ describe("app deploy and takedown", () => {
 
     expect(busy).toMatchObject({ ok: false, reason: "hosting_unavailable" });
     expect(reclaimed).toMatchObject({ ok: true, version: 3 });
-    expect((await getApp(deps, NOTES))?.deployments).toMatchObject([
+    expect((await getApp(deps, NOTES, MANAGER))?.deployments).toMatchObject([
       { version: 3, status: "live" },
       { version: 2, status: "failed", failureReason: "deadline_exceeded" },
       { version: 1, status: "superseded" },
@@ -473,7 +477,9 @@ describe("app deploy and takedown", () => {
     await deploy(await session(await user("alice")));
     await deploy(await session(await user("bob")), body("budget" as AppName));
 
-    expect((await listApps(deps)).map((app) => [app.name, app.url, app.owner.userId])).toEqual([
+    expect(
+      (await listApps(deps, MANAGER)).map((app) => [app.name, app.url, app.owner.userId])
+    ).toEqual([
       ["budget", "https://budget.apps.example.test", "bob"],
       ["notes", "https://notes.apps.example.test", "alice"],
     ]);

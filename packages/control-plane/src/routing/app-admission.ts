@@ -5,6 +5,7 @@
  * module.
  */
 
+import type { SessionViewer } from "@open-inspect/shared";
 import { parseAppName, type AppName } from "@open-inspect/shared/apps";
 import {
   SCOPED_PERMISSION_PAIRS,
@@ -38,6 +39,22 @@ export const UNCONFIGURED_APP_OWNER_LOOKUP: AppOwnerLookup = {
 };
 
 type AppRequirement = Extract<RouteAuthorizationRequirement, { kind: "app" }>;
+
+type UserViewer = Extract<SessionViewer, { kind: "user" }>;
+
+function ownsApp(viewer: UserViewer, owner: AppOwner): boolean {
+  return (
+    owner.userId === viewer.userId ||
+    (owner.teamId !== null && viewer.memberships.has(owner.teamId))
+  );
+}
+
+/** Whether the viewer may manage the app, by the same rule app admission enforces. */
+export function canManageApp(viewer: SessionViewer, owner: AppOwner): boolean {
+  if (viewer.kind === "service") return false;
+  const scope = resolveScopedPermission("apps.manage", viewer.permissions);
+  return scope === "any" || (scope === "own" && ownsApp(viewer, owner));
+}
 
 export type AppAdmissionOutcome =
   | { kind: "allowed"; effectivePermission: PermissionId; owner: AppOwner }
@@ -98,10 +115,7 @@ export async function resolveAppRequirement(
   const owner = await lookup.findOwner(name.name);
   if (!owner) return APP_NOT_FOUND;
 
-  const owns =
-    owner.userId === viewer.userId ||
-    (owner.teamId !== null && viewer.memberships.has(owner.teamId));
-  if (scope === "own" && !owns) {
+  if (scope === "own" && !ownsApp(viewer, owner)) {
     return {
       kind: "denied",
       status: 403,

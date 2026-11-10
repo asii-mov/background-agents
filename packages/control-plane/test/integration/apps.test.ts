@@ -244,7 +244,7 @@ describe("apps", () => {
       await expect(listed.json()).resolves.toMatchObject({
         apps: [{ name: "notes", status: "live", url: "https://notes.apps.example.test" }],
       });
-      const detail = await asUser("/apps/notes", { userId: BOB, role: "member" });
+      const detail = await asUser("/apps/notes", { userId: ALICE, role: "member" });
       await expect(detail.json()).resolves.toMatchObject({
         app: { owner: { userId: ALICE } },
         deployments: [{ version: 1, status: "live", requestedBy: { sessionId: sessionName } }],
@@ -296,6 +296,65 @@ describe("apps", () => {
   describe("GET /apps", () => {
     it("requires apps.read", async () => {
       expect((await asUser("/apps", { userId: VICTOR, role: "viewer" })).status).toBe(403);
+    });
+
+    describe("session and repository linkage", () => {
+      beforeEach(async () => {
+        for (const id of [ALICE, BOB, CAROL]) await seedActiveUser(id);
+        await seedTeam("platform", [
+          [ALICE, "member"],
+          [BOB, "member"],
+        ]);
+        await seedLiveApp("notes", ALICE, "platform");
+        await env.DB.batch([
+          env.DB.prepare(
+            `UPDATE apps SET last_session_id = 'session-notes', last_repo_owner = 'acme',
+               last_repo_name = 'notes' WHERE name = 'notes'`
+          ),
+          env.DB.prepare(
+            "UPDATE app_deployments SET session_id = 'session-notes' WHERE app_name = 'notes'"
+          ),
+        ]);
+      });
+
+      async function viewAs(userId: string, role: BuiltInRoleKey) {
+        const list = await asUser("/apps", { userId, role });
+        const detail = await asUser("/apps/notes", { userId, role });
+        expect([list.status, detail.status]).toEqual([200, 200]);
+        const { apps } = await list.json<{ apps: Record<string, unknown>[] }>();
+        const { app, deployments } = await detail.json<{
+          app: Record<string, unknown>;
+          deployments: { requestedBy: Record<string, unknown> }[];
+        }>();
+        return { listed: apps[0], app, requestedBy: deployments[0]?.requestedBy };
+      }
+
+      it.each([
+        ["the owner", ALICE, "member"],
+        ["a teammate of the owner team", BOB, "member"],
+        ["an administrator", ADA, "administrator"],
+      ] as const)("shows %s the deploying session and repository", async (_case, userId, role) => {
+        const view = await viewAs(userId, role);
+
+        for (const app of [view.listed, view.app]) {
+          expect(app).toMatchObject({
+            lastSessionId: "session-notes",
+            lastRepo: { owner: "acme", name: "notes" },
+          });
+        }
+        expect(view.requestedBy).toEqual({ userId: ALICE, sessionId: "session-notes" });
+      });
+
+      it("hides them from a member who cannot manage the app", async () => {
+        const view = await viewAs(CAROL, "member");
+
+        for (const app of [view.listed, view.app]) {
+          expect(app).toMatchObject({ name: "notes", owner: { userId: ALICE } });
+          expect(app).not.toHaveProperty("lastSessionId");
+          expect(app).not.toHaveProperty("lastRepo");
+        }
+        expect(view.requestedBy).toEqual({ userId: ALICE });
+      });
     });
   });
 

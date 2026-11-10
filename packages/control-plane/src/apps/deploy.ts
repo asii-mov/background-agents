@@ -13,9 +13,13 @@ import {
   type AppDeployFailure,
   type AppDeployFailureReason,
   type AppDeploySuccess,
+  type AppDeploymentEntry,
   type AppDeploymentView,
+  type AppDirectoryEntry,
   type AppName,
   type AppSummary,
+  type RedactedAppDeploymentView,
+  type RedactedAppSummary,
 } from "@open-inspect/shared/apps";
 import type { FetchClient } from "@open-inspect/shared/service-auth";
 import type {
@@ -372,7 +376,7 @@ async function sweepApp(
   return result;
 }
 
-export function toAppSummary(record: AppRecord, appsDomain: string): AppSummary {
+function toRedactedAppSummary(record: AppRecord, appsDomain: string): RedactedAppSummary {
   return {
     name: record.name,
     url: appUrl(appsDomain, record.name),
@@ -388,8 +392,6 @@ export function toAppSummary(record: AppRecord, appsDomain: string): AppSummary 
     bundleBytes: record.bundleBytes,
     version: record.version,
     lastDeployedAt: record.lastDeployedAt,
-    lastSessionId: record.lastSessionId,
-    lastRepo: record.lastRepo,
     lastErrorReason: record.lastErrorReason,
     takedown: record.hold
       ? {
@@ -401,6 +403,25 @@ export function toAppSummary(record: AppRecord, appsDomain: string): AppSummary 
         }
       : null,
   };
+}
+
+function toAppSummary(record: AppRecord, appsDomain: string): AppSummary {
+  return {
+    ...toRedactedAppSummary(record, appsDomain),
+    lastSessionId: record.lastSessionId,
+    lastRepo: record.lastRepo,
+  };
+}
+
+function toRedactedDeploymentView(view: AppDeploymentView): RedactedAppDeploymentView {
+  return { ...view, requestedBy: { userId: view.requestedBy.userId } };
+}
+
+/** Whether the viewer may manage an app with this owner, and so see what deployed it. */
+export type CanManageApp = (owner: { userId: string; teamId: string | null }) => boolean;
+
+function ownerOf(record: AppRecord): { userId: string; teamId: string | null } {
+  return { userId: record.ownerUserId, teamId: record.ownerTeamId };
 }
 
 /**
@@ -483,22 +504,33 @@ export async function releaseHold(
 }
 
 /** Every app: `apps.read` is a workspace directory. */
-export async function listApps(deps: Pick<AppsDeps, "db" | "appsDomain">): Promise<AppSummary[]> {
+export async function listApps(
+  deps: Pick<AppsDeps, "db" | "appsDomain">,
+  canManage: CanManageApp
+): Promise<AppDirectoryEntry[]> {
   const records = await new AppStore(deps.db).list();
-  return records.map((record) => toAppSummary(record, deps.appsDomain));
+  return records.map((record) =>
+    canManage(ownerOf(record))
+      ? toAppSummary(record, deps.appsDomain)
+      : toRedactedAppSummary(record, deps.appsDomain)
+  );
 }
 
 export async function getApp(
   deps: Pick<AppsDeps, "db" | "appsDomain">,
-  name: AppName
-): Promise<{ app: AppSummary; deployments: AppDeploymentView[] } | null> {
+  name: AppName,
+  canManage: CanManageApp
+): Promise<{ app: AppDirectoryEntry; deployments: AppDeploymentEntry[] } | null> {
   const store = new AppStore(deps.db);
   const record = await store.get(name);
   if (!record) return null;
-  return {
-    app: toAppSummary(record, deps.appsDomain),
-    deployments: await store.listDeployments(name, APP_DEPLOYMENT_HISTORY_LIMIT),
-  };
+  const deployments = await store.listDeployments(name, APP_DEPLOYMENT_HISTORY_LIMIT);
+  return canManage(ownerOf(record))
+    ? { app: toAppSummary(record, deps.appsDomain), deployments }
+    : {
+        app: toRedactedAppSummary(record, deps.appsDomain),
+        deployments: deployments.map(toRedactedDeploymentView),
+      };
 }
 
 const globalFetch: FetchClient = { fetch: (input, init) => fetch(input, init) };
