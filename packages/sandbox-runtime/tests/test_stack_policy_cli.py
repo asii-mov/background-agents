@@ -244,6 +244,36 @@ GOLDEN = [
         rules=seed_rules(frontend_blocks=False),
         line="warning: Could not check the stack policy: `web/package.json` could not be read.",
     ),
+    *(
+        Golden(
+            f"new-{name}-is-a-gap-that-blocks-under-a-blocking-rule",
+            introduce({"README.md": "fixture\n"}, {f"web/{name}": content}),
+            {},
+            1,
+            line=f"error: Could not check the stack policy: `web/{name}` could not be read.",
+        )
+        for name, content in (
+            ("package.yaml", "dependencies:\n  react: ^18\n"),
+            ("package.json5", "{dependencies: {react: '^18'}}\n"),
+        )
+    ),
+    Golden(
+        "react-in-a-deno-import-map-blocks",
+        introduce(
+            {"README.md": "fixture\n"},
+            {"web/deno.json": json.dumps({"imports": {"react": "npm:react@^18"}})},
+        ),
+        {("React", "web/deno.json"): "violation"},
+        1,
+        line="error: web/deno.json: React is not allowed for Web frontend.",
+    ),
+    Golden(
+        "a-package-json-with-a-byte-order-mark-is-read",
+        introduce({"web/package.json": SVELTE}, {"web/package.json": "﻿" + REACT}),
+        {("React", "web/package.json"): "violation"},
+        1,
+        line="error: web/package.json: React is not allowed for Web frontend.",
+    ),
     Golden(
         "unreadable-manifest-at-base-passes",
         introduce({"templates/package.json": "{{ name }}"}, {"README.md": "edited\n"}),

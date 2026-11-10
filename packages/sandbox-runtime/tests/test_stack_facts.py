@@ -111,6 +111,54 @@ async def test_an_unparseable_manifest_makes_the_facts_incomplete(tmp_path):
     assert declared(facts) == {("npm", "hono", "api/package.json", "runtime")}
 
 
+async def test_deno_import_maps_declare_npm_packages(tmp_path):
+    write(
+        tmp_path,
+        {
+            "deno.jsonc": """// Deno reads comments and trailing commas here
+            {
+              "imports": {
+                "ui": "npm:react@^18/jsx-runtime",
+                "dom/": "npm:/react-dom@18/",
+                "path": "jsr:@std/path@^1",
+              },
+              "scopes": {"./vendor/": {"types": "npm:@Types/React@^18"}},
+            }""",
+            "edge/deno.json": json.dumps({"imports": {"hono": "npm:hono"}}),
+        },
+    )
+
+    facts = await collect_tree_facts(DirectorySource(tmp_path))
+
+    assert declared(facts) == {
+        ("npm", "react", "deno.jsonc", "runtime"),
+        ("npm", "react-dom", "deno.jsonc", "runtime"),
+        ("npm", "@types/react", "deno.jsonc", "runtime"),
+        ("npm", "hono", "edge/deno.json", "runtime"),
+    }
+    assert facts.complete
+
+
+async def test_manifests_the_scanner_cannot_read_make_the_facts_incomplete(tmp_path):
+    write(
+        tmp_path,
+        {
+            "pnpm/package.yaml": "dependencies:\n  react: ^18\n",
+            "json5/package.json5": "{dependencies: {react: '^18'}}",
+            "split/deno.json": json.dumps({"importMap": "./import_map.json"}),
+            "split/import_map.json": json.dumps({"imports": {"react": "npm:react"}}),
+        },
+    )
+
+    facts = await collect_tree_facts(DirectorySource(tmp_path))
+
+    assert facts.unreadable == (
+        PurePosixPath("json5/package.json5"),
+        PurePosixPath("pnpm/package.yaml"),
+        PurePosixPath("split/deno.json"),
+    )
+
+
 async def test_npm_lockfiles_give_resolved_versions_and_direct_flags(tmp_path):
     write(
         tmp_path,

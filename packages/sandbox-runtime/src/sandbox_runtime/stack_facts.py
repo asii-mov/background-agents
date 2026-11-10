@@ -190,7 +190,8 @@ def _string_list(value: Any, context: str) -> list[str]:
 class NpmEcosystem:
     """``package.json`` dependency fields in every directory (workspaces included). Resolved
     versions from ``package-lock.json`` / ``npm-shrinkwrap.json`` (v2/v3) and ``bun.lock``.
-    Enforcement reads ``package.json`` alone, so it works with every package manager."""
+    Enforcement reads ``package.json`` and Deno import maps, so it works with every package
+    manager; pnpm's ``package.yaml`` / ``package.json5`` are unreadable (fail closed)."""
 
     id = "npm"
     _FIELDS: Final[dict[str, DependencyScope]] = {
@@ -203,13 +204,28 @@ class NpmEcosystem:
     def normalize(self, name: str) -> str:
         return name.strip().lower()
 
+    #: pnpm reads these instead of package.json; no YAML or JSON5 parser ships in the sandbox.
+    _UNREAD_MANIFESTS: Final = frozenset({"package.yaml", "package.json5"})
+    _DENO_CONFIGS: Final = frozenset({"deno.json", "deno.jsonc"})
+    _NPM_SPECIFIER: Final = re.compile(r"^npm:/?(@[^/@]+/[^/@]+|[^/@]+)(?:@([^/]+))?")
+
     def is_manifest(self, path: PurePosixPath) -> bool:
-        return path.name == "package.json"
+        return (
+            path.name == "package.json"
+            or path.name in self._UNREAD_MANIFESTS
+            or path.name in self._DENO_CONFIGS
+        )
 
     def is_lockfile(self, path: PurePosixPath) -> bool:
         return path.name in ("package-lock.json", "npm-shrinkwrap.json", "bun.lock")
 
     def parse_manifest(self, path: PurePosixPath, content: bytes) -> ManifestContents:
+        if path.name in self._UNREAD_MANIFESTS:
+            raise ManifestParseError(
+                f"{path.name} is not read; declare dependencies in package.json"
+            )
+        if path.name in self._DENO_CONFIGS:
+            return self._deno_config(path, content)
         document = _mapping(_json_document(content), "package.json")
         dependencies: list[DeclaredDependency] = []
         for field_name, scope in self._FIELDS.items():
@@ -227,6 +243,31 @@ class NpmEcosystem:
                         declared,
                     )
                 )
+        return ManifestContents(tuple(dependencies))
+
+    def _deno_config(self, path: PurePosixPath, content: bytes) -> ManifestContents:
+        """``npm:`` specifiers in the import map. A separate ``importMap`` file is not read."""
+        try:
+            document = json.loads(_strip_jsonc(content.decode("utf-8-sig")))
+        except (UnicodeDecodeError, ValueError) as error:
+            raise ManifestParseError(str(error)) from error
+        document = _mapping(document, path.name)
+        if "importMap" in document:
+            raise ManifestParseError("a separate importMap file is not read")
+        import_maps = [
+            document.get("imports") or {},
+            *_mapping(document.get("scopes") or {}, "scopes").values(),
+        ]
+        dependencies: list[DeclaredDependency] = []
+        for imports in import_maps:
+            for spec in _mapping(imports, "imports").values():
+                match = self._NPM_SPECIFIER.match(spec) if isinstance(spec, str) else None
+                if match:
+                    dependencies.append(
+                        DeclaredDependency(
+                            self.id, self.normalize(match.group(1)), path, "runtime", match.group(2)
+                        )
+                    )
         return ManifestContents(tuple(dependencies))
 
     @staticmethod
