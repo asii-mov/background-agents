@@ -4,6 +4,8 @@ import {
   attachDomain,
   checkD1Atomicity,
   createCloudflareClient,
+  describeFetchError,
+  describeProbe,
   provisionApp,
   takeDownApp,
 } from "../scripts/live-smoke";
@@ -84,5 +86,32 @@ describe("the live smoke's API steps against the fake", () => {
     });
 
     expect(await api.request("DELETE", "/workers/domains/d1")).toMatchObject({ status, success });
+  });
+});
+
+describe("the live smoke's probe diagnostics", () => {
+  it("names each fetch failure cause and its code", () => {
+    const dns = Object.assign(new Error("getaddrinfo ENOTFOUND smoke-a.apps.example.test"), {
+      code: "ENOTFOUND",
+    });
+
+    expect(describeFetchError(new TypeError("fetch failed", { cause: dns }))).toBe(
+      "fetch failed, caused by ENOTFOUND getaddrinfo ENOTFOUND smoke-a.apps.example.test"
+    );
+  });
+
+  it("shows an Access redirect without its query string or cookies", () => {
+    const headers = new Headers({
+      location:
+        "https://team.cloudflareaccess.com/cdn-cgi/access/login/smoke-a.apps.example.test?kid=k&meta=secret-meta",
+      "set-cookie": "CF_Authorization=secret-cookie",
+      server: "cloudflare",
+    });
+
+    const observed = describeProbe({ status: 302, servedByRun: false, body: "", headers });
+
+    expect(observed).toBe(
+      "HTTP 302 location=https://team.cloudflareaccess.com/cdn-cgi/access/login/smoke-a.apps.example.test server=cloudflare"
+    );
   });
 });

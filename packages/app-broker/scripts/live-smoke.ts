@@ -406,27 +406,52 @@ export async function checkD1Atomicity(
 
 // ---- Edge probes (live only) --------------------------------------------------------------------
 
-interface Probe {
+interface ProbeResponse {
   status: number;
   servedByRun: boolean;
   body: string;
+  headers: Headers;
 }
+export type Probe = ProbeResponse | { error: string };
 
-async function probe(
-  url: string,
-  headers: Record<string, string>,
-  runId: string
-): Promise<Probe | { error: string }> {
+/** Response headers that tell TLS, DNS and Access failures apart without carrying a credential. */
+const DIAGNOSTIC_HEADERS = ["location", "server", "cf-ray", "cf-mitigated", "content-type"];
+
+async function probe(url: string, headers: Record<string, string>, runId: string): Promise<Probe> {
   try {
     const response = await fetch(url, { headers, redirect: "manual" });
     return {
       status: response.status,
       servedByRun: response.headers.get(RUN_HEADER) === runId,
       body: await response.text(),
+      headers: response.headers,
     };
   } catch (error) {
-    return { error: describe(error) };
+    return { error: describeFetchError(error) };
   }
+}
+
+/** A fetch failure with each `cause` and its code, e.g. ENOTFOUND or ERR_TLS_CERT_ALTNAME_INVALID. */
+export function describeFetchError(error: unknown): string {
+  const parts: string[] = [];
+  let current = error;
+  while (current !== undefined && parts.length < 4) {
+    const code = isRecord(current) && typeof current.code === "string" ? `${current.code} ` : "";
+    parts.push(`${code}${describe(current)}`);
+    current = current instanceof Error ? current.cause : undefined;
+  }
+  return parts.join(", caused by ");
+}
+
+/** The status and allowlisted headers of a probe, with any query string cut from `location`. */
+export function describeProbe(result: Probe): string {
+  if ("error" in result) return result.error;
+  const shown = DIAGNOSTIC_HEADERS.flatMap((name) => {
+    const value = result.headers.get(name);
+    if (value === null) return [];
+    return [`${name}=${name === "location" ? value.split(/[?#]/)[0] : value}`];
+  });
+  return [`HTTP ${result.status}`, ...shown].join(" ");
 }
 
 async function poll<T>(
@@ -442,18 +467,27 @@ async function poll<T>(
   return null;
 }
 
+type EchoOutcome =
+  { answered: true; assertion: string | null } | { answered: false; lastProbe: string };
+
 async function waitForEcho(
   hostname: string,
   headers: Record<string, string>,
   runId: string
-): Promise<{ assertion: string | null } | null> {
+): Promise<EchoOutcome> {
+  let lastProbe = "no probe completed";
   const served = await poll(ACCESS_PROPAGATION_TIMEOUT_MS, async () => {
     const response = await probe(`https://${hostname}/echo`, headers, runId);
-    return "error" in response || !response.servedByRun ? null : response;
+    if ("error" in response || !response.servedByRun) {
+      lastProbe = describeProbe(response);
+      return null;
+    }
+    return response;
   });
-  if (!served) return null;
+  if (!served) return { answered: false, lastProbe };
   const echo: unknown = JSON.parse(served.value.body);
   return {
+    answered: true,
     assertion: isRecord(echo) && typeof echo.assertion === "string" ? echo.assertion : null,
   };
 }
@@ -560,26 +594,30 @@ async function runLiveSmoke(env: SmokeEnv): Promise<{ runId: string; results: Ch
       `read back after each of two deployments: ${JSON.stringify(a.subdomainReads)}`
     );
     const domainA = await attachDomain(api, cleanup, { ...names("a"), zoneId: env.zoneId });
+    let lastTlsProbe = "no probe completed";
     const tls = await poll(CERT_WAIT_TIMEOUT_MS, async () => {
       const response = await probe(`https://${a.hostname}/echo`, serviceHeaders, runId);
-      return "error" in response ? null : response;
+      if (!("error" in response)) return response;
+      lastTlsProbe = response.error;
+      return null;
     });
     record(
       "certificateIssued",
       tls !== null,
       tls
         ? `first HTTPS response ${tls.elapsedMs} ms after the domain PUT`
-        : `no HTTPS response within ${CERT_WAIT_TIMEOUT_MS} ms`
+        : `no HTTPS response within ${CERT_WAIT_TIMEOUT_MS} ms; last probe: ${lastTlsProbe}`
     );
 
     const echoA = await waitForEcho(a.hostname, serviceHeaders, runId);
-    const audA = audiences(echoA?.assertion ?? null);
+    const audA = audiences(echoA.answered ? echoA.assertion : null);
     record(
       "exactAccessAppWins",
-      echoA !== null && audA.includes(a.aud) && !audA.includes(floor.aud),
-      echoA
+      echoA.answered && audA.includes(a.aud) && !audA.includes(floor.aud),
+      echoA.answered
         ? `JWT aud ${JSON.stringify(audA)}; per-app ${a.aud}; floor ${floor.aud}`
-        : `the Worker never answered with the service token within ${ACCESS_PROPAGATION_TIMEOUT_MS} ms`
+        : `the Worker never answered with the service token within ` +
+            `${ACCESS_PROPAGATION_TIMEOUT_MS} ms; last probe: ${echoA.lastProbe}`
     );
     const asset = await probe(`https://${a.hostname}${ASSET_PATH}`, serviceHeaders, runId);
     record(
@@ -595,11 +633,12 @@ async function runLiveSmoke(env: SmokeEnv): Promise<{ runId: string; results: Ch
     });
     await attachDomain(api, cleanup, { ...names("b"), zoneId: env.zoneId });
     const echoB = await waitForEcho(b.hostname, serviceHeaders, runId);
-    if (!echoA?.assertion || !echoB) {
+    if (!echoA.answered || !echoA.assertion || !echoB.answered) {
       record(
         "perAppTokenRefusedAtSibling",
         false,
-        "precondition failed: both apps must answer the service token first"
+        "precondition failed: both apps must answer the service token first" +
+          (echoB.answered ? "" : `; app B last probe: ${echoB.lastProbe}`)
       );
     } else {
       const replay = await probe(
