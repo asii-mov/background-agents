@@ -78,7 +78,8 @@ records one row per assumption:
 2. A token issued for one app is refused at a sibling app's hostname.
 3. A Worker created with workers.dev and previews off stays off after versions and deployments.
 4. Asset uploads accept `sha256(base64 + extension)` truncated to 32 hex characters.
-5. A custom domain gets a certificate. The time to the first HTTPS response is recorded.
+5. A custom domain gets a certificate. The times until the zone's nameservers serve the hostname and
+   until the first HTTPS response are recorded separately.
 6. A D1 `/query` body whose second statement fails leaves the first statement unapplied.
 7. Takedown (detach the domain, delete the script, revoke the Access app) stops the hostname
    resolving.
@@ -111,12 +112,14 @@ read -rs APP_BROKER_SMOKE_API_TOKEN && export APP_BROKER_SMOKE_API_TOKEN
 APP_BROKER_LIVE_SMOKE=1 npm run smoke -w @open-inspect/app-broker
 ```
 
-A run takes a few minutes; it waits up to 10 minutes each for the certificate and for DNS to stop
-resolving. It creates a service token, two Access policies, the floor app, two Workers with Access
-apps and custom domains, and a D1 database, each with `oi-smoke` and the run id in its name or
-hostname (the floor app has only `oi-smoke`), and deletes them before it exits. Anything it could
-not delete is printed under `Could not delete`. An interrupted run deletes nothing, so remove that
-run's `oi-smoke` objects by hand.
+A run takes a few minutes; it waits up to 10 minutes each for DNS to publish, for the certificate,
+and for DNS to stop resolving. It asks the zone's nameservers directly and connects to the address
+they return, because a caching resolver that saw the hostname before it was published keeps the
+NXDOMAIN for the zone's SOA minimum (30 minutes on Cloudflare). It creates a service token, two
+Access policies, the floor app, two Workers with Access apps and custom domains, and a D1 database,
+each with `oi-smoke` and the run id in its name or hostname (the floor app has only `oi-smoke`), and
+deletes them before it exits. Anything it could not delete is printed under `Could not delete`. An
+interrupted run deletes nothing, so remove that run's `oi-smoke` objects by hand.
 
 It prints a Markdown table of assumptions, results and observations, and exits 1 if any assumption
 failed. Paste the table into the PR that enables app hosting. The D1 row includes the real error

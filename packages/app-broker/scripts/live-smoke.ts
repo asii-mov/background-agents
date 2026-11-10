@@ -9,7 +9,11 @@
  * environment variables and token permissions.
  */
 import { createHash, randomBytes } from "node:crypto";
+import { NODATA, NOTFOUND } from "node:dns";
+import { Resolver } from "node:dns/promises";
+import { isIP, type LookupFunction } from "node:net";
 import { pathToFileURL } from "node:url";
+import { Agent, fetch as fetchVia } from "undici";
 
 export const ASSUMPTIONS = {
   exactAccessAppWins:
@@ -20,7 +24,8 @@ export const ASSUMPTIONS = {
     "A Worker created with workers.dev and previews off stays off after versions and deployments",
   sha256AssetHashesAccepted:
     "Static asset uploads accept sha256(base64 + extension) truncated to 32 hex characters",
-  certificateIssued: "A custom domain gets a certificate (time to first HTTPS response recorded)",
+  certificateIssued:
+    "A custom domain gets a certificate (authoritative DNS publish and first HTTPS times recorded)",
   d1QueryIsAtomic: "A D1 /query body whose second statement fails leaves the first unapplied",
   takedownStopsResolution:
     "Removing the custom domain, script and Access app stops the hostname resolving",
@@ -43,6 +48,8 @@ const COMPATIBILITY_DATE = "2026-06-01";
 const SMOKE_MODULE = "smoke.mjs";
 const ASSET_PATH = "/asset.txt";
 const RUN_HEADER = "x-oi-smoke-run";
+const DNS_PUBLISH_TIMEOUT_MS = 10 * 60_000;
+const DNS_QUERY_TIMEOUT_MS = 5_000;
 const CERT_WAIT_TIMEOUT_MS = 10 * 60_000;
 const ACCESS_PROPAGATION_TIMEOUT_MS = 2 * 60_000;
 const RESOLUTION_WAIT_TIMEOUT_MS = 10 * 60_000;
@@ -417,9 +424,70 @@ export type Probe = ProbeResponse | { error: string };
 /** Response headers that tell TLS, DNS and Access failures apart without carrying a credential. */
 const DIAGNOSTIC_HEADERS = ["location", "server", "cf-ray", "cf-mitigated", "content-type"];
 
-async function probe(url: string, headers: Record<string, string>, runId: string): Promise<Probe> {
+/** The node:dns/promises Resolver methods the authoritative lookup uses. */
+export interface DnsResolver {
+  setServers(servers: string[]): void;
+  resolveNs(name: string): Promise<string[]>;
+  resolve4(name: string): Promise<string[]>;
+  resolve6(name: string): Promise<string[]>;
+}
+
+const newSystemResolver = (): DnsResolver =>
+  new Resolver({ timeout: DNS_QUERY_TIMEOUT_MS, tries: 2 });
+
+async function noRecordsIsEmpty(lookup: Promise<string[]>): Promise<string[]> {
   try {
-    const response = await fetch(url, { headers, redirect: "manual" });
+    return await lookup;
+  } catch (error) {
+    if (isRecord(error) && (error.code === NOTFOUND || error.code === NODATA)) return [];
+    throw error;
+  }
+}
+
+/**
+ * The hostname's A then AAAA addresses as its zone's nameservers serve them. Caching resolvers
+ * hold an early NXDOMAIN for the zone's SOA minimum (30 minutes on Cloudflare); authoritative
+ * servers answer from the zone itself. The hostname is only ever asked of those servers.
+ */
+export async function authoritativeAddresses(
+  hostname: string,
+  newResolver: () => DnsResolver = newSystemResolver
+): Promise<string[]> {
+  const system = newResolver();
+  let nameservers: string[] = [];
+  for (let name = hostname; nameservers.length === 0 && name.includes(".");) {
+    name = name.slice(name.indexOf(".") + 1);
+    nameservers = await noRecordsIsEmpty(system.resolveNs(name));
+  }
+  const serverIps = (await Promise.all(nameservers.map((ns) => system.resolve4(ns)))).flat();
+  if (serverIps.length === 0) throw new SmokeError(`no nameserver addresses for ${hostname}`);
+  const authoritative = newResolver();
+  authoritative.setServers(serverIps);
+  const [v4, v6] = await Promise.all([
+    noRecordsIsEmpty(authoritative.resolve4(hostname)),
+    noRecordsIsEmpty(authoritative.resolve6(hostname)),
+  ]);
+  return [...v4, ...v6];
+}
+
+/** Connects every request to `address`; the URL still sets SNI and Host. */
+function pinnedLookup(address: string): LookupFunction {
+  const family = isIP(address);
+  return (_hostname, options, callback) => {
+    if (options.all) callback(null, [{ address, family }]);
+    else callback(null, address, family);
+  };
+}
+
+async function probe(
+  url: string,
+  address: string,
+  headers: Record<string, string>,
+  runId: string
+): Promise<Probe> {
+  const dispatcher = new Agent({ connect: { lookup: pinnedLookup(address) } });
+  try {
+    const response = await fetchVia(url, { headers, redirect: "manual", dispatcher });
     return {
       status: response.status,
       servedByRun: response.headers.get(RUN_HEADER) === runId,
@@ -428,6 +496,8 @@ async function probe(url: string, headers: Record<string, string>, runId: string
     };
   } catch (error) {
     return { error: describeFetchError(error) };
+  } finally {
+    await dispatcher.close();
   }
 }
 
@@ -467,17 +537,70 @@ async function poll<T>(
   return null;
 }
 
+type Reachability =
+  | { reachable: true; address: string; publishedMs: number; firstHttpsMs: number }
+  | { reachable: false; detail: string };
+
+/**
+ * Waits for the zone's nameservers to serve the hostname, then for a TLS handshake to succeed at
+ * that address. Both times are measured from `attachedAt`, the custom domain PUT.
+ */
+async function waitUntilReachable(
+  hostname: string,
+  headers: Record<string, string>,
+  runId: string,
+  attachedAt: number
+): Promise<Reachability> {
+  let lastLookup = "no lookup completed";
+  const published = await poll(DNS_PUBLISH_TIMEOUT_MS, async () => {
+    try {
+      const [address] = await authoritativeAddresses(hostname);
+      if (address) return address;
+      lastLookup = "no A/AAAA record";
+    } catch (error) {
+      lastLookup = describeFetchError(error);
+    }
+    return null;
+  });
+  if (!published) {
+    return {
+      reachable: false,
+      detail: `no authoritative A/AAAA within ${DNS_PUBLISH_TIMEOUT_MS} ms; last lookup: ${lastLookup}`,
+    };
+  }
+  const address = published.value;
+  const publishedMs = Date.now() - attachedAt;
+  let lastProbe = "no probe completed";
+  const https = await poll(CERT_WAIT_TIMEOUT_MS, async () => {
+    const response = await probe(`https://${hostname}/echo`, address, headers, runId);
+    if (!("error" in response)) return response;
+    lastProbe = response.error;
+    return null;
+  });
+  if (!https) {
+    return {
+      reachable: false,
+      detail:
+        `authoritative A/AAAA ${publishedMs} ms after the domain PUT, but no HTTPS response ` +
+        `within ${CERT_WAIT_TIMEOUT_MS} ms; last probe: ${lastProbe}`,
+    };
+  }
+  return { reachable: true, address, publishedMs, firstHttpsMs: Date.now() - attachedAt };
+}
+
 type EchoOutcome =
   { answered: true; assertion: string | null } | { answered: false; lastProbe: string };
 
 async function waitForEcho(
   hostname: string,
+  reach: Reachability,
   headers: Record<string, string>,
   runId: string
 ): Promise<EchoOutcome> {
+  if (!reach.reachable) return { answered: false, lastProbe: reach.detail };
   let lastProbe = "no probe completed";
   const served = await poll(ACCESS_PROPAGATION_TIMEOUT_MS, async () => {
-    const response = await probe(`https://${hostname}/echo`, headers, runId);
+    const response = await probe(`https://${hostname}/echo`, reach.address, headers, runId);
     if ("error" in response || !response.servedByRun) {
       lastProbe = describeProbe(response);
       return null;
@@ -502,13 +625,7 @@ function audiences(jwt: string | null): string[] {
 
 async function resolvesToAddress(hostname: string): Promise<boolean> {
   try {
-    const response = await fetch(
-      `https://cloudflare-dns.com/dns-query?name=${encodeURIComponent(hostname)}&type=A`,
-      { headers: { accept: "application/dns-json" } }
-    );
-    const answer: unknown = await response.json();
-    const records = isRecord(answer) && Array.isArray(answer.Answer) ? answer.Answer : [];
-    return records.some((record) => isRecord(record) && record.type === 1);
+    return (await authoritativeAddresses(hostname)).length > 0;
   } catch {
     return true;
   }
@@ -594,22 +711,17 @@ async function runLiveSmoke(env: SmokeEnv): Promise<{ runId: string; results: Ch
       `read back after each of two deployments: ${JSON.stringify(a.subdomainReads)}`
     );
     const domainA = await attachDomain(api, cleanup, { ...names("a"), zoneId: env.zoneId });
-    let lastTlsProbe = "no probe completed";
-    const tls = await poll(CERT_WAIT_TIMEOUT_MS, async () => {
-      const response = await probe(`https://${a.hostname}/echo`, serviceHeaders, runId);
-      if (!("error" in response)) return response;
-      lastTlsProbe = response.error;
-      return null;
-    });
+    const reachA = await waitUntilReachable(a.hostname, serviceHeaders, runId, Date.now());
     record(
       "certificateIssued",
-      tls !== null,
-      tls
-        ? `first HTTPS response ${tls.elapsedMs} ms after the domain PUT`
-        : `no HTTPS response within ${CERT_WAIT_TIMEOUT_MS} ms; last probe: ${lastTlsProbe}`
+      reachA.reachable,
+      reachA.reachable
+        ? `authoritative A/AAAA ${reachA.publishedMs} ms, first HTTPS response ` +
+            `${reachA.firstHttpsMs} ms after the domain PUT`
+        : reachA.detail
     );
 
-    const echoA = await waitForEcho(a.hostname, serviceHeaders, runId);
+    const echoA = await waitForEcho(a.hostname, reachA, serviceHeaders, runId);
     const audA = audiences(echoA.answered ? echoA.assertion : null);
     record(
       "exactAccessAppWins",
@@ -619,7 +731,9 @@ async function runLiveSmoke(env: SmokeEnv): Promise<{ runId: string; results: Ch
         : `the Worker never answered with the service token within ` +
             `${ACCESS_PROPAGATION_TIMEOUT_MS} ms; last probe: ${echoA.lastProbe}`
     );
-    const asset = await probe(`https://${a.hostname}${ASSET_PATH}`, serviceHeaders, runId);
+    const asset = reachA.reachable
+      ? await probe(`https://${a.hostname}${ASSET_PATH}`, reachA.address, serviceHeaders, runId)
+      : { error: reachA.detail };
     record(
       "sha256AssetHashesAccepted",
       !("error" in asset) && asset.status === 200 && asset.body === a.assetContent,
@@ -632,8 +746,9 @@ async function runLiveSmoke(env: SmokeEnv): Promise<{ runId: string; results: Ch
       runId,
     });
     await attachDomain(api, cleanup, { ...names("b"), zoneId: env.zoneId });
-    const echoB = await waitForEcho(b.hostname, serviceHeaders, runId);
-    if (!echoA.answered || !echoA.assertion || !echoB.answered) {
+    const reachB = await waitUntilReachable(b.hostname, serviceHeaders, runId, Date.now());
+    const echoB = await waitForEcho(b.hostname, reachB, serviceHeaders, runId);
+    if (!echoA.answered || !echoA.assertion || !echoB.answered || !reachB.reachable) {
       record(
         "perAppTokenRefusedAtSibling",
         false,
@@ -643,6 +758,7 @@ async function runLiveSmoke(env: SmokeEnv): Promise<{ runId: string; results: Ch
     } else {
       const replay = await probe(
         `https://${b.hostname}/echo`,
+        reachB.address,
         { "cf-access-token": echoA.assertion },
         runId
       );
@@ -672,7 +788,7 @@ async function runLiveSmoke(env: SmokeEnv): Promise<{ runId: string; results: Ch
       "takedownStopsResolution",
       gone !== null,
       gone
-        ? `no A record ${gone.elapsedMs} ms after takedown`
+        ? `no authoritative A/AAAA ${gone.elapsedMs} ms after takedown`
         : `still resolving ${RESOLUTION_WAIT_TIMEOUT_MS} ms after takedown`
     );
   } catch (error) {

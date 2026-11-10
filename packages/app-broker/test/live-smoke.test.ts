@@ -1,7 +1,9 @@
 import { describe, expect, it } from "vitest";
 import {
   Cleanup,
+  type DnsResolver,
   attachDomain,
+  authoritativeAddresses,
   checkD1Atomicity,
   createCloudflareClient,
   describeFetchError,
@@ -112,6 +114,81 @@ describe("the live smoke's probe diagnostics", () => {
 
     expect(observed).toBe(
       "HTTP 302 location=https://team.cloudflareaccess.com/cdn-cgi/access/login/smoke-a.apps.example.test server=cloudflare"
+    );
+  });
+});
+
+const NAMESERVER_IP = "192.0.2.53";
+
+/**
+ * A caching resolver that serves the zone's NS records and already holds an NXDOMAIN for every app
+ * hostname, and nameservers at NAMESERVER_IP that serve `published`.
+ */
+function fakeDns(published: Record<string, { a?: string[]; aaaa?: string[] }>) {
+  const asked: { servers: string[] | null; type: string; name: string }[] = [];
+  const nxdomain = (name: string) =>
+    Object.assign(new Error(`queryA ENOTFOUND ${name}`), { code: "ENOTFOUND" });
+  const nodata = (name: string) =>
+    Object.assign(new Error(`queryNs ENODATA ${name}`), { code: "ENODATA" });
+  const newResolver = (): DnsResolver => {
+    let servers: string[] | null = null;
+    const answer = async (type: "NS" | "A" | "AAAA", name: string): Promise<string[]> => {
+      asked.push({ servers, type, name });
+      if (servers === null) {
+        if (type === "NS" && name === "example.test") return ["ns1.dns.test"];
+        if (type === "A" && name === "ns1.dns.test") return [NAMESERVER_IP];
+        if (name === "apps.example.test") throw nodata(name);
+        throw nxdomain(name);
+      }
+      const records = servers.includes(NAMESERVER_IP) ? published[name] : undefined;
+      if (!records) throw nxdomain(name);
+      return (type === "A" ? records.a : records.aaaa) ?? [];
+    };
+    return {
+      setServers: (next) => {
+        servers = next;
+      },
+      resolveNs: (name) => answer("NS", name),
+      resolve4: (name) => answer("A", name),
+      resolve6: (name) => answer("AAAA", name),
+    };
+  };
+  return { newResolver, asked };
+}
+
+describe("the live smoke's authoritative DNS lookup", () => {
+  const hostname = "smoke-a.apps.example.test";
+
+  it("returns what the zone's nameservers serve, A records first", async () => {
+    const dns = fakeDns({ [hostname]: { a: ["198.51.100.7"], aaaa: ["2001:db8::7"] } });
+
+    expect(await authoritativeAddresses(hostname, dns.newResolver)).toEqual([
+      "198.51.100.7",
+      "2001:db8::7",
+    ]);
+  });
+
+  it("reports an unpublished hostname as having no addresses", async () => {
+    const dns = fakeDns({});
+
+    expect(await authoritativeAddresses(hostname, dns.newResolver)).toEqual([]);
+  });
+
+  it("never asks the caching resolver about the hostname itself", async () => {
+    const dns = fakeDns({ [hostname]: { a: ["198.51.100.7"] } });
+
+    await authoritativeAddresses(hostname, dns.newResolver);
+
+    const hostnameQueries = dns.asked.filter((query) => query.name === hostname);
+    expect(hostnameQueries.length).toBeGreaterThan(0);
+    expect(hostnameQueries.every((query) => query.servers?.includes(NAMESERVER_IP))).toBe(true);
+  });
+
+  it("fails when no nameserver can be found", async () => {
+    const dns = fakeDns({});
+
+    await expect(authoritativeAddresses("smoke-a.elsewhere.test", dns.newResolver)).rejects.toThrow(
+      "no nameserver addresses"
     );
   });
 });
