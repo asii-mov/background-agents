@@ -1,5 +1,9 @@
 import type { ClientMessage } from "@open-inspect/shared/types/websocket";
-import type { EventResponse, ListEventsResponse } from "@open-inspect/shared/types/sandbox-events";
+import {
+  eventResponseSchema,
+  type EventResponse,
+  type ListEventsResponse,
+} from "@open-inspect/shared/types/sandbox-events";
 import {
   encodeEventTimelineCursor,
   type EventListCursor,
@@ -7,6 +11,7 @@ import {
 } from "./event-cursor";
 import type { EventRow } from "./types";
 import type { EventRepository } from "./event-repository";
+import { sessionEventSchema, type SessionEvent } from "@open-inspect/shared/types/sessions";
 import {
   sessionTimelineEventSchema,
   type ServerMessage,
@@ -110,14 +115,22 @@ function toEventStreamCursor(cursor: EventTimelineCursor): EventStreamCursor {
   };
 }
 
+/** A persisted event with its timeline position, as the trace export lists it. */
+export function toSessionEvent(event: EventRow): SessionEvent {
+  return sessionEventSchema.parse({
+    ...toEventResponse(event),
+    timelineSequence: event.timeline_sequence,
+  });
+}
+
 function toEventResponse(event: EventRow): EventResponse {
-  return {
+  return eventResponseSchema.parse({
     id: event.id,
     type: event.type,
-    data: JSON.parse(event.data) as Record<string, unknown>,
+    data: JSON.parse(event.data) as unknown,
     messageId: event.message_id,
     createdAt: event.created_at,
-  };
+  });
 }
 
 function clampHistoryLimit(limit: number | undefined): number {

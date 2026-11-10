@@ -1,6 +1,7 @@
 "use client";
 
 import { useTheme } from "next-themes";
+import { useId } from "react";
 import {
   useSyntaxHighlightPreferences,
   LIGHT_THEMES,
@@ -9,6 +10,13 @@ import {
   type SyntaxHighlightThemeDefinition,
 } from "@/hooks/use-syntax-highlight-preferences";
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
+import {
+  Select,
+  SelectTrigger,
+  SelectValue,
+  SelectContent,
+  SelectItem,
+} from "@/components/ui/select";
 import { SunIcon, MoonIcon, MonitorIcon } from "@/components/ui/icons";
 
 const COLOR_SCHEME_OPTIONS: { value: ColorSchemeMode; label: string; icon: typeof SunIcon }[] = [
@@ -30,24 +38,27 @@ function ThemeRow({
   themes: SyntaxHighlightThemeDefinition[];
   onChange: (id: string) => void;
 }) {
+  const id = useId();
   return (
-    <div className="flex items-center justify-between px-4 py-3">
+    <div className="flex flex-col gap-3 px-4 py-3 sm:flex-row sm:items-center sm:justify-between">
       <div>
-        <span className="text-sm text-foreground">{label}</span>
+        <label htmlFor={id} className="text-sm text-foreground">
+          {label}
+        </label>
         <p className="text-xs text-muted-foreground mt-0.5">{description}</p>
       </div>
-      <select
-        aria-label={label}
-        value={value}
-        onChange={(e) => onChange(e.target.value)}
-        className="text-sm bg-background border border-border rounded px-2 py-1.5 text-foreground"
-      >
-        {themes.map((t) => (
-          <option key={t.id} value={t.id}>
-            {t.label}
-          </option>
-        ))}
-      </select>
+      <Select value={value} onValueChange={onChange}>
+        <SelectTrigger id={id} className="w-full sm:w-auto">
+          <SelectValue />
+        </SelectTrigger>
+        <SelectContent>
+          {themes.map((t) => (
+            <SelectItem key={t.id} value={t.id}>
+              {t.label}
+            </SelectItem>
+          ))}
+        </SelectContent>
+      </Select>
     </div>
   );
 }
@@ -72,9 +83,9 @@ export function AppearanceSettings() {
           Customize how code is displayed in sessions.
         </p>
 
-        <div className="border border-border rounded-md divide-y divide-border-muted">
+        <div className="divide-y divide-border-muted overflow-hidden rounded-xl border border-border-muted bg-card">
           {/* Color scheme mode toggle */}
-          <div className="flex items-center justify-between px-4 py-3">
+          <div className="flex flex-col gap-3 px-4 py-3 sm:flex-row sm:items-center sm:justify-between">
             <div>
               <span className="text-sm text-foreground">Color scheme</span>
               <p className="text-xs text-muted-foreground mt-0.5">
@@ -86,6 +97,7 @@ export function AppearanceSettings() {
               variant="outline"
               size="sm"
               value={selectedColorScheme}
+              className="self-start"
               onValueChange={(value) => {
                 if (!value) return;
                 const nextMode = value as ColorSchemeMode;

@@ -1,4 +1,15 @@
 import type { Page, Request, Route } from "@playwright/test";
+import { analyticsDashboard } from "../src/lib/analytics.test-fixture";
+import { permissionsForBuiltInRole } from "../../shared/src/rbac";
+import {
+  approvedComponents,
+  componentCategories,
+  stackInventory,
+  stackPolicyPreview,
+  stackRollup,
+  type StackPolicyState,
+} from "./verification-stack-policy";
+import { appsRoute, appsState, type AppsVerificationState } from "./verification-apps";
 
 type PlatformRole = "member" | "editor" | "admin";
 type NetworkPolicy =
@@ -29,9 +40,13 @@ export interface VerificationApiState {
   sandboxNetworkPolicy: NetworkPolicy;
   sandboxWriteError: string | null;
   automation: VerificationAutomationState;
+  stackPolicy: StackPolicyState;
+  sessionSkills: Array<Record<string, unknown>>;
+  apps: AppsVerificationState;
 }
 
 const userId = "0123456789abcdef0123456789abcdef";
+const staffUserId = "fedcba9876543210fedcba9876543210";
 const commitSha = "49f948faa9258a0c61caceaf225e179651397431";
 const sourceSha256 = "4a".repeat(32);
 const revisionSha256 = "7b".repeat(32);
@@ -212,6 +227,46 @@ async function handleApi(route: Route, state: VerificationApiState): Promise<voi
     });
     return;
   }
+  if (method === "GET" && url.pathname === "/api/me/authorization") {
+    const key = state.role === "admin" ? "administrator" : "member";
+    const authorization =
+      state.role === "editor"
+        ? {
+            userId,
+            suspendedAt: null,
+            role: { id: "role_fork_catalog_editor", key: null, name: "Catalog editor" },
+            permissions: [
+              ...permissionsForBuiltInRole("member"),
+              "skills.manage",
+              "mcp_servers.manage",
+              "governance.read",
+              "governance.manage",
+            ],
+          }
+        : {
+            userId,
+            suspendedAt: null,
+            role: { id: `role_builtin_${key}`, key, name: key },
+            permissions: permissionsForBuiltInRole(key),
+          };
+    await json(route, authorization);
+    return;
+  }
+  if (
+    method === "GET" &&
+    ["/api/me/teams", "/api/teams", "/api/settings/teams"].includes(url.pathname)
+  ) {
+    await json(route, {
+      teams: [],
+      capabilities: { canListAllTeams: state.role === "admin" },
+      requireTeamOnCreate: false,
+    });
+    return;
+  }
+  if (method === "GET" && url.pathname === "/api/memory-preferences") {
+    await json(route, { includeMemories: true });
+    return;
+  }
   if (method === "GET" && url.pathname === "/api/keyboard-shortcuts") {
     await json(route, keyboardShortcuts);
     return;
@@ -274,7 +329,7 @@ async function handleApi(route: Route, state: VerificationApiState): Promise<voi
     return;
   }
   if (method === "POST" && url.pathname === "/api/sessions") {
-    await json(route, { sessionId: "session-verification" }, 201);
+    await json(route, { sessionId: "session-verification", status: "active" }, 201);
     return;
   }
   if (method === "POST" && url.pathname === "/api/sessions/session-verification/prompt") {
@@ -308,6 +363,24 @@ async function handleApi(route: Route, state: VerificationApiState): Promise<voi
     });
     return;
   }
+  if (
+    method === "GET" &&
+    url.pathname === "/api/sessions/session-verification/collaborator-candidates"
+  ) {
+    await json(route, []);
+    return;
+  }
+  if (method === "GET" && url.pathname === "/api/sessions/session-verification/memories") {
+    await json(route, {
+      includePersonalMemories: true,
+      directiveChars: 0,
+      catalogChars: 0,
+      estimatedTokens: 0,
+      omittedCount: 0,
+      items: [],
+    });
+    return;
+  }
   if (method === "GET" && url.pathname === "/api/sessions/session-verification/children") {
     await json(route, { children: [] });
     return;
@@ -318,7 +391,7 @@ async function handleApi(route: Route, state: VerificationApiState): Promise<voi
       resolverVersion: 2,
       selection: { mode: "all" },
       resolvedAt: now,
-      skills: [],
+      skills: state.sessionSkills,
     });
     return;
   }
@@ -380,11 +453,11 @@ async function handleApi(route: Route, state: VerificationApiState): Promise<voi
   }
   if (method === "PATCH" && url.pathname === "/api/sessions/session-verification/read-state") {
     await json(route, {
-      readState: {
-        latestMessageId: "message-assistant-live-1",
-        latestMessageCreatedAt: now + 3_000,
-        latestMessageReadAt: now + 4_000,
-      },
+      sessionId: "session-verification",
+      outcome: "marked_read",
+      unread: false,
+      latestMessageId: "message-assistant-live-1",
+      version: 1,
     });
     return;
   }
@@ -405,6 +478,10 @@ async function handleApi(route: Route, state: VerificationApiState): Promise<voi
       automations: [
         {
           id: "automation-security-review",
+          harness: "opencode",
+          userId,
+          ownerTeamId: null,
+          capabilities: { canRead: true, canManage: true, canTrigger: true },
           name: "Nightly identity security review",
           instructions: "Review identity changes for security regressions.",
           triggerType: "schedule",
@@ -444,6 +521,16 @@ async function handleApi(route: Route, state: VerificationApiState): Promise<voi
   if (method === "POST" && url.pathname === "/api/automations/automation-security-review/trigger") {
     state.automation.triggered = true;
     await json(route, { invocationId: "invocation-manual-1" }, 202);
+    return;
+  }
+  if (method === "GET" && url.pathname === "/api/analytics/dashboard") {
+    const snapshot = analyticsDashboard();
+    const days = Number(url.searchParams.get("days"));
+    if (days !== 7 && days !== 14 && days !== 30 && days !== 90)
+      throw new Error("Unexpected analytics range");
+    snapshot.window.days = days;
+    snapshot.window.startAt = snapshot.window.endAt - days * 86_400_000;
+    await json(route, snapshot);
     return;
   }
   if (method === "GET" && url.pathname === "/api/analytics/summary") {
@@ -594,7 +681,46 @@ async function handleApi(route: Route, state: VerificationApiState): Promise<voi
     return;
   }
   if (method === "GET" && url.pathname === "/api/approved-components") {
-    await json(route, []);
+    await json(route, approvedComponents());
+    return;
+  }
+  if (method === "GET" && url.pathname === "/api/component-categories") {
+    await json(route, componentCategories(state.stackPolicy));
+    return;
+  }
+  if (method === "PUT" && url.pathname === "/api/component-categories/web-frontend") {
+    const input = body as { enforcement?: "advise" | "block"; revision?: number };
+    if (state.role === "member" || !input.enforcement) {
+      await json(route, { error: "Forbidden" }, 403);
+      return;
+    }
+    state.stackPolicy.webFrontendEnforcement = input.enforcement;
+    state.stackPolicy.webFrontendRevision += 1;
+    await json(route, componentCategories(state.stackPolicy)[3]);
+    return;
+  }
+  if (method === "GET" && url.pathname === "/api/stack-policy/preview") {
+    await json(route, stackPolicyPreview(state.stackPolicy, url.searchParams.get("repo")));
+    return;
+  }
+  if (method === "GET" && url.pathname === "/api/stack-inventory") {
+    await json(route, stackInventory());
+    return;
+  }
+  if (method === "GET" && url.pathname === "/api/stack-inventory/rollup") {
+    await json(route, stackRollup());
+    return;
+  }
+  if (method === "GET" && url.pathname === "/api/app-data/inventory") {
+    await json(route, { error: "Not found" }, 404);
+    return;
+  }
+  const appsResponse = appsRoute(state.apps, url.pathname, method, body, {
+    userId,
+    manageAny: state.role === "admin",
+  });
+  if (appsResponse) {
+    await json(route, appsResponse.body, appsResponse.status);
     return;
   }
   if (method === "GET" && url.pathname === "/api/security-pipelines") {
@@ -682,6 +808,12 @@ export async function installVerificationApi(page: Page): Promise<VerificationAp
     sandboxNetworkPolicy: { mode: "unrestricted" },
     sandboxWriteError: null,
     automation: { triggered: false },
+    stackPolicy: { webFrontendEnforcement: "advise", webFrontendRevision: 1 },
+    sessionSkills: [],
+    apps: appsState(
+      { userId, displayName: "Verifier Admin" },
+      { userId: staffUserId, displayName: "Staff Engineer" }
+    ),
   };
   await page.route("**/api/**", (route) => handleApi(route, state));
   return state;

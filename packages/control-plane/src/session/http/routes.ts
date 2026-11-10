@@ -19,6 +19,7 @@ export interface SessionInternalRoute {
   handler: SessionInternalRouteHandler;
 }
 
+/** Handlers required to serve every internal SessionDO HTTP route. */
 export interface SessionInternalRouteHandlers {
   init: SessionInternalRouteHandler;
   state: SessionInternalRouteHandler;
@@ -28,18 +29,20 @@ export interface SessionInternalRouteHandlers {
   autofix: SessionInternalRouteHandler;
   stop: SessionInternalRouteHandler;
   sandboxEvent: SessionInternalRouteHandler;
+  sandboxError: SessionInternalRouteHandler;
   createMediaArtifact: SessionInternalRouteHandler;
   recordAttachment: SessionInternalRouteHandler;
   listParticipants: SessionInternalRouteHandler;
-  addParticipant: SessionInternalRouteHandler;
   listEvents: SessionInternalRouteHandler;
   listArtifacts: SessionInternalRouteHandler;
   listMessages: SessionInternalRouteHandler;
+  exportTrace: SessionInternalRouteHandler;
   createPr: SessionInternalRouteHandler;
   pullRequestArtifactSnapshot: SessionInternalRouteHandler;
   pullRequestsRefresh: SessionInternalRouteHandler;
   wsToken: SessionInternalRouteHandler;
   updateTitle: SessionInternalRouteHandler;
+  budget: SessionInternalRouteHandler;
   archive: SessionInternalRouteHandler;
   unarchive: SessionInternalRouteHandler;
   expireDraft: SessionInternalRouteHandler;
@@ -81,6 +84,7 @@ export function createSessionInternalRoutes(
     { method: "POST", path: SessionInternalPaths.autofix, handler: handlers.autofix },
     { method: "POST", path: SessionInternalPaths.stop, handler: handlers.stop },
     { method: "POST", path: SessionInternalPaths.sandboxEvent, handler: handlers.sandboxEvent },
+    { method: "POST", path: SessionInternalPaths.sandboxError, handler: handlers.sandboxError },
     {
       method: "POST",
       path: SessionInternalPaths.createMediaArtifact,
@@ -92,14 +96,10 @@ export function createSessionInternalRoutes(
       path: SessionInternalPaths.participants,
       handler: handlers.listParticipants,
     },
-    {
-      method: "POST",
-      path: SessionInternalPaths.participants,
-      handler: handlers.addParticipant,
-    },
     { method: "GET", path: SessionInternalPaths.events, handler: handlers.listEvents },
     { method: "GET", path: SessionInternalPaths.artifacts, handler: handlers.listArtifacts },
     { method: "GET", path: SessionInternalPaths.messages, handler: handlers.listMessages },
+    { method: "GET", path: SessionInternalPaths.traceExport, handler: handlers.exportTrace },
     { method: "POST", path: SessionInternalPaths.createPr, handler: handlers.createPr },
     {
       method: "POST",
@@ -113,6 +113,7 @@ export function createSessionInternalRoutes(
     },
     { method: "POST", path: SessionInternalPaths.wsToken, handler: handlers.wsToken },
     { method: "POST", path: SessionInternalPaths.updateTitle, handler: handlers.updateTitle },
+    { method: "POST", path: SessionInternalPaths.budget, handler: handlers.budget },
     { method: "POST", path: SessionInternalPaths.archive, handler: handlers.archive },
     { method: "POST", path: SessionInternalPaths.unarchive, handler: handlers.unarchive },
     { method: "POST", path: SessionInternalPaths.expireDraft, handler: handlers.expireDraft },

@@ -1,7 +1,7 @@
 import { resolveBuildTimeoutSeconds } from "@open-inspect/shared/types/integrations";
 import { createLogger, type CorrelationContext } from "../logger";
-import { createSourceControlProviderFromEnv, resolveScmProviderFromEnv } from "../source-control";
-import { scmCloneIdentity } from "../sandbox/sandbox-env";
+import { readCachedInstallationRepositories } from "../repos/cache";
+import { createSourceControlProviderFromEnv } from "../source-control";
 import { prepareLegacyManagedProviderEnv } from "../sandbox/managed-provider-env";
 import type { Env } from "../types";
 import type { SqlDatabase } from "../db/sql-database";
@@ -10,6 +10,7 @@ import {
   hashImageBuildCallbackToken,
   IMAGE_BUILD_CALLBACK_TOKEN_TTL_MS,
 } from "./callback-auth";
+import { resolveImageBuildTokenScope } from "./credential-scope";
 import type { ImageBuildScope } from "./model";
 import {
   loadScopeBuildSecrets,
@@ -31,11 +32,29 @@ export interface PlannedCallbackAuth {
 
 export type { ResolvedImageBuildTarget } from "./scope";
 
+/** Inputs for planBuild; the target is resolved before registration, secrets after. */
+export interface ImageBuildPlanRequest {
+  buildId: string;
+  scope: ImageBuildScope;
+  callbackUrl: string;
+  failureCallbackUrl: string;
+  correlation: CorrelationContext;
+  target: ResolvedImageBuildTarget;
+  callbackAuth: PlannedCallbackAuth;
+}
+
+/** The planning operations the workflow sequences a build through. */
+export interface ImageBuildPlannerPort {
+  resolveTarget(scope: ImageBuildScope): Promise<ResolvedImageBuildTarget>;
+  createCallbackAuth(): Promise<PlannedCallbackAuth>;
+  planBuild(params: ImageBuildPlanRequest): Promise<ImageBuildPlan>;
+}
+
 /**
  * Resolves a trigger request into a concrete provider build plan.
  *
  * The planner is the only image-build layer that loads secrets, and it leans
- * on scope.ts for everything kind-specific. Split deliberately: resolveTarget
+ * on scope.ts for targets, settings and secrets. Split deliberately: resolveTarget
  * and createCallbackAuth run BEFORE the build row is registered (cheap D1
  * read + pure crypto), while planBuild — which decrypts secrets — runs AFTER,
  * so a concurrent secret change always sees a row to supersede and the
@@ -44,7 +63,7 @@ export type { ResolvedImageBuildTarget } from "./scope";
  * timeout honors the primary repository's sandbox settings with the scope's
  * own overrides layered on top.
  */
-export class ImageBuildPlanner {
+export class ImageBuildPlanner implements ImageBuildPlannerPort {
   constructor(
     private readonly env: Env,
     private readonly db: SqlDatabase
@@ -63,15 +82,7 @@ export class ImageBuildPlanner {
     };
   }
 
-  async planBuild(params: {
-    buildId: string;
-    scope: ImageBuildScope;
-    callbackUrl: string;
-    failureCallbackUrl: string;
-    correlation: CorrelationContext;
-    target: ResolvedImageBuildTarget;
-    callbackAuth: PlannedCallbackAuth;
-  }): Promise<ImageBuildPlan> {
+  async planBuild(params: ImageBuildPlanRequest): Promise<ImageBuildPlan> {
     const { repositories, repositoriesFingerprint } = params.target;
     const primary = repositories[0];
 
@@ -89,6 +100,7 @@ export class ImageBuildPlanner {
       callbackUrl: params.callbackUrl,
       failureCallbackUrl: params.failureCallbackUrl,
       buildTimeoutMs: resolveBuildTimeoutSeconds(sandboxSettings) * MS_PER_SECOND,
+      resources: { cpuCores: sandboxSettings.cpuCores, memoryMib: sandboxSettings.memoryMib },
       userEnvVars: userEnvVars
         ? prepareLegacyManagedProviderEnv({
             exposedSecrets: userEnvVars,
@@ -113,28 +125,12 @@ export class ImageBuildPlanner {
     target: ResolvedImageBuildTarget
   ): Promise<ImageBuildCloneAuth> {
     try {
+      const tokenScope = await resolveImageBuildTokenScope(this.db, scope, target, () =>
+        readCachedInstallationRepositories(this.env)
+      );
       const provider = createSourceControlProviderFromEnv(this.env);
-      const [primary, ...rest] = target.repositories;
-      const auth = await provider.generateCredentialHelperAuth({
-        repositories: [
-          {
-            owner: primary.repoOwner,
-            name: primary.repoName,
-            providerRepoId: target.kind === "repo" ? target.repoId : null,
-          },
-          ...rest.map((repository) => ({
-            owner: repository.repoOwner,
-            name: repository.repoName,
-            providerRepoId: null,
-          })),
-        ],
-      });
-      return {
-        type: "credential_helper",
-        host: scmCloneIdentity(resolveScmProviderFromEnv(this.env.SCM_PROVIDER)).host,
-        username: auth.username,
-        token: auth.password,
-      };
+      const auth = await provider.generateCredentialHelperAuth(tokenScope);
+      return { type: "credential_helper", token: auth.password };
     } catch (e) {
       logger.warn("image_build.clone_token_failed", {
         error: e instanceof Error ? e.message : String(e),

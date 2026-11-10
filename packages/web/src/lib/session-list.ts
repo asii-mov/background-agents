@@ -5,11 +5,26 @@ import {
   SESSION_LIST_CURRENT_USER,
   type SessionListQuery,
 } from "@open-inspect/shared/session-list-query";
-import type { Session } from "@open-inspect/shared/types/sessions";
-import type { BrowserApiPath } from "./browser-api-fetch";
+import {
+  sessionListResponseSchema,
+  sessionListSummarySchema,
+  type SessionListResponse,
+  type SessionListSummary,
+} from "@open-inspect/shared/types/sessions";
+import { z } from "zod";
+import { browserApiFetch, type BrowserApiPath } from "./browser-api-fetch";
 import { formatRepoLabel } from "./repo-label";
+import { sessionReadStateClientSchema } from "./session-read-state";
 
-export const SESSIONS_PAGE_SIZE = DEFAULT_SESSION_LIST_LIMIT;
+const sessionListClientResponseSchema = sessionListResponseSchema.extend({
+  sessions: z.array(
+    sessionListSummarySchema.extend({
+      readState: sessionReadStateClientSchema.optional(),
+    })
+  ),
+});
+
+const SESSIONS_PAGE_SIZE = DEFAULT_SESSION_LIST_LIMIT;
 const COMMAND_MENU_SESSIONS_LIMIT = 100;
 const SESSIONS_API_PATH = "/api/sessions";
 export const CURRENT_USER_CREATED_BY = SESSION_LIST_CURRENT_USER;
@@ -23,9 +38,13 @@ export const COMMAND_MENU_SESSIONS_KEY = buildSessionsPageKey({
   limit: COMMAND_MENU_SESSIONS_LIMIT,
 });
 
-export interface SessionListResponse {
-  sessions: Session[];
-  hasMore: boolean;
+export type SessionListItem = SessionListSummary;
+export type { SessionListResponse };
+
+export async function fetchSessionListPage(path: BrowserApiPath): Promise<SessionListResponse> {
+  const response = await browserApiFetch(path);
+  if (!response.ok) throw new Error(`Fetch failed: ${response.status}`);
+  return sessionListClientResponseSchema.parse(await response.json());
 }
 
 export function buildSessionsPageKey(options: SessionListQuery = {}): BrowserApiPath {
@@ -59,50 +78,11 @@ export function isArchivedSessionListKey(key: unknown): key is string {
   return url.searchParams.get("status") === "archived";
 }
 
-// Extracted from session-sidebar so the cache-shape transformation can be unit
-// tested without rendering the component or going through Radix/SWR.
-export function applyTitleUpdate(
-  data: SessionListResponse | undefined,
-  sessionId: string,
-  title: string | null
-): SessionListResponse | undefined {
-  if (!data) return data;
-  return {
-    ...data,
-    sessions: data.sessions.map((session) =>
-      session.id === sessionId ? { ...session, title } : session
-    ),
-  };
-}
-
-export function applySessionReadState(
-  data: SessionListResponse | undefined,
-  sessionId: string,
-  readState: Session["readState"]
-): SessionListResponse | undefined {
-  if (!data) return data;
-  return {
-    ...data,
-    sessions: data.sessions.map((session) => {
-      if (session.id !== sessionId) return session;
-      if (!readState) return session;
-      const currentMessageId = session.readState?.latestMessageId;
-      if (currentMessageId !== undefined && currentMessageId !== readState.latestMessageId) {
-        return session;
-      }
-      return {
-        ...session,
-        readState,
-      };
-    }),
-  };
-}
-
-export function removeSessionFromList(sessions: Session[], sessionId: string) {
+export function removeSessionFromList(sessions: SessionListItem[], sessionId: string) {
   return sessions.filter((session) => session.id !== sessionId);
 }
 
-export function buildSessionSearchValue(session: Session): string {
+export function buildSessionSearchValue(session: SessionListItem): string {
   const repositoryLabels = session.repositories?.length
     ? session.repositories.map((repository) =>
         formatRepoLabel(repository.repoOwner, repository.repoName)
@@ -118,7 +98,7 @@ export function buildSessionSearchValue(session: Session): string {
  * session payload loads.
  */
 export function buildSessionHref(
-  session: Pick<Session, "id" | "title" | "repoOwner" | "repoName">
+  session: Pick<SessionListItem, "id" | "title" | "repoOwner" | "repoName">
 ) {
   const query: Record<string, string> = {};
   if (session.repoOwner && session.repoName) {

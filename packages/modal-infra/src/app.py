@@ -13,6 +13,8 @@ import modal
 
 import sandbox_runtime
 
+from .app_config import APP_NAME
+from .images.base import deployed_image_environment
 from .log_config import get_logger
 
 # Path to sandbox_runtime source — bundled into function_image so shims can resolve
@@ -21,7 +23,7 @@ _SANDBOX_RUNTIME_DIR = Path(sandbox_runtime.__file__).parent
 log = get_logger("app")
 
 # Main Modal application
-app = modal.App("open-inspect")
+app = modal.App(APP_NAME)
 
 # Image for Modal functions (not sandbox)
 # Includes all dependencies needed by the function modules at import time
@@ -32,24 +34,10 @@ function_image = (
         "httpx",
         "fastapi",
         "modal",  # Required for sandbox.manager imports
-        "PyJWT[crypto]",  # For GitHub App token generation
     )
     # Bundle sandbox_runtime so modal-infra shims can import from it at runtime
-    .add_local_dir(str(_SANDBOX_RUNTIME_DIR), remote_path="/root/sandbox_runtime")
-)
-
-# Secrets for LLM API keys - defined in Modal dashboard or CLI
-# These are injected into sandboxes but never stored in snapshots
-llm_secrets = modal.Secret.from_name(
-    "llm-api-keys",
-    required_keys=["ANTHROPIC_API_KEY"],
-)
-
-# Secrets for GitHub App - used for git operations (clone, push)
-# These are used to generate installation tokens, NOT injected into sandboxes
-github_app_secrets = modal.Secret.from_name(
-    "github-app",
-    required_keys=["GITHUB_APP_ID", "GITHUB_APP_PRIVATE_KEY", "GITHUB_APP_INSTALLATION_ID"],
+    .add_local_dir(str(_SANDBOX_RUNTIME_DIR), remote_path="/root/sandbox_runtime", copy=True)
+    .env(deployed_image_environment())
 )
 
 # Secret for internal API authentication and deployment configuration.
@@ -57,8 +45,6 @@ github_app_secrets = modal.Secret.from_name(
 #   MODAL_API_SECRET: verify requests from control plane to Modal endpoints
 # Optional keys (add to the same secret as needed):
 #   ALLOWED_CONTROL_PLANE_HOSTS: comma-separated list of permitted callback hosts
-#   SCM_PROVIDER: "github" (default) or "gitlab" — selects the clone credential type
-#   GITLAB_ACCESS_TOKEN: GitLab PAT used as clone credential when SCM_PROVIDER=gitlab
 internal_api_secret = modal.Secret.from_name(
     "internal-api",
     required_keys=["MODAL_API_SECRET"],

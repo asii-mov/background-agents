@@ -1,3 +1,8 @@
+import { checkHarnessCompatibility } from "@open-inspect/shared/harnesses";
+import { parseBody } from "./body";
+import { Hono } from "hono";
+import { admit } from "../routing/admit";
+import type { ControlPlaneHonoEnv } from "../routing/hono-env";
 import { spawnChildSessionRequestSchema } from "@open-inspect/shared/types/session-api";
 import {
   DEFAULT_MAX_CONCURRENT_CHILD_SESSIONS,
@@ -16,6 +21,7 @@ import {
 import { generateId } from "../auth/crypto";
 import { getEffectiveEnabledModels } from "../db/model-preferences";
 import { SessionIndexStore } from "../db/session-index";
+import { TeamMembershipStore } from "../db/team-memberships";
 import { createLogger } from "../logger";
 import { SessionInternalPaths } from "../session/contracts";
 import type { EnqueuePromptRequest } from "../session/enqueue-prompt-contract";
@@ -28,33 +34,40 @@ import {
 import { spawnContextSchema } from "../session/spawn-context";
 import type { Env } from "../types";
 import {
-  defineRoutes,
   error,
   GITHUB_SANDBOX_FALLBACK_ROUTE,
   json,
-  parsePattern,
-  type Route,
+  permissionRequirement,
+  sessionRequirement,
+  requireAll,
+  resolveRepoOrError,
 } from "./shared";
-import { sessionRoute, type SessionRouteContext } from "./session-route";
+import { type SessionRouteContext, dispatchSession } from "./session-route";
 import { DEFAULT_BASE_BRANCH } from "../repos/default-branch";
+import { inheritedPin } from "../session/pinned";
+import { authorizeEnvironmentTarget, authorizeSessionTarget } from "./session-target-authorization";
 
 const logger = createLogger("router:session-child-spawn");
 const MAX_SPAWN_DEPTH = 2;
 
-async function handleSpawnChild(
+function isJsonRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+export async function handleSpawnChild(
   request: Request,
   env: Env,
-  match: RegExpMatchArray,
+  params: { id: string },
   ctx: SessionRouteContext
 ): Promise<Response> {
-  const parentId = match.groups?.id;
-  if (!parentId) return error("Parent session ID required");
+  const parentId = params.id;
 
-  const parsedBody = spawnChildSessionRequestSchema.safeParse(await request.json());
-  if (!parsedBody.success) {
-    return error("title and prompt are required");
-  }
-  const body = parsedBody.data;
+  const body = await parseBody(
+    request,
+    spawnChildSessionRequestSchema,
+    "title and prompt are required"
+  );
+  if (body instanceof Response) return body;
 
   if (!body.title || !body.prompt) {
     return error("title and prompt are required");
@@ -64,6 +77,22 @@ async function handleSpawnChild(
 
   const parentSession = await sessionStore.get(parentId);
   const parentEnvironmentId = parentSession?.environmentId ?? null;
+  // Reject an incompatible inherited environment before settings resolution or child admission.
+  // The permission preflight runs first so a missing grant keeps its permission_required shape.
+  if (parentEnvironmentId) {
+    const permissionError = await authorizeSessionTarget(ctx, {
+      teamId: null,
+      environmentId: parentEnvironmentId,
+    });
+    if (permissionError) return permissionError;
+    const environmentError = await authorizeEnvironmentTarget(ctx, {
+      environmentId: parentEnvironmentId,
+      ownerTeamId: parentSession?.ownerTeamId ?? null,
+      inherited: true,
+    });
+    if (environmentError) return environmentError;
+  }
+
   // Children inherit the parent's settings scope: its primary repo plus, for
   // environment-launched parents, that environment's overrides (design §13.5).
   const resolvedChildSandboxSettings = parentSession
@@ -98,8 +127,8 @@ async function handleSpawnChild(
   if (!spawnContextRes.ok) {
     let message = "Failed to get parent session context";
     try {
-      const body = (await spawnContextRes.json()) as { error?: unknown };
-      if (typeof body.error === "string" && body.error.length > 0) {
+      const body = await spawnContextRes.json();
+      if (isJsonRecord(body) && typeof body.error === "string" && body.error.length > 0) {
         message = body.error;
       }
     } catch {
@@ -113,11 +142,17 @@ async function handleSpawnChild(
     return error("Failed to get parent session context", 500);
   }
   const spawnContext = parsedSpawnContext.data;
-  const { sandboxTimeoutMs: _currentTimeoutMs, ...resolvedChildSettingsWithoutTimeout } =
-    resolvedChildSandboxSettings;
+  const {
+    sandboxTimeoutMs: _currentTimeoutMs,
+    finalSnapshotBufferMs: _currentBufferMs,
+    ...resolvedChildSettingsWithoutTimeout
+  } = resolvedChildSandboxSettings;
   const childSandboxSettings: SandboxSettings = resolvedChildSettingsWithoutTimeout;
   if (spawnContext.sandboxTimeoutMs !== undefined) {
     childSandboxSettings.sandboxTimeoutMs = spawnContext.sandboxTimeoutMs;
+  }
+  if (spawnContext.finalSnapshotBufferMs !== undefined) {
+    childSandboxSettings.finalSnapshotBufferMs = spawnContext.finalSnapshotBufferMs;
   }
 
   const requestedRepoOwner = body.repoOwner?.trim().toLowerCase() || null;
@@ -138,6 +173,44 @@ async function handleSpawnChild(
       return error("Child sessions must use the same repository as the parent", 403);
     }
   }
+
+  const inheritedRepositories =
+    parentRepoOwner && parentRepoName ? [{ owner: parentRepoOwner, name: parentRepoName }] : [];
+  const targetAuthorizationError = await authorizeSessionTarget(ctx, {
+    teamId: null,
+    environmentId: parentEnvironmentId,
+    repositories: inheritedRepositories,
+  });
+  if (targetAuthorizationError) return targetAuthorizationError;
+
+  const teamId = parentSession?.ownerTeamId ?? null;
+  // Sandbox callers skip route authorization. Require the active author's own
+  // team membership rather than borrowing the parent's ownership fallback.
+  const childOwnerUserId =
+    spawnContext.promptAuthor.canonicalUserId ??
+    (teamId === null ? (parentSession?.userId ?? null) : null);
+  if (
+    teamId &&
+    (!childOwnerUserId ||
+      !(await new TeamMembershipStore(ctx.db).listForUser(childOwnerUserId)).has(teamId))
+  ) {
+    return json({ error: "Not a team member", code: "not_member" }, 403);
+  }
+
+  let childRepoId = spawnContext.repoId;
+  if (teamId && parentRepoOwner && parentRepoName) {
+    const resolved = await resolveRepoOrError(env, parentRepoOwner, parentRepoName, ctx, logger);
+    childRepoId = resolved.repoId;
+  }
+  const resolvedTargetAuthorizationError = await authorizeSessionTarget(ctx, {
+    teamId,
+    environmentId: parentEnvironmentId,
+    repositories: inheritedRepositories.map((repository) => ({
+      ...repository,
+      repoId: childRepoId,
+    })),
+  });
+  if (resolvedTargetAuthorizationError) return resolvedTargetAuthorizationError;
 
   let enabledModels: ValidModel[];
   try {
@@ -160,6 +233,12 @@ async function handleSpawnChild(
     return error(`Model "${body.model}" is not enabled`, 400);
   }
   const model = resolveEnabledModel({ model: requestedModel, enabledModels });
+  // The child runs on the parent's harness; the requested model must run there.
+  const harness = spawnContext.harness;
+  const harnessIncompatibility = checkHarnessCompatibility(harness, model);
+  if (harnessIncompatibility) {
+    return error(harnessIncompatibility.message, 400);
+  }
   if (body.reasoningEffort !== undefined && !isValidReasoningEffort(model, body.reasoningEffort)) {
     const validEfforts = getReasoningConfig(model)?.efforts;
     const suffix = validEfforts?.length
@@ -189,6 +268,14 @@ async function handleSpawnChild(
     });
     return error("Parent provider auth unavailable", 503);
   }
+  // The child inherits the parent's auth modes but may run a different model,
+  // so the auth half of the harness rule is checked against the child's model.
+  const harnessAuthIncompatibility = checkHarnessCompatibility(
+    harness,
+    model,
+    Object.fromEntries(providerAuth.map((auth) => [auth.provider, auth.authMode]))
+  );
+  if (harnessAuthIncompatibility) return error(harnessAuthIncompatibility.message, 400);
 
   const childDepth = parentDepth + 1;
   const childId = generateId();
@@ -215,27 +302,29 @@ async function handleSpawnChild(
   );
 
   const input: SessionInitInput = {
+    ownerTeamId: teamId,
+    visibility: parentSession?.visibility ?? "workspace",
     sessionId: childId,
     repoOwner: spawnContext.repoOwner,
     repoName: spawnContext.repoName,
-    repoId: spawnContext.repoId,
+    repoId: childRepoId,
     environmentId: parentEnvironmentId,
     branch:
       spawnContext.repoOwner && spawnContext.repoName
         ? (spawnContext.baseBranch ?? DEFAULT_BASE_BRANCH)
         : null,
     title: body.title,
+    harness,
     model,
     reasoningEffort,
     participantUserId: spawnContext.promptAuthor.userId,
-    platformUserId: spawnContext.promptAuthor.canonicalUserId ?? null,
+    platformUserId: childOwnerUserId,
+    participantCanonicalUserId: spawnContext.promptAuthor.canonicalUserId ?? null,
+    collaboratorSourceSessionId: parentId,
     scmLogin: spawnContext.promptAuthor.scmLogin,
     scmName: spawnContext.promptAuthor.scmName,
     scmEmail: spawnContext.promptAuthor.scmEmail,
     scmUserId: spawnContext.promptAuthor.scmUserId,
-    scmTokenEncrypted: spawnContext.promptAuthor.scmAccessTokenEncrypted,
-    scmRefreshTokenEncrypted: spawnContext.promptAuthor.scmRefreshTokenEncrypted,
-    scmTokenExpiresAt: spawnContext.promptAuthor.scmTokenExpiresAt,
     codeServerEnabled: childCodeServerEnabled,
     vncEnabled: childVncEnabled,
     sandboxSettings: childSandboxSettings,
@@ -244,7 +333,8 @@ async function handleSpawnChild(
     spawnDepth: childDepth,
     automationId: parentSession?.automationId ?? null,
     automationRunId: parentSession?.automationRunId ?? null,
-    managedSkillsSourceSessionId: parentId,
+    managedSkills: inheritedPin(parentId),
+    memory: inheritedPin(parentId),
     providerAuth: providerAuth.map((auth) => ({
       ...auth,
       inheritedFromSessionId: parentId,
@@ -338,10 +428,16 @@ async function handleSpawnChild(
   return json({ sessionId: childId, status: "created" }, 201);
 }
 
-export const sessionChildSpawnRoutes: Route[] = defineRoutes(GITHUB_SANDBOX_FALLBACK_ROUTE, [
-  sessionRoute({
-    method: "POST",
-    pattern: parsePattern("/sessions/:id/children"),
-    handler: handleSpawnChild,
+export const sessionChildSpawnRoutes = new Hono<ControlPlaneHonoEnv>();
+
+sessionChildSpawnRoutes.post(
+  "/sessions/:id/children",
+  admit({
+    ...GITHUB_SANDBOX_FALLBACK_ROUTE,
+    authorization: requireAll(
+      sessionRequirement("collaborate"),
+      permissionRequirement("sessions.create")
+    ),
   }),
-]);
+  (c) => dispatchSession(c, handleSpawnChild)
+);

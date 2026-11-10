@@ -1,6 +1,7 @@
 # Open-Inspect Control Plane
 
-Cloudflare Workers + Durable Objects control plane for session management and real-time streaming.
+Cloudflare Workers + Hono + Durable Objects control plane for session management and real-time
+streaming.
 
 ## Overview
 
@@ -21,8 +22,11 @@ The control plane provides:
 ┌─────────────────────────────────────────────────────────────────┐
 │                    Cloudflare Workers                            │
 │  ┌──────────────────────────────────────────────────────────┐   │
-│  │                   API Gateway (router.ts)                 │   │
-│  │   POST /sessions  │  GET /sessions/:id  │  WebSocket      │   │
+│  │                  Worker fetch entrypoint                 │   │
+│  │  ┌──────────────────────────────────┐  ┌───────────────┐ │   │
+│  │  │ Hono HTTP API + Route Admission  │  │  WebSocket    │ │   │
+│  │  │ POST /sessions  GET /sessions/:id│  │  upgrade*     │ │   │
+│  │  └──────────────────────────────────┘  └───────────────┘ │   │
 │  └─────────────────────────────┬────────────────────────────┘   │
 │                                │                                 │
 │  ┌─────────────────────────────┴────────────────────────────┐   │
@@ -45,6 +49,12 @@ The control plane provides:
 └─────────────────────────────────────────────────────────────────┘
 ```
 
+Hono selects ordinary HTTP routes from the framework-neutral catalog. Authentication, service
+principal admission, canonical actor resolution, RBAC, sandbox capabilities, and route-specific
+authorization remain in the shared admission layer. WebSocket upgrades (`*` above), scheduled
+events, Queues, and Durable Object lifecycle callbacks stay at the Cloudflare Worker boundary and do
+not pass through Hono.
+
 ## API Endpoints
 
 ### Health
@@ -55,25 +65,26 @@ The control plane provides:
 
 ### Sessions
 
-| Endpoint                        | Method    | Description                    |
-| ------------------------------- | --------- | ------------------------------ |
-| `/sessions`                     | GET       | List user's sessions           |
-| `/sessions`                     | POST      | Create new session             |
-| `/sessions/:id`                 | GET       | Get canonical session snapshot |
-| `/sessions/:id`                 | DELETE    | Delete session                 |
-| `/sessions/:id/sandbox-access`  | GET       | Get sandbox connection details |
-| `/sessions/:id/prompt`          | POST      | Enqueue prompt                 |
-| `/sessions/:id/stop`            | POST      | Stop execution                 |
-| `/sessions/:id/ws`              | WebSocket | Real-time connection           |
-| `/sessions/:id/events`          | GET       | Paginated events               |
-| `/sessions/:id/artifacts`       | GET       | List artifacts                 |
-| `/sessions/:id/participants`    | GET/POST  | Manage participants            |
-| `/sessions/:id/messages`        | GET       | List messages                  |
-| `/sessions/:id/pr`              | POST      | Create pull request            |
-| `/sessions/:id/scm-credentials` | POST      | Broker sandbox git credentials |
-| `/sessions/:id/ws-token`        | POST      | Generate WebSocket token       |
-| `/sessions/:id/archive`         | POST      | Archive session                |
-| `/sessions/:id/unarchive`       | POST      | Unarchive session              |
+| Endpoint                        | Method    | Description                          |
+| ------------------------------- | --------- | ------------------------------------ |
+| `/sessions`                     | GET       | List workspace sessions              |
+| `/sessions`                     | POST      | Create new session                   |
+| `/sessions/:id`                 | GET       | Get canonical session snapshot       |
+| `/sessions/:id`                 | DELETE    | Delete session                       |
+| `/sessions/:id/sandbox-access`  | GET       | Get sandbox connection details       |
+| `/sessions/:id/prompt`          | POST      | Enqueue prompt                       |
+| `/sessions/:id/stop`            | POST      | Stop execution                       |
+| `/sessions/:id/ws`              | WebSocket | Real-time connection                 |
+| `/sessions/:id/events`          | GET       | Paginated events                     |
+| `/sessions/:id/artifacts`       | GET       | List artifacts                       |
+| `/sessions/:id/participants`    | GET       | List runtime participants            |
+| `/sessions/:id/messages`        | GET       | List messages                        |
+| `/sessions/:id/pr`              | POST      | Create pull request                  |
+| `/sessions/:id/scm-credentials` | POST      | Broker sandbox git credentials       |
+| `/sessions/:id/ws-token`        | POST      | Generate WebSocket token             |
+| `/sessions/:id/archive`         | POST      | Archive session                      |
+| `/sessions/:id/unarchive`       | POST      | Unarchive session                    |
+| `/sessions/batch-archive`       | POST      | Archive explicitly selected sessions |
 
 ### Create PR Payload
 
@@ -209,6 +220,52 @@ An invocation's status is **derived from its child runs, never stored**: no chil
 any child starting/running → `starting`/`running`; all terminal → `completed` (none failed),
 `failed` (none completed), `partial_failed` (a mix), or `skipped` (all skipped).
 
+#### Webhook triggers
+
+Webhook automations are called with their API key (`Authorization: Bearer <key>`) instead of a user
+session:
+
+| Endpoint                                             | Method | Description                                                                            |
+| ---------------------------------------------------- | ------ | -------------------------------------------------------------------------------------- |
+| `/webhooks/automation/:id`                           | POST   | Fire with a JSON body → `{ok, triggered, skipped, steered, invocationId}`              |
+| `/webhooks/automation/:id/invocations/:invocationId` | GET    | Status of a webhook firing → `{invocationId, status, runs: [{id, status, sessionId}]}` |
+
+`invocationId` is `null` when nothing was recorded (conditions did not match, the automation is
+paused, or execution was denied before admission). A retry with the same `idempotencyKey` returns
+the original firing's ID, even while it is still running. The status endpoint serves only
+invocations this webhook caused, and never exposes session content.
+
+### Audit Events
+
+| Endpoint        | Method | Description                                                    |
+| --------------- | ------ | -------------------------------------------------------------- |
+| `/audit-events` | GET    | Newest-first, cursor-paginated events (`workspace.audit.read`) |
+
+Each event has an `action`, a stored `operationResult` (`applied`, `no_op`, `denied`, or
+`rejected`), and structured `metadata`. What a row proves depends on who wrote it:
+
+- **Authorization decisions** (`authorization.request_allowed`, `authorization.request_denied`) are
+  written by route admission. With `metadata.schema = "authorization_decision.v1"` they also record
+  `httpMethod`, `httpPath`, `httpStatus`, and the evaluated `requirements`. They prove only that the
+  request was allowed or denied and which HTTP status it returned. An allowed request may still fail
+  validation (400), conflict (409), or fail downstream (500), and even a 2xx does not prove that a
+  domain change or asynchronous work (a sandbox, job, or external effect) completed. Their
+  `operationResult` encodes the decision (`applied` for allowed, `denied` for denied) and must not
+  be read as a domain outcome. Rows written before the schema existed carry `{ "legacy": true }`
+  metadata and have no recorded status.
+- **Operation events** (the actions in `AUDIT_OPERATION_ACTIONS`, for example
+  `workspace.member_role_updated`) are written by the operation owner alongside the change, so their
+  `operationResult` is the domain outcome.
+- Any other action is unrecognized; clients should not interpret its `operationResult`.
+
+`interpretAuditEvent` in `@open-inspect/shared` implements these rules. It takes the decision from
+the exact action and reports `httpStatus` only when the metadata parses as
+`authorization_decision.v1`.
+
+A feature that needs "operation completed" evidence must emit its own event from the owning
+transaction or workflow, correlated by request ID. That evidence is never inferred from admission or
+from an HTTP 2xx.
+
 ## WebSocket Protocol
 
 ### Client → Server Messages
@@ -236,7 +293,6 @@ any child starting/running → `starting`/`running`; all terminal → `completed
 | `sandbox_spawning` | Sandbox is being created      |
 | `sandbox_warming`  | Sandbox warming               |
 | `sandbox_status`   | Sandbox status update         |
-| `sandbox_ready`    | Sandbox ready                 |
 | `sandbox_error`    | Sandbox error occurred        |
 | `sandbox_warning`  | Sandbox warning message       |
 | `sandbox_restored` | Restored from snapshot        |
@@ -249,7 +305,7 @@ any child starting/running → `starting`/`running`; all terminal → `completed
 
 ### Prerequisites
 
-- Node.js 22+
+- Node.js 24+
 - Terraform (for deployment)
 
 ### Setup
@@ -263,8 +319,15 @@ npm install
 
 ```bash
 npm run build
-# Outputs to dist/index.js
+# Outputs the Worker bundle to dist/index.js and the Node host to dist/node/main.js
 ```
+
+### Run as a container
+
+The control plane also runs as a Node process on a container, with SQLite on a volume and an
+S3-compatible bucket for media. See
+[docs/CONTROL_PLANE_CONTAINER.md](../../docs/CONTROL_PLANE_CONTAINER.md) for `docker compose up` and
+the image build.
 
 ### Deploy
 
@@ -356,7 +419,7 @@ requests so the React `/login` route can render them server-side.
 Three independent key domains protect stored credentials. Rotation guidance differs — never treat
 them as interchangeable during an incident:
 
-- **`TOKEN_ENCRYPTION_KEY`** — AES-256-GCM for the SCM enrichment tokens in `user_scm_tokens`:
+- **`TOKEN_ENCRYPTION_KEY`** — AES-256-GCM for SCM access tokens copied into session participants:
 
   ```typescript
   import { encryptToken, decryptToken } from "./auth/crypto";
@@ -368,13 +431,14 @@ them as interchangeable during an incident:
   const token = await decryptToken(encrypted, env.TOKEN_ENCRYPTION_KEY);
   ```
 
-  Rotating it invalidates stored SCM tokens; affected users re-link their SCM connection.
+  Rotating it invalidates SCM credentials already copied into sessions. New sessions resolve current
+  GitHub credentials through Better Auth.
 
 - **`BROWSER_AUTH_SECRET`** — Better Auth's secret. It signs browser session cookies **and**
   encrypts the sign-in OAuth credential columns on `user_identities` (`access_token`,
   `refresh_token`, `id_token`, written at web sign-in and read via `auth.api.getAccessToken`).
   Rotating it signs every browser session out and orphans those stored credentials — they
-  re-populate at each user's next sign-in. It does not affect `user_scm_tokens`.
+  re-populate at each user's next sign-in.
 
 - **`PROVIDER_ACCOUNTS_ENCRYPTION_KEY`** — dedicated AES-256-GCM key for subscription-provider
   account credentials. Provider account mode stores only account references on sessions and brokers
@@ -394,37 +458,90 @@ Existing sessions remain pinned to their stored authentication mode.
 > **Single-Tenant Only**: This control plane is designed for single-tenant deployment where all
 > users are trusted members of the same organization.
 
+Slack-bot `POST /sessions/:id/prompt` and `POST /sessions/:id/attachments` requests require exactly
+one `channel=slack:<channelId>` query coordinate covered by the service signature. Before actor
+enrollment or session writes, admission compares the live channel binding with the session's
+persisted owning team in every `TEAMS_ENFORCEMENT` mode. Matching workspace/unbound scopes remain
+valid; this check does not replace the user's collaboration or membership authorization. Scope
+refusals return `slack_channel_scope_denied`, which closes the bot's thread mapping rather than
+treating the refusal as a per-user denial or retrying with cached ownership.
+
+Slack channel catalogs use signed `GET /repos?channel=slack:<channelId>` and
+`GET /environments?channel=slack:<channelId>` requests with the requesting user's actor assertion.
+The control plane derives the team from its current binding, checks user access, and filters current
+repository grants; a bot-supplied `teamId` cannot override that scope. Unbound channel scopes
+include only workspace-owned environments, even for multi-team users and administrators. The bot
+does not cache channel-catalog responses or fall back to workspace/team data on failed scoped reads.
+
+Bulk archiving uses `POST /sessions/batch-archive` with an explicit selection:
+
+```json
+{ "sessionIds": ["session-one", "session-two"] }
+```
+
+The request requires 1–25 unique, non-empty session IDs. Unknown fields and the old operator cursor
+format are rejected. The caller must be an authenticated human holding `sessions.bulk_archive`,
+granted to Owner and Administrator by default and available to custom roles. Admission and
+authorization auditing use the ordinary RBAC pipeline. Single-session `/sessions/:id/archive`
+continues to use workspace `sessions.lifecycle`; it is not participant-scoped.
+
+A valid batch returns HTTP 200 with one result per ID, in request order:
+
+```json
+{
+  "results": [
+    { "sessionId": "session-one", "outcome": "archived" },
+    { "sessionId": "session-two", "outcome": "failed" }
+  ]
+}
+```
+
+Outcomes are `archived`, `already_archived`, `skipped_cancelled`, `skipped_queued_work`,
+`not_found`, or `failed`. The batch is not atomic: successful targets remain archived even if
+another target fails. Retry only failed IDs; the endpoint does not scan or replay earlier targets.
+Use the existing session-list API to choose targets. A missing runtime is reported as `not_found`,
+without rewriting its index row. Runtime calls have bounded concurrency and share one batch deadline
+below the web proxy timeout. Unstarted or unfinished targets return `failed`; a timed-out mutation
+may still complete, and retrying it is safe.
+
+Both single and batch requests use the same runtime archive operation. The runtime checks current
+state before changing it, refuses cancelled sessions or queued work, and confirms index agreement
+before returning success. All lifecycle projections use the session's persisted monotonic status
+revision, independent of activity timestamps. Older deliveries cannot overwrite a newer status;
+identical retries are idempotent and preserve newer activity. A superseding transition, missing
+index row, or unavailable projection returns a retryable failure. Single-session callers receive
+HTTP 503 in that case; batch callers receive `failed` for that ID. Single-session success/error
+bodies retain their existing fields and include an additive `outcome` for successful or ineligible
+archive decisions.
+
+Deploy D1 migration `0094_session_status_revision.sql` before the worker update. Runtime schema
+migration 51 upgrades existing sessions lazily; their first projection claims the legacy index row.
+The web proxy bounds raw request bytes before parsing and preserves upstream retry/correlation
+headers.
+
+The former `/operator/sessions/archive` and `/internal/operator-archive` proposal is not exposed.
+
 ### GitHub App Token Flow
 
-The system uses two types of GitHub tokens:
+The sandbox helper calls `/sessions/:id/scm-credentials` with its sandbox auth token. The control
+plane resolves the persisted session repositories, intersects current owning-team grants only for
+team-owned sessions, and passes that scope to the provider. GitHub mints a short-lived installation
+token for that scope; GitLab returns its deployment-wide PAT without narrowing it. Installation-wide
+metadata/catalog credentials are separate from GitHub session credentials.
 
-| Token            | Used For           | Delivery                      | Access Scope                     |
-| ---------------- | ------------------ | ----------------------------- | -------------------------------- |
-| GitHub App Token | Clone, fetch, push | Brokered to credential helper | All repos where App is installed |
-| User OAuth Token | Create PRs         | Server-only                   | User's accessible repos          |
-
-Fresh and prebuilt-image sandboxes do not receive a long-lived `GITHUB_TOKEN`, `GITHUB_APP_TOKEN`,
-or `VCS_CLONE_TOKEN` for normal git operations. Git invokes the sandbox credential helper, which
-calls `/sessions/:id/scm-credentials` with the sandbox auth token and receives short-lived
-credentials on demand. Legacy snapshots and one-shot image builds may still receive env-token
-fallbacks for compatibility. The helper preserves the existing installation-wide model by serving
-credentials for HTTPS git requests to the configured SCM host, including setup/start hooks that
-clone auxiliary private repos. This avoids stale embedded credentials in long-running sessions and
-Daytona persistent resumes; Modal snapshot restores still mint a fresh fallback token during
-restore.
-
-If a `create-pr` request is triggered by a participant without a user OAuth token (for example,
-Slack-created or Google-login sessions), the sandbox can still push the branch with brokered GitHub
-App credentials and the control plane returns a manual GitHub `pull/new` URL instead of failing the
-request.
+The helper caches the returned password on disk; Modal filesystem snapshots can retain that cache.
+Grant changes constrain subsequent credential resolution, not already-issued tokens. Image builds
+receive `VCS_CLONE_TOKEN` because they have no session broker. For the authoritative delivery,
+provider, user-identity, and snapshot boundaries, see
+[Repository and Credential Boundaries](../../docs/AUTH.md#repository-and-credential-boundaries).
 
 ### Why This Matters
 
-- **No per-user repo access validation**: When a session is created, the system does not verify that
-  the user has access to the requested repository
+- **No personal GitHub access comparison**: Session creation checks Open-Inspect permissions and
+  resource access, not the user's personal GitHub repository permissions
 - **Shared GitHub App installation**: A single `GITHUB_APP_INSTALLATION_ID` is used for all users
-- **Trust boundary is the organization**: All users with access to the web app can work with any
-  repository the GitHub App is installed on
+- **Trust boundary is the organization**: Teams and session visibility add internal access controls,
+  not multi-tenant isolation. See [Authentication and Authorization](../../docs/AUTH.md).
 
 ### Configuration
 
@@ -434,6 +551,7 @@ All secrets are configured via Terraform. Required secrets include:
 - `GITHUB_APP_PRIVATE_KEY` - GitHub App private key (PKCS#8 format)
 - `GITHUB_APP_INSTALLATION_ID` - Single installation for all users
 - `REPO_SECRETS_ENCRYPTION_KEY` - AES-GCM key for encrypting repo secrets in D1
+- `PROVIDER_ACCOUNTS_ENCRYPTION_KEY` - Dedicated key for provider account credentials in D1
 
 Optional variables:
 

@@ -1,31 +1,22 @@
+import { getValidHarnessOrDefault } from "@open-inspect/shared/harnesses";
 import { childFollowUpPromptRequestSchema } from "@open-inspect/shared/types/session-api";
 import { isSessionPromptable } from "@open-inspect/shared/types/session-activity";
 import { z } from "zod";
 import { sessionStatusSchema } from "@open-inspect/shared/types/sessions";
-import type { Logger } from "../../../logger";
 import { parsePersistedSandboxSettings } from "../../../sandbox/settings";
-import { parseArtifactMetadata } from "../../artifact-metadata";
 import type { SessionMessenger } from "../../messenger";
-import { PromptQueueFullError, SessionNotPromptableError } from "../../message-queue";
+import {
+  PromptQueueFullError,
+  SandboxPromptBlockedError,
+  SessionNotPromptableError,
+} from "../../message-queue";
 import type { MessageRepository } from "../../message-repository";
-import type { ArtifactRepository } from "../../artifact-repository";
-import type { EventRepository } from "../../event-repository";
 import type { ParticipantRepository } from "../../participant-repository";
 import type { SessionCoreRepository } from "../../session-core-repository";
-import type { SandboxRepository } from "../../sandbox-repository";
 import type { MessageService } from "../../services/message.service";
 import type { SpawnContext } from "../../spawn-context";
 import { activePromptAuthorSchema, type ActivePromptAuthor } from "../../active-prompt-author";
-import { resolvePublicSessionId } from "../../public-session-id";
 import type { ParticipantRow } from "../../types";
-import {
-  RECENT_EVENT_FETCH_LIMIT,
-  buildChildSessionDetail,
-  collectFinalResponseEventRows,
-  parseChildSummaryOptions,
-  type ChildSummaryFinalResponseInput,
-  type ChildSummaryTrajectoryInput,
-} from "./child-session-summary";
 
 const parentPromptRequestSchema = childFollowUpPromptRequestSchema.extend({
   parentSessionId: z.string().min(1),
@@ -67,19 +58,15 @@ function toActivePromptAuthor(participant: ParticipantRow): ActivePromptAuthor {
 
 /**
  * HTTP boundary for the parent/child session endpoints: spawn context and
- * prompt-author reads for child spawning, the child summary read model, and
- * the parent-prompt/status-update callbacks children invoke.
+ * prompt-author reads for child spawning, and the parent-prompt/status-update
+ * callbacks children invoke. The child-summary read is served by
+ * `ChildSummaryHandler`.
  */
 export class ChildSessionsHandler {
   constructor(
     private readonly messageRepository: MessageRepository,
-    private readonly eventRepository: EventRepository,
     private readonly participantRepository: ParticipantRepository,
-    private readonly artifactRepository: ArtifactRepository,
     private readonly sessionCoreRepository: SessionCoreRepository,
-    private readonly sandboxRepository: SandboxRepository,
-    private readonly durableObjectId: string,
-    private readonly log: Logger,
     private readonly messenger: SessionMessenger,
     private readonly messageService: Pick<MessageService, "enqueuePrompt">
   ) {}
@@ -96,8 +83,11 @@ export class ChildSessionsHandler {
     );
     if (promptAuthor instanceof Response) return promptAuthor;
     let sandboxTimeoutMs: number | undefined;
+    let finalSnapshotBufferMs: number | undefined;
     try {
-      sandboxTimeoutMs = parsePersistedSandboxSettings(session.sandbox_settings).sandboxTimeoutMs;
+      const sandboxSettings = parsePersistedSandboxSettings(session.sandbox_settings);
+      sandboxTimeoutMs = sandboxSettings.sandboxTimeoutMs;
+      finalSnapshotBufferMs = sandboxSettings.finalSnapshotBufferMs;
     } catch {
       sandboxTimeoutMs = undefined;
     }
@@ -105,10 +95,12 @@ export class ChildSessionsHandler {
       repoOwner: session.repo_owner,
       repoName: session.repo_name,
       repoId: session.repo_id,
+      harness: getValidHarnessOrDefault(session.harness),
       model: session.model,
       reasoningEffort: session.reasoning_effort ?? null,
       baseBranch: session.base_branch,
       sandboxTimeoutMs,
+      finalSnapshotBufferMs,
       promptAuthor: {
         userId: promptAuthor.user_id,
         ...(promptAuthor.canonical_user_id
@@ -118,9 +110,6 @@ export class ChildSessionsHandler {
         scmLogin: promptAuthor.scm_login,
         scmName: promptAuthor.scm_name,
         scmEmail: promptAuthor.scm_email,
-        scmAccessTokenEncrypted: promptAuthor.scm_access_token_encrypted,
-        scmRefreshTokenEncrypted: promptAuthor.scm_refresh_token_encrypted,
-        scmTokenExpiresAt: promptAuthor.scm_token_expires_at,
       },
     };
 
@@ -136,62 +125,6 @@ export class ChildSessionsHandler {
       this.participantRepository
     );
     return author instanceof Response ? author : Response.json(toActivePromptAuthor(author));
-  }
-
-  getChildSummary(url?: URL): Response {
-    const session = this.sessionCoreRepository.getSession();
-    if (!session) {
-      return Response.json({ error: "Session not found" }, { status: 404 });
-    }
-
-    const parsedOptions = parseChildSummaryOptions(url);
-    if (!parsedOptions.ok) {
-      return Response.json({ error: parsedOptions.error }, { status: 400 });
-    }
-
-    const options = parsedOptions.options;
-    const sandbox = this.sandboxRepository.getSandbox();
-    const artifacts = this.artifactRepository.listArtifacts();
-    const recentEventRows = this.eventRepository.listEventPage({
-      limit: RECENT_EVENT_FETCH_LIMIT,
-    }).events;
-    let finalResponse: ChildSummaryFinalResponseInput | undefined;
-    let trajectory: ChildSummaryTrajectoryInput | undefined;
-
-    if (options.includeFinalResponse) {
-      const terminalMessage = this.messageRepository.getLatestTerminalMessage();
-      const collectedEvents = terminalMessage
-        ? collectFinalResponseEventRows(this.eventRepository, terminalMessage.id)
-        : { eventRows: [], eventLimitReached: false };
-      finalResponse = { message: terminalMessage, ...collectedEvents };
-    }
-
-    if (options.includeTrajectory) {
-      const page = this.eventRepository.getEventTimelinePage({
-        limit: options.trajectoryLimit,
-        cursor: options.trajectoryCursor ?? undefined,
-      });
-      trajectory = {
-        eventRows: page.events,
-        hasMore: page.hasMore,
-        nextCursor: page.nextCursor,
-        limit: options.trajectoryLimit,
-      };
-    }
-
-    return Response.json(
-      buildChildSessionDetail({
-        session,
-        sandbox,
-        publicSessionId: resolvePublicSessionId(session, this.durableObjectId),
-        artifacts,
-        recentEventRows,
-        hasUnfinishedPrompt: this.messageRepository.getPendingOrProcessingCount() > 0,
-        parseArtifactMetadata: (artifact) => parseArtifactMetadata(artifact, this.log),
-        finalResponse,
-        trajectory,
-      })
-    );
   }
 
   async parentPrompt(request: Request): Promise<Response> {
@@ -229,15 +162,18 @@ export class ChildSessionsHandler {
             login: parsed.data.author.scmLogin,
             name: parsed.data.author.scmName,
             email: parsed.data.author.scmEmail,
-            accessTokenEncrypted: null,
-            refreshTokenEncrypted: null,
-            tokenExpiresAt: null,
           },
         })
       );
     } catch (error) {
       if (error instanceof SessionNotPromptableError) {
         return Response.json({ error: error.message }, { status: 409 });
+      }
+      if (error instanceof SandboxPromptBlockedError) {
+        return Response.json(
+          { error: error.message, code: "SANDBOX_RECOVERY_REQUIRED" },
+          { status: 409 }
+        );
       }
       if (error instanceof PromptQueueFullError) {
         return Response.json({ error: "Child prompt queue is full" }, { status: 429 });

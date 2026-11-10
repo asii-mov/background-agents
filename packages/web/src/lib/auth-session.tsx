@@ -8,6 +8,7 @@ import {
   type BrowserAuthSessionUser,
 } from "./browser-auth-session-contract";
 import { browserApiFetch } from "./browser-api-fetch";
+import { clearStoredPromptDrafts } from "./prompt-drafts";
 
 const BROWSER_AUTH_SESSION_PATH = "/api/auth/get-session";
 
@@ -58,6 +59,12 @@ export async function signOut(): Promise<void> {
   if (!response.ok) {
     throw new Error(`Sign-out failed with status ${response.status}`);
   }
+  clearStoredPromptDrafts();
+  await clearAuthSessionCache();
+}
+
+/** Immediately reflect a server-side session revocation in the client cache. */
+export async function clearAuthSessionCache(): Promise<void> {
   await mutate(BROWSER_AUTH_SESSION_PATH, null, false);
 }
 

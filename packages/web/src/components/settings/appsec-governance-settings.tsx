@@ -1,5 +1,12 @@
 "use client";
 
+import {
+  Select,
+  SelectTrigger,
+  SelectValue,
+  SelectContent,
+  SelectItem,
+} from "@/components/ui/select";
 import { useState } from "react";
 import useSWR from "swr";
 import { toast } from "sonner";
@@ -7,15 +14,17 @@ import {
   securityPipelineCommandSchema,
   type SecurityPipelineMetadata,
 } from "@open-inspect/shared/types/security-pipelines";
-import { browserApiFetch } from "@/lib/browser-api-fetch";
-import { usePlatformRole } from "@/hooks/use-platform-role";
+import { useCurrentUserAuthorization } from "@/hooks/use-current-user-authorization";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
 import { Textarea } from "@/components/ui/textarea";
 import { PlusIcon } from "@/components/ui/icons";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { ApprovedComponentsSettings } from "./approved-components-settings";
+import { fetchJson, writeJson } from "./governance-api";
+import { AppDataInventorySettings, StackAdoptionSettings } from "./stack-adoption-settings";
 
 type RiskLevel = "low" | "medium" | "high" | "critical";
 type PlatformRole = "member" | "editor" | "admin";
@@ -46,6 +55,13 @@ interface PipelineForm {
   maxRemediationAttempts: number;
 }
 
+const GOVERNANCE_VIEWS = [
+  { value: "stack-policy", label: "Stack policy" },
+  { value: "adoption", label: "Adoption" },
+  { value: "app-data", label: "App data" },
+  { value: "verification", label: "Pipelines and risk" },
+] as const;
+
 const DEFAULT_COMMANDS = [{ name: "tests", command: ["npm", "test"], timeoutSeconds: 300 }];
 
 const EMPTY_PIPELINE: PipelineForm = {
@@ -57,29 +73,6 @@ const EMPTY_PIPELINE: PipelineForm = {
   blocking: true,
   maxRemediationAttempts: 2,
 };
-
-async function fetchJson<T>(path: `/api/${string}`): Promise<T> {
-  const response = await browserApiFetch(path);
-  const data = await response.json();
-  if (!response.ok) {
-    throw new Error((data as { error?: string }).error ?? "Request failed");
-  }
-  return data as T;
-}
-
-async function mutateJson<T>(path: `/api/${string}`, method: string, body?: unknown): Promise<T> {
-  const response = await browserApiFetch(path, {
-    method,
-    ...(body === undefined
-      ? {}
-      : { headers: { "content-type": "application/json" }, body: JSON.stringify(body) }),
-  });
-  const data = await response.json();
-  if (!response.ok) {
-    throw new Error((data as { error?: string }).error ?? "Request failed");
-  }
-  return data as T;
-}
 
 function parseScopes(value: string): string[] | null {
   const values = value
@@ -216,7 +209,9 @@ function PipelineEditor({
 }
 
 export function AppSecGovernanceSettings() {
-  const { canWriteCatalog, canManagePlatform } = usePlatformRole();
+  const { hasPermission } = useCurrentUserAuthorization();
+  const canManageGovernance = hasPermission("governance.manage");
+  const canAssignPlatformRoles = hasPermission("workspace.members.manage");
   const {
     data: pipelines = [],
     isLoading: loadingPipelines,
@@ -228,7 +223,7 @@ export function AppSecGovernanceSettings() {
     mutate: reloadRisk,
   } = useSWR("/api/repository-risk", fetchJson<RepositoryRiskProfile[]>);
   const { data: users = [], mutate: reloadUsers } = useSWR(
-    canManagePlatform ? "/api/platform/users" : null,
+    canAssignPlatformRoles ? "/api/platform/users" : null,
     fetchJson<PlatformUser[]>
   );
   const [editingPipeline, setEditingPipeline] = useState<
@@ -279,9 +274,9 @@ export function AppSecGovernanceSettings() {
           : {}),
       };
       if (editingPipeline === "new") {
-        await mutateJson("/api/security-pipelines", "POST", body);
+        await writeJson("/api/security-pipelines", "POST", body);
       } else if (editingPipeline) {
-        await mutateJson(`/api/security-pipelines/${editingPipeline.id}`, "PUT", body);
+        await writeJson(`/api/security-pipelines/${editingPipeline.id}`, "PUT", body);
       }
       await reloadPipelines();
       setEditingPipeline(null);
@@ -295,7 +290,7 @@ export function AppSecGovernanceSettings() {
 
   async function deletePipeline(id: string) {
     try {
-      await mutateJson(`/api/security-pipelines/${id}`, "DELETE");
+      await writeJson(`/api/security-pipelines/${id}`, "DELETE");
       await reloadPipelines();
       if (editingPipeline !== "new" && editingPipeline?.id === id) setEditingPipeline(null);
       toast.success("Security pipeline deleted");
@@ -310,7 +305,7 @@ export function AppSecGovernanceSettings() {
       return;
     }
     try {
-      await mutateJson("/api/repository-risk", "PUT", {
+      await writeJson("/api/repository-risk", "PUT", {
         repoOwner: riskOwner.trim(),
         repoName: riskName.trim(),
         criticality: riskLevel,
@@ -328,7 +323,7 @@ export function AppSecGovernanceSettings() {
 
   async function updateRole(userId: string, role: PlatformRole) {
     try {
-      await mutateJson(`/api/platform/users/${encodeURIComponent(userId)}/role`, "PATCH", { role });
+      await writeJson(`/api/platform/users/${encodeURIComponent(userId)}/role`, "PATCH", { role });
       await reloadUsers();
       toast.success("Platform role updated");
     } catch (error) {
@@ -337,188 +332,227 @@ export function AppSecGovernanceSettings() {
   }
 
   return (
-    <div className="space-y-8">
+    <div className="space-y-6">
       <div>
         <h2 className="text-xl font-semibold text-foreground">AppSec governance</h2>
-        <p className="mt-1 text-sm text-muted-foreground">
-          Centrally assign verification, classify repository impact, and control catalogue
-          ownership. Agents retain autonomous sandbox tools; these controls are enforced at the
-          platform boundary.
+        <p className="mt-1 max-w-prose text-sm text-muted-foreground">
+          Decide what agents build with, see how repositories follow it, and verify what they
+          generate. Members never see this page; agents apply it without asking them.
         </p>
       </div>
 
-      <ApprovedComponentsSettings />
-
-      <Section
-        title="Managed verification pipelines"
-        description="Run argv-based checks after generation, return verified findings to the agent, rerun them after remediation, and block completion when required checks still fail."
-      >
-        {canWriteCatalog && editingPipeline === null && (
-          <Button size="sm" variant="outline" onClick={() => startPipeline()} className="mb-4">
-            <span className="inline-flex items-center gap-1">
-              <PlusIcon className="h-3.5 w-3.5" /> Add pipeline
-            </span>
-          </Button>
-        )}
-        {editingPipeline !== null && (
-          <PipelineEditor
-            form={pipelineForm}
-            setForm={setPipelineForm}
-            saving={savingPipeline}
-            onSave={savePipeline}
-            onCancel={() => setEditingPipeline(null)}
-          />
-        )}
-        {loadingPipelines ? (
-          <p className="text-sm text-muted-foreground">Loading...</p>
-        ) : pipelines.length === 0 ? (
-          <p className="text-sm text-muted-foreground">No managed pipelines configured.</p>
-        ) : (
-          <div className="space-y-2">
-            {pipelines.map((pipeline) => (
-              <div key={pipeline.id} className="rounded-md border border-border bg-card p-3">
-                <div className="flex items-start justify-between gap-3">
-                  <div>
-                    <p className="text-sm font-medium text-foreground">{pipeline.name}</p>
-                    <p className="text-xs text-muted-foreground">
-                      {pipeline.commands.length} check(s) ·{" "}
-                      {pipeline.blocking ? "blocking" : "report only"} ·{" "}
-                      {pipeline.maxRemediationAttempts} remediation attempt(s)
-                    </p>
-                    <p className="mt-1 text-xs text-muted-foreground">
-                      {pipeline.repoScopes?.join(", ") ||
-                        pipeline.environmentScopes?.join(", ") ||
-                        "all sessions"}{" "}
-                      · created by {pipeline.createdBy}
-                    </p>
-                  </div>
-                  {canWriteCatalog && (
-                    <div className="flex gap-2">
-                      <Button size="xs" variant="outline" onClick={() => startPipeline(pipeline)}>
-                        Edit
-                      </Button>
-                      <Button size="xs" variant="ghost" onClick={() => deletePipeline(pipeline.id)}>
-                        Delete
-                      </Button>
+      <Tabs defaultValue="stack-policy">
+        <TabsList className="mb-6 overflow-x-auto">
+          {GOVERNANCE_VIEWS.map((view) => (
+            <TabsTrigger key={view.value} value={view.value} className="flex-none px-3">
+              {view.label}
+            </TabsTrigger>
+          ))}
+        </TabsList>
+        <TabsContent value="stack-policy">
+          <ApprovedComponentsSettings />
+        </TabsContent>
+        <TabsContent value="adoption">
+          <StackAdoptionSettings />
+        </TabsContent>
+        <TabsContent value="app-data">
+          <AppDataInventorySettings />
+        </TabsContent>
+        <TabsContent value="verification" className="space-y-8">
+          <Section
+            title="Managed verification pipelines"
+            description="Run argv-based checks after generation, return verified findings to the agent, rerun them after remediation, and block completion when required checks still fail."
+          >
+            {canManageGovernance && editingPipeline === null && (
+              <Button size="sm" variant="outline" onClick={() => startPipeline()} className="mb-4">
+                <span className="inline-flex items-center gap-1">
+                  <PlusIcon className="h-3.5 w-3.5" /> Add pipeline
+                </span>
+              </Button>
+            )}
+            {editingPipeline !== null && (
+              <PipelineEditor
+                form={pipelineForm}
+                setForm={setPipelineForm}
+                saving={savingPipeline}
+                onSave={savePipeline}
+                onCancel={() => setEditingPipeline(null)}
+              />
+            )}
+            {loadingPipelines ? (
+              <p className="text-sm text-muted-foreground">Loading...</p>
+            ) : pipelines.length === 0 ? (
+              <p className="text-sm text-muted-foreground">No managed pipelines configured.</p>
+            ) : (
+              <div className="space-y-2">
+                {pipelines.map((pipeline) => (
+                  <div key={pipeline.id} className="rounded-md border border-border bg-card p-3">
+                    <div className="flex items-start justify-between gap-3">
+                      <div>
+                        <p className="text-sm font-medium text-foreground">{pipeline.name}</p>
+                        <p className="text-xs text-muted-foreground">
+                          {pipeline.commands.length} check(s) ·{" "}
+                          {pipeline.blocking ? "blocking" : "report only"} ·{" "}
+                          {pipeline.maxRemediationAttempts} remediation attempt(s)
+                        </p>
+                        <p className="mt-1 text-xs text-muted-foreground">
+                          {pipeline.repoScopes?.join(", ") ||
+                            pipeline.environmentScopes?.join(", ") ||
+                            "all sessions"}{" "}
+                          · created by {pipeline.createdBy}
+                        </p>
+                      </div>
+                      {canManageGovernance && (
+                        <div className="flex gap-2">
+                          <Button
+                            size="xs"
+                            variant="outline"
+                            onClick={() => startPipeline(pipeline)}
+                          >
+                            Edit
+                          </Button>
+                          <Button
+                            size="xs"
+                            variant="ghost"
+                            onClick={() => deletePipeline(pipeline.id)}
+                          >
+                            Delete
+                          </Button>
+                        </div>
+                      )}
                     </div>
-                  )}
-                </div>
+                  </div>
+                ))}
               </div>
-            ))}
-          </div>
-        )}
-      </Section>
+            )}
+          </Section>
 
-      <Section
-        title="Repository criticality"
-        description="PR risk is repository criticality × change criticality. Scores of 8 or more are forced into draft security review. Unclassified repositories default to medium."
-      >
-        {canWriteCatalog && (
-          <div className="mb-4 grid gap-3 rounded-md border border-border bg-card p-4 sm:grid-cols-2">
-            <div>
-              <Label className="mb-1.5">Owner</Label>
-              <Input
-                value={riskOwner}
-                onChange={(event) => setRiskOwner(event.target.value)}
-                placeholder="acme"
-              />
-            </div>
-            <div>
-              <Label className="mb-1.5">Repository</Label>
-              <Input
-                value={riskName}
-                onChange={(event) => setRiskName(event.target.value)}
-                placeholder="identity-service"
-              />
-            </div>
-            <div>
-              <Label className="mb-1.5">Criticality</Label>
-              <select
-                value={riskLevel}
-                onChange={(event) => setRiskLevel(event.target.value as RiskLevel)}
-                className="h-9 w-full rounded-sm border border-border bg-background px-3 text-sm"
-              >
-                <option value="low">Low</option>
-                <option value="medium">Medium</option>
-                <option value="high">High</option>
-                <option value="critical">Critical</option>
-              </select>
-            </div>
-            <div>
-              <Label className="mb-1.5">Rationale</Label>
-              <Input
-                value={riskRationale}
-                onChange={(event) => setRiskRationale(event.target.value)}
-                placeholder="Production identity boundary"
-              />
-            </div>
-            <Button size="sm" onClick={saveRiskProfile} className="sm:col-span-2 sm:w-fit">
-              Save criticality
-            </Button>
-          </div>
-        )}
-        {loadingRisk ? (
-          <p className="text-sm text-muted-foreground">Loading...</p>
-        ) : riskProfiles.length === 0 ? (
-          <p className="text-sm text-muted-foreground">
-            No repository overrides; medium is the default.
-          </p>
-        ) : (
-          <div className="divide-y divide-border rounded-md border border-border">
-            {riskProfiles.map((profile) => (
-              <button
-                type="button"
-                key={`${profile.repoOwner}/${profile.repoName}`}
-                onClick={() => {
-                  if (!canWriteCatalog) return;
-                  setRiskOwner(profile.repoOwner);
-                  setRiskName(profile.repoName);
-                  setRiskLevel(profile.criticality);
-                  setRiskRationale(profile.rationale ?? "");
-                }}
-                className="flex w-full items-center justify-between gap-3 px-3 py-2 text-left"
-              >
-                <span className="text-sm text-foreground">
-                  {profile.repoOwner}/{profile.repoName}
-                </span>
-                <span className="text-xs uppercase text-muted-foreground">
-                  {profile.criticality}
-                </span>
-              </button>
-            ))}
-          </div>
-        )}
-      </Section>
-
-      {canManagePlatform && (
-        <Section
-          title="Platform ownership"
-          description="Editors manage the shared Skills, MCP, pipeline, and repository-risk catalogues. Administrators can also assign roles."
-        >
-          <div className="divide-y divide-border rounded-md border border-border">
-            {users.map((user) => (
-              <div key={user.id} className="flex items-center justify-between gap-3 px-3 py-2">
-                <div className="min-w-0">
-                  <p className="truncate text-sm text-foreground">
-                    {user.displayName || user.email || user.id}
-                  </p>
-                  <p className="truncate text-xs text-muted-foreground">{user.email || user.id}</p>
+          <Section
+            title="Repository criticality"
+            description="PR risk is repository criticality × change criticality. Scores of 8 or more are forced into draft security review. Unclassified repositories default to medium."
+          >
+            {canManageGovernance && (
+              <div className="mb-4 grid gap-3 rounded-md border border-border bg-card p-4 sm:grid-cols-2">
+                <div>
+                  <Label className="mb-1.5">Owner</Label>
+                  <Input
+                    value={riskOwner}
+                    onChange={(event) => setRiskOwner(event.target.value)}
+                    placeholder="acme"
+                  />
                 </div>
-                <select
-                  aria-label={`Role for ${user.displayName || user.email || user.id}`}
-                  value={user.role}
-                  onChange={(event) => updateRole(user.id, event.target.value as PlatformRole)}
-                  className="h-8 rounded-sm border border-border bg-background px-2 text-xs"
-                >
-                  <option value="member">Member</option>
-                  <option value="editor">Editor</option>
-                  <option value="admin">Admin</option>
-                </select>
+                <div>
+                  <Label className="mb-1.5">Repository</Label>
+                  <Input
+                    value={riskName}
+                    onChange={(event) => setRiskName(event.target.value)}
+                    placeholder="identity-service"
+                  />
+                </div>
+                <div>
+                  <Label className="mb-1.5">Criticality</Label>
+                  <Select
+                    value={riskLevel}
+                    onValueChange={(value) => setRiskLevel(value as RiskLevel)}
+                  >
+                    <SelectTrigger className="h-9 w-full rounded-sm border border-border bg-background px-3 text-sm">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {" "}
+                      <SelectItem value="low">Low</SelectItem>
+                      <SelectItem value="medium">Medium</SelectItem>
+                      <SelectItem value="high">High</SelectItem>
+                      <SelectItem value="critical">Critical</SelectItem>
+                    </SelectContent>
+                  </Select>
+                </div>
+                <div>
+                  <Label className="mb-1.5">Rationale</Label>
+                  <Input
+                    value={riskRationale}
+                    onChange={(event) => setRiskRationale(event.target.value)}
+                    placeholder="Production identity boundary"
+                  />
+                </div>
+                <Button size="sm" onClick={saveRiskProfile} className="sm:col-span-2 sm:w-fit">
+                  Save criticality
+                </Button>
               </div>
-            ))}
-          </div>
-        </Section>
-      )}
+            )}
+            {loadingRisk ? (
+              <p className="text-sm text-muted-foreground">Loading...</p>
+            ) : riskProfiles.length === 0 ? (
+              <p className="text-sm text-muted-foreground">
+                No repository overrides; medium is the default.
+              </p>
+            ) : (
+              <div className="divide-y divide-border rounded-md border border-border">
+                {riskProfiles.map((profile) => (
+                  <button
+                    type="button"
+                    key={`${profile.repoOwner}/${profile.repoName}`}
+                    onClick={() => {
+                      if (!canManageGovernance) return;
+                      setRiskOwner(profile.repoOwner);
+                      setRiskName(profile.repoName);
+                      setRiskLevel(profile.criticality);
+                      setRiskRationale(profile.rationale ?? "");
+                    }}
+                    className="flex w-full items-center justify-between gap-3 px-3 py-2 text-left"
+                  >
+                    <span className="text-sm text-foreground">
+                      {profile.repoOwner}/{profile.repoName}
+                    </span>
+                    <span className="text-xs uppercase text-muted-foreground">
+                      {profile.criticality}
+                    </span>
+                  </button>
+                ))}
+              </div>
+            )}
+          </Section>
+
+          {canAssignPlatformRoles && (
+            <Section
+              title="Platform ownership"
+              description="Editors manage the shared Skills, MCP, pipeline, and repository-risk catalogues. Administrators can also assign roles."
+            >
+              <div className="divide-y divide-border rounded-md border border-border">
+                {users.map((user) => (
+                  <div key={user.id} className="flex items-center justify-between gap-3 px-3 py-2">
+                    <div className="min-w-0">
+                      <p className="truncate text-sm text-foreground">
+                        {user.displayName || user.email || user.id}
+                      </p>
+                      <p className="truncate text-xs text-muted-foreground">
+                        {user.email || user.id}
+                      </p>
+                    </div>
+                    <Select
+                      value={user.role}
+                      onValueChange={(value) => updateRole(user.id, value as PlatformRole)}
+                    >
+                      <SelectTrigger
+                        aria-label={`Role for ${user.displayName || user.email || user.id}`}
+                        className="h-8 rounded-sm border border-border bg-background px-2 text-xs"
+                      >
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        {" "}
+                        <SelectItem value="member">Member</SelectItem>
+                        <SelectItem value="editor">Editor</SelectItem>
+                        <SelectItem value="admin">Admin</SelectItem>
+                      </SelectContent>
+                    </Select>
+                  </div>
+                ))}
+              </div>
+            </Section>
+          )}
+        </TabsContent>
+      </Tabs>
     </div>
   );
 }

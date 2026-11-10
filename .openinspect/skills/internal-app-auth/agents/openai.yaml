@@ -1,0 +1,4 @@
+interface:
+  display_name: "Internal app authentication"
+  short_description: "Use centralized auth for internal apps"
+  default_prompt: "Use $internal-app-auth when building or changing authentication for this internal app."

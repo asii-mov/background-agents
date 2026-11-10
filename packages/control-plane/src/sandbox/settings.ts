@@ -1,8 +1,11 @@
 import {
+  DEFAULT_FINAL_SNAPSHOT_BUFFER_MS,
   findSandboxPortConflict,
   isValidSandboxTimeoutMs,
+  MIN_FINAL_SNAPSHOT_BUFFER_MS,
   MAX_SANDBOX_NETWORK_ALLOWLIST_ENTRIES,
   MAX_TUNNEL_PORTS,
+  validateSandboxChildSessionLimits,
   type ConfiguredSandboxPort,
   type SandboxNetworkPolicy,
   type SandboxSettings,
@@ -10,9 +13,24 @@ import {
 
 type InvalidSandboxSettingsBehavior = "throw" | "omit";
 
+export const SANDBOX_TUNNELS_POLICIES = ["public", "disabled"] as const;
+export type SandboxTunnelsPolicy = (typeof SANDBOX_TUNNELS_POLICIES)[number];
+
+const SANDBOX_TUNNELS_DISABLED_MESSAGE =
+  "Public preview tunnels are disabled in this workspace. Deploy with the deploy-app tool instead.";
+
+/** `SANDBOX_TUNNELS_POLICY`. Unset keeps upstream public tunnels; an unrecognized value fails closed. */
+export function parseSandboxTunnelsPolicy(value: string | undefined): SandboxTunnelsPolicy {
+  return !value || value === "public" ? "public" : "disabled";
+}
+
 export interface NormalizeSandboxSettingsOptions {
   invalid?: InvalidSandboxSettingsBehavior;
   createError?: (message: string) => Error;
+  /** Defer cross-field defaults until repo/environment overrides are merged. */
+  partial?: boolean;
+  /** Under "disabled", tunnel ports are rejected (or omitted). Defaults to "public". */
+  tunnelsPolicy?: SandboxTunnelsPolicy;
 }
 
 export class SandboxSettingsValidationError extends Error {
@@ -23,9 +41,12 @@ export class SandboxSettingsValidationError extends Error {
 }
 
 /** Decode and normalize a session's persisted sandbox settings snapshot. */
-export function parsePersistedSandboxSettings(settingsJson: string | null): SandboxSettings {
+export function parsePersistedSandboxSettings(
+  settingsJson: string | null,
+  tunnelsPolicy?: SandboxTunnelsPolicy
+): SandboxSettings {
   if (settingsJson === null) return {};
-  return normalizeSandboxSettings(JSON.parse(settingsJson), { invalid: "omit" });
+  return normalizeSandboxSettings(JSON.parse(settingsJson), { invalid: "omit", tunnelsPolicy });
 }
 
 /**
@@ -72,6 +93,10 @@ export function normalizeSandboxSettings(
 
   if (settings.tunnelPorts !== undefined) {
     normalizeTunnelPorts(settings.tunnelPorts, reject, result);
+    if (result.tunnelPorts && options.tunnelsPolicy === "disabled") {
+      delete result.tunnelPorts;
+      reject(SANDBOX_TUNNELS_DISABLED_MESSAGE);
+    }
   }
 
   const codeServerPort = normalizePort(settings.codeServerPort, "codeServerPort", reject);
@@ -94,12 +119,12 @@ export function normalizeSandboxSettings(
     reject
   );
 
-  if (
-    maxConcurrentChildSessions !== undefined &&
-    maxTotalChildSessions !== undefined &&
-    maxConcurrentChildSessions > maxTotalChildSessions
-  ) {
-    reject("maxConcurrentChildSessions must be less than or equal to maxTotalChildSessions");
+  const childSessionLimitsError = validateSandboxChildSessionLimits({
+    maxConcurrentChildSessions,
+    maxTotalChildSessions,
+  });
+  if (childSessionLimitsError !== undefined) {
+    reject(childSessionLimitsError);
     maxConcurrentChildSessions = undefined;
   }
 
@@ -146,6 +171,37 @@ export function normalizeSandboxSettings(
     }
   }
 
+  if (settings.finalSnapshotBufferMs !== undefined) {
+    if (
+      typeof settings.finalSnapshotBufferMs !== "number" ||
+      !Number.isSafeInteger(settings.finalSnapshotBufferMs) ||
+      settings.finalSnapshotBufferMs < MIN_FINAL_SNAPSHOT_BUFFER_MS ||
+      settings.finalSnapshotBufferMs % 1000 !== 0
+    ) {
+      reject(
+        `finalSnapshotBufferMs must be at least ${MIN_FINAL_SNAPSHOT_BUFFER_MS} and a whole number of seconds`
+      );
+    } else {
+      result.finalSnapshotBufferMs = settings.finalSnapshotBufferMs;
+    }
+  }
+
+  if (!options.partial && result.sandboxTimeoutMs !== undefined) {
+    if (
+      result.finalSnapshotBufferMs !== undefined &&
+      result.finalSnapshotBufferMs >= result.sandboxTimeoutMs
+    ) {
+      reject("finalSnapshotBufferMs must be less than sandboxTimeoutMs");
+      delete result.finalSnapshotBufferMs;
+    }
+    if (
+      (result.finalSnapshotBufferMs ?? DEFAULT_FINAL_SNAPSHOT_BUFFER_MS) >= result.sandboxTimeoutMs
+    ) {
+      reject("default finalSnapshotBufferMs must be less than sandboxTimeoutMs");
+      delete result.sandboxTimeoutMs;
+    }
+  }
+
   const buildTimeoutSeconds = normalizePositiveIntegerSetting(
     settings.buildTimeoutSeconds,
     "buildTimeoutSeconds",
@@ -154,6 +210,15 @@ export function normalizeSandboxSettings(
   if (buildTimeoutSeconds !== undefined) {
     // Stored as-is; the build trigger caps it at MAX via resolveBuildTimeoutSeconds.
     result.buildTimeoutSeconds = buildTimeoutSeconds;
+  }
+
+  const maxSessionCostUsd = normalizePositiveNumberSetting(
+    settings.maxSessionCostUsd,
+    "maxSessionCostUsd",
+    reject
+  );
+  if (maxSessionCostUsd !== undefined) {
+    result.maxSessionCostUsd = maxSessionCostUsd;
   }
 
   checkPortCollisions(result, reject);
@@ -405,4 +470,17 @@ function isValidAllowedDomain(value: string): boolean {
       !label.startsWith("-") &&
       !label.endsWith("-")
   );
+}
+
+function normalizePositiveNumberSetting(
+  value: unknown,
+  name: string,
+  reject: (message: string) => false
+): number | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) {
+    reject(`${name} must be a positive finite number`);
+    return undefined;
+  }
+  return value;
 }

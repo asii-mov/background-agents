@@ -14,35 +14,55 @@ import type {
   ClientPresence,
   ClientPrompt,
   ClientSubscribe,
+  ClientCommandAuthorization,
   FetchHistory,
 } from "./message-router";
 import type { SessionEventStream, SessionHistoryPage } from "./event-stream";
 import type { SessionConnectionAuthenticator } from "./connection-authenticator";
 import type { SessionMessageQueue } from "./message-queue";
 import type { PresenceService } from "./presence-service";
+import type { SessionAction } from "@open-inspect/shared";
+import type { SessionWebSocket } from "../platform-ports";
+import type { ShutdownRecoveryAction } from "@open-inspect/shared/types/sandbox-shutdown";
 
-export class SessionClientCommandFacade implements SessionClientCommands<WebSocket, ClientInfo> {
+export class SessionClientCommandFacade implements SessionClientCommands<
+  SessionWebSocket,
+  ClientInfo
+> {
   constructor(
     private readonly authenticator: SessionConnectionAuthenticator,
     private readonly prompts: SessionMessageQueue,
+    private readonly stop: () => Promise<void>,
     private readonly presence: PresenceService,
-    private readonly events: SessionEventStream
+    private readonly events: SessionEventStream,
+    private readonly recover?: (action: ShutdownRecoveryAction) => Promise<void>
   ) {}
 
-  subscribe(connection: WebSocket, message: ClientSubscribe): Promise<void> {
+  subscribe(connection: SessionWebSocket, message: ClientSubscribe): Promise<void> {
     return this.authenticator.handleSubscribe(connection, message);
   }
 
-  submitPrompt(connection: WebSocket, client: ClientInfo, message: ClientPrompt): Promise<void> {
+  submitPrompt(
+    connection: SessionWebSocket,
+    client: ClientInfo,
+    message: ClientPrompt
+  ): Promise<void> {
     return this.prompts.handlePromptMessage(connection, client, message);
   }
 
-  cancelPrompt(connection: WebSocket, message: ClientCancelPrompt): Promise<void> {
+  cancelPrompt(connection: SessionWebSocket, message: ClientCancelPrompt): Promise<void> {
     return this.prompts.cancelQueuedPrompt(connection, message);
   }
 
   stopExecution(): Promise<void> {
-    return this.prompts.stopExecution();
+    return this.stop();
+  }
+
+  recoverShutdown(action: ShutdownRecoveryAction): Promise<void> {
+    if (!this.recover) {
+      return Promise.reject(new Error("Shutdown recovery is not configured"));
+    }
+    return this.recover(action);
   }
 
   notifyTyping(): Promise<void> {
@@ -58,5 +78,13 @@ export class SessionClientCommandFacade implements SessionClientCommands<WebSock
     limit?: number;
   }): SessionHistoryPage {
     return this.events.getHistoryPage(message);
+  }
+
+  authorize(
+    connection: SessionWebSocket,
+    client: ClientInfo,
+    action: SessionAction
+  ): Promise<ClientCommandAuthorization> {
+    return this.authenticator.authorizeClientCommand(connection, client.userId, action);
   }
 }

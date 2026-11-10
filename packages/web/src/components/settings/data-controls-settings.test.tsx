@@ -8,18 +8,27 @@ import * as matchers from "@testing-library/jest-dom/matchers";
 import useSWR, { SWRConfig, mutate as globalMutate } from "swr";
 import { DataControlsSettings } from "./data-controls-settings";
 import { SIDEBAR_SESSIONS_KEY } from "@/lib/session-list";
+import type { SessionListSummary } from "@open-inspect/shared/types/sessions";
 
 expect.extend(matchers);
 
-const { toastMock } = vi.hoisted(() => ({
+const { toastMock, authorizationMock } = vi.hoisted(() => ({
   toastMock: {
     success: vi.fn(),
     error: vi.fn(),
   },
+  authorizationMock: { permissions: null as Set<string> | null },
 }));
 
 vi.mock("sonner", () => ({
   toast: toastMock,
+}));
+
+vi.mock("@/hooks/use-current-user-authorization", () => ({
+  useCurrentUserAuthorization: () => ({
+    hasPermission: (permission: string) =>
+      authorizationMock.permissions === null || authorizationMock.permissions.has(permission),
+  }),
 }));
 
 vi.mock("next/link", () => ({
@@ -30,26 +39,42 @@ vi.mock("next/link", () => ({
   ),
 }));
 
-type ArchivedSession = ReturnType<typeof createArchivedSession>;
+type ArchivedSession = SessionListSummary;
 
-function createArchivedSession(index: number, overrides: Record<string, unknown> = {}) {
+function createArchivedSession(index: number): ArchivedSession {
   return {
     id: `session-${index}`,
+    capabilities: {
+      canRead: true,
+      canCollaborate: false,
+      canManageLifecycle: true,
+      canSandbox: false,
+      canDelete: false,
+      canManageCollaborators: false,
+      canChangeVisibility: false,
+    },
     title: `Session ${index}`,
     repoOwner: "open-inspect",
     repoName: "background-agents",
     baseBranch: "main",
-    branchName: null,
-    baseSha: null,
-    currentSha: null,
-    opencodeSessionId: null,
+    harness: "opencode",
+    model: "anthropic/claude-sonnet-4-6",
+    reasoningEffort: null,
     parentSessionId: null,
     spawnSource: "user",
     spawnDepth: 0,
     status: "archived",
+    automationId: null,
+    automationRunId: null,
+    scmLogin: null,
+    userId: null,
+    totalCost: 0,
+    activeDurationMs: 0,
+    messageCount: 0,
+    prCount: 0,
+    environmentId: null,
     createdAt: 1000 + index,
     updatedAt: 2000 + index,
-    ...overrides,
   };
 }
 
@@ -65,6 +90,7 @@ type FetchHandlers = {
   // successful POST /unarchive removes the session from it so subsequent
   // pages shift the way they would server-side.
   archivedSessions?: ArchivedSession[];
+  onArchivedList?: (offset: number, limit: number) => Response | Promise<Response>;
   onUnarchive?: (sessionId: string) => Response | Promise<Response>;
   onListSidebar?: () => Response | Promise<Response>;
 };
@@ -93,6 +119,7 @@ function installFetch(handlers: FetchHandlers) {
       if (params.get("status") === "archived") {
         const offset = Number(params.get("offset") || 0);
         const limit = Number(params.get("limit") || 20);
+        if (handlers.onArchivedList) return handlers.onArchivedList(offset, limit);
         const sessions = archived.slice(offset, offset + limit);
         return jsonResponse({
           sessions,
@@ -141,9 +168,41 @@ afterEach(async () => {
   vi.restoreAllMocks();
   toastMock.success.mockReset();
   toastMock.error.mockReset();
+  authorizationMock.permissions = null;
 });
 
 describe("DataControlsSettings — unarchive flow", () => {
+  it("keeps archived sessions readable without exposing unarchive to read-only roles", async () => {
+    authorizationMock.permissions = new Set(["sessions.read"]);
+    const session = createArchivedSession(1);
+    session.capabilities!.canManageLifecycle = false;
+    installFetch({ archivedSessions: [session] });
+
+    renderComponent();
+
+    expect(await screen.findByText("Session 1")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Unarchive" })).not.toBeInTheDocument();
+  });
+
+  it("uses response lifecycle capabilities even without browser permission grants", async () => {
+    authorizationMock.permissions = new Set();
+    installFetch({ archivedSessions: [createArchivedSession(1)] });
+    renderComponent();
+    expect(await screen.findByRole("button", { name: "Unarchive" })).toBeInTheDocument();
+  });
+
+  it("toasts the server reason_code on an unarchive denial and keeps the row", async () => {
+    installFetch({
+      archivedSessions: [createArchivedSession(1)],
+      onUnarchive: () => jsonResponse({ reason_code: "team_inactive" }, 403),
+    });
+    renderComponent();
+    const user = userEvent.setup();
+    await user.click(await screen.findByRole("button", { name: "Unarchive" }));
+    expect(toastMock.error).toHaveBeenCalledWith("Failed to unarchive session (team_inactive)");
+    expect(screen.getByText("Session 1")).toBeInTheDocument();
+  });
+
   it("removes the row when the unarchive request succeeds", async () => {
     installFetch({
       archivedSessions: [createArchivedSession(1)],
@@ -270,6 +329,35 @@ describe("DataControlsSettings — unarchive flow", () => {
     expect(await screen.findByText("Session 21")).toBeInTheDocument();
     expect(screen.getByText("Session 22")).toBeInTheDocument();
     expect(screen.getByText("Session 23")).toBeInTheDocument();
+  });
+
+  it("rejects malformed Load-more responses", async () => {
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+    installFetch({
+      onArchivedList: (offset) => {
+        if (offset === 0) {
+          const sessions = Array.from({ length: 20 }, (_, i) => createArchivedSession(i + 1));
+          return jsonResponse({ sessions, hasMore: true });
+        }
+        return jsonResponse({ sessions: [{ id: 21 }], hasMore: false });
+      },
+    });
+
+    renderComponent();
+
+    expect(await screen.findByText("Session 1")).toBeInTheDocument();
+
+    const user = userEvent.setup();
+    await user.click(screen.getByRole("button", { name: "Load more" }));
+
+    await waitFor(() => {
+      expect(consoleError).toHaveBeenCalledWith(
+        "Failed to fetch archived sessions:",
+        expect.any(Error)
+      );
+    });
+    expect(screen.queryByText("Session 21")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Load more" })).toBeEnabled();
   });
 
   it("keeps the row visible when the unarchive request returns 500", async () => {

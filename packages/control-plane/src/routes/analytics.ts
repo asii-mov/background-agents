@@ -1,43 +1,84 @@
 import {
   ANALYTICS_BREAKDOWN_BY,
   ANALYTICS_DAYS,
-  type AnalyticsBreakdownBy,
+  ANALYTICS_RUN_ORDER_BY,
+  ANALYTICS_SCOPES,
+  DEFAULT_ANALYTICS_DAYS,
+  DEFAULT_ANALYTICS_SCOPE,
   type AnalyticsDays,
+  type AnalyticsScope,
 } from "@open-inspect/shared/types/analytics";
-import { type AnalyticsFilters, AnalyticsStore, HUMAN_SPAWN_SOURCES } from "../db/analytics-store";
+import { type AnalyticsFilters, AnalyticsStore } from "../db/analytics-store";
+import { AnalyticsDashboardStore } from "../db/analytics-dashboard-store";
+import { SessionRunStore } from "../db/session-run-store";
+import { TeamMembershipStore } from "../db/team-memberships";
+import { teamsEnforcementMode, viewerFromContext } from "../authorization/session-admission";
+import type { TeamRole } from "@open-inspect/shared/types/teams";
 import {
   type PullRequestAnalyticsFilters,
   PullRequestAnalyticsStore,
 } from "../db/pull-request-analytics-store";
+import { Hono } from "hono";
+import { z } from "zod";
+import { admit, dispatch } from "../routing/admit";
+import type { ControlPlaneHonoEnv } from "../routing/hono-env";
 import type { Env } from "../types";
+import { parseQuery } from "./query";
 import {
   type RequestContext,
-  type Route,
   SCM_AGNOSTIC_USER_OR_SERVICE_ROUTE,
-  defineRoutes,
-  error,
   json,
-  parsePattern,
+  requirePermission,
 } from "./shared";
 
-function parseDaysParam(value: string | null): AnalyticsDays | null {
-  if (value === null) return 30;
+const DEFAULT_RUNS_LIMIT = 50;
+const MAX_RUNS_LIMIT = 100;
 
-  const parsed = Number(value);
-  return ANALYTICS_DAYS.includes(parsed as AnalyticsDays) ? (parsed as AnalyticsDays) : null;
-}
+/** The reporting window; absent, the default. The value is read the way `Number()` reads it. */
+const daysQuery = z.object({
+  days: z
+    .string()
+    .optional()
+    .transform((raw) => (raw === undefined ? DEFAULT_ANALYTICS_DAYS : Number(raw)))
+    .pipe(
+      z.literal(ANALYTICS_DAYS, { error: `days must be one of: ${ANALYTICS_DAYS.join(", ")}` })
+    ),
+});
 
-function parseBreakdownBy(value: string | null): AnalyticsBreakdownBy | null {
-  if (!value) return null;
-  return ANALYTICS_BREAKDOWN_BY.includes(value as AnalyticsBreakdownBy)
-    ? (value as AnalyticsBreakdownBy)
-    : null;
-}
+const windowQuery = daysQuery.extend({
+  scope: z
+    .enum(ANALYTICS_SCOPES, { error: `scope must be one of: ${ANALYTICS_SCOPES.join(", ")}` })
+    .default(DEFAULT_ANALYTICS_SCOPE),
+});
 
-function getFilters(days: AnalyticsDays): AnalyticsFilters {
+const breakdownQuery = windowQuery.extend({
+  by: z.enum(ANALYTICS_BREAKDOWN_BY, {
+    error: `by must be one of: ${ANALYTICS_BREAKDOWN_BY.join(", ")}`,
+  }),
+});
+
+const runsQuery = daysQuery.extend({
+  scope: z
+    .enum(ANALYTICS_SCOPES, { error: `scope must be one of: ${ANALYTICS_SCOPES.join(", ")}` })
+    .default("all"),
+  limit: z
+    .string()
+    .optional()
+    .transform((raw) => (raw === undefined ? DEFAULT_RUNS_LIMIT : Number(raw)))
+    .refine((value) => Number.isSafeInteger(value) && value >= 1 && value <= MAX_RUNS_LIMIT, {
+      error: `limit must be an integer between 1 and ${MAX_RUNS_LIMIT}`,
+    }),
+  orderBy: z
+    .enum(ANALYTICS_RUN_ORDER_BY, {
+      error: `orderBy must be one of: ${ANALYTICS_RUN_ORDER_BY.join(", ")}`,
+    })
+    .default("cost"),
+});
+
+function getFilters(days: AnalyticsDays, scope: AnalyticsScope): AnalyticsFilters {
   const endAt = Date.now();
   const startAt = endAt - days * 24 * 60 * 60 * 1000;
-  return { startAt, endAt, spawnSources: HUMAN_SPAWN_SOURCES };
+  return { startAt, endAt, scope };
 }
 
 /**
@@ -50,95 +91,135 @@ function getPullRequestFilters(days: AnalyticsDays): PullRequestAnalyticsFilters
   return { startAt: now - days * 24 * 60 * 60 * 1000, endAt: now, now };
 }
 
+async function analyticsAccess(ctx: RequestContext, env: Env) {
+  const memberships = ctx.authorization
+    ? (ctx.sessionMemberships ??= await new TeamMembershipStore(ctx.db).listForUser(
+        ctx.authorization.userId
+      ))
+    : new Map<string, TeamRole>();
+  return {
+    viewer: viewerFromContext(ctx, memberships),
+    mode: teamsEnforcementMode(ctx, env),
+  };
+}
+
+async function handleDashboard(
+  request: Request,
+  env: Env,
+  _params: object,
+  ctx: RequestContext
+): Promise<Response> {
+  const query = parseQuery(request, windowQuery);
+  if (query instanceof Response) return query;
+  const { days, scope } = query;
+
+  const generatedAt = Date.now();
+  const { viewer, mode } = await analyticsAccess(ctx, env);
+  const store = new AnalyticsDashboardStore(ctx.db, viewer, mode);
+  return json(
+    await store.get({
+      days,
+      scope,
+      startAt: generatedAt - days * 24 * 60 * 60 * 1000,
+      endAt: generatedAt,
+    })
+  );
+}
+
 async function handleSummary(
   request: Request,
   env: Env,
-  _match: RegExpMatchArray,
+  _params: object,
   ctx: RequestContext
 ): Promise<Response> {
-  const url = new URL(request.url);
-  const days = parseDaysParam(url.searchParams.get("days"));
-  if (!days) {
-    return error(`days must be one of: ${ANALYTICS_DAYS.join(", ")}`, 400);
-  }
+  const query = parseQuery(request, windowQuery);
+  if (query instanceof Response) return query;
+  const { days, scope } = query;
 
-  const store = new AnalyticsStore(ctx.db);
-  return json(await store.getSummary(getFilters(days)));
+  const { viewer, mode } = await analyticsAccess(ctx, env);
+  const store = new AnalyticsStore(ctx.db, viewer, mode);
+  return json(await store.getSummary(getFilters(days, scope)));
 }
 
 async function handleTimeseries(
   request: Request,
   env: Env,
-  _match: RegExpMatchArray,
+  _params: object,
   ctx: RequestContext
 ): Promise<Response> {
-  const url = new URL(request.url);
-  const days = parseDaysParam(url.searchParams.get("days"));
-  if (!days) {
-    return error(`days must be one of: ${ANALYTICS_DAYS.join(", ")}`, 400);
-  }
+  const query = parseQuery(request, windowQuery);
+  if (query instanceof Response) return query;
+  const { days, scope } = query;
 
-  const store = new AnalyticsStore(ctx.db);
-  return json(await store.getTimeseries(getFilters(days)));
+  const { viewer, mode } = await analyticsAccess(ctx, env);
+  const store = new AnalyticsStore(ctx.db, viewer, mode);
+  return json(await store.getTimeseries(getFilters(days, scope)));
 }
 
 async function handleBreakdown(
   request: Request,
   env: Env,
-  _match: RegExpMatchArray,
+  _params: object,
   ctx: RequestContext
 ): Promise<Response> {
-  const url = new URL(request.url);
-  const days = parseDaysParam(url.searchParams.get("days"));
-  if (!days) {
-    return error(`days must be one of: ${ANALYTICS_DAYS.join(", ")}`, 400);
-  }
+  const query = parseQuery(request, breakdownQuery);
+  if (query instanceof Response) return query;
+  const { days, scope, by } = query;
 
-  const byParam = url.searchParams.get("by");
-  const by = parseBreakdownBy(byParam);
-  if (!by) {
-    return error(`by must be one of: ${ANALYTICS_BREAKDOWN_BY.join(", ")}`, 400);
-  }
-
-  const store = new AnalyticsStore(ctx.db);
-  return json(await store.getBreakdown(getFilters(days), by));
+  const { viewer, mode } = await analyticsAccess(ctx, env);
+  const store = new AnalyticsStore(ctx.db, viewer, mode);
+  return json(await store.getBreakdown(getFilters(days, scope), by));
 }
 
 async function handlePullRequests(
   request: Request,
   env: Env,
-  _match: RegExpMatchArray,
+  _params: object,
   ctx: RequestContext
 ): Promise<Response> {
-  const url = new URL(request.url);
-  const days = parseDaysParam(url.searchParams.get("days"));
-  if (!days) {
-    return error(`days must be one of: ${ANALYTICS_DAYS.join(", ")}`, 400);
-  }
+  const query = parseQuery(request, daysQuery);
+  if (query instanceof Response) return query;
+  const { days } = query;
 
-  const store = new PullRequestAnalyticsStore(ctx.db);
+  const { viewer, mode } = await analyticsAccess(ctx, env);
+  const store = new PullRequestAnalyticsStore(ctx.db, viewer, mode);
   return json(await store.get(getPullRequestFilters(days)));
 }
 
-export const analyticsRoutes: Route[] = defineRoutes(SCM_AGNOSTIC_USER_OR_SERVICE_ROUTE, [
-  {
-    method: "GET",
-    pattern: parsePattern("/analytics/summary"),
-    handler: handleSummary,
-  },
-  {
-    method: "GET",
-    pattern: parsePattern("/analytics/timeseries"),
-    handler: handleTimeseries,
-  },
-  {
-    method: "GET",
-    pattern: parsePattern("/analytics/breakdown"),
-    handler: handleBreakdown,
-  },
-  {
-    method: "GET",
-    pattern: parsePattern("/analytics/pull-requests"),
-    handler: handlePullRequests,
-  },
-]);
+async function handleRuns(
+  request: Request,
+  env: Env,
+  _params: object,
+  ctx: RequestContext
+): Promise<Response> {
+  const query = parseQuery(request, runsQuery);
+  if (query instanceof Response) return query;
+  const endAt = Date.now();
+  const { viewer, mode } = await analyticsAccess(ctx, env);
+  const store = new SessionRunStore(ctx.db, viewer, mode);
+  return json({
+    runs: await store.list({
+      startAt: endAt - query.days * 24 * 60 * 60 * 1000,
+      endAt,
+      limit: query.limit,
+      orderBy: query.orderBy,
+      scope: query.scope,
+    }),
+  });
+}
+
+const ANALYTICS_READ = admit({
+  ...SCM_AGNOSTIC_USER_OR_SERVICE_ROUTE,
+  authorization: requirePermission("analytics.read"),
+});
+
+export const analyticsRoutes = new Hono<ControlPlaneHonoEnv>();
+
+analyticsRoutes.get("/analytics/dashboard", ANALYTICS_READ, (c) => dispatch(c, handleDashboard));
+analyticsRoutes.get("/analytics/summary", ANALYTICS_READ, (c) => dispatch(c, handleSummary));
+analyticsRoutes.get("/analytics/timeseries", ANALYTICS_READ, (c) => dispatch(c, handleTimeseries));
+analyticsRoutes.get("/analytics/breakdown", ANALYTICS_READ, (c) => dispatch(c, handleBreakdown));
+analyticsRoutes.get("/analytics/runs", ANALYTICS_READ, (c) => dispatch(c, handleRuns));
+analyticsRoutes.get("/analytics/pull-requests", ANALYTICS_READ, (c) =>
+  dispatch(c, handlePullRequests)
+);

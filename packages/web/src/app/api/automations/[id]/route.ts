@@ -10,6 +10,7 @@ const UPDATE_FIELDS = [
   "scheduleTz",
   "model",
   "reasoningEffort",
+  "harness",
   "eventType",
   "triggerConfig",
   "repositories",
@@ -60,6 +61,25 @@ export async function PUT(request: NextRequest, { params }: { params: Promise<{ 
   } catch (error) {
     console.error("Failed to update automation:", error);
     return NextResponse.json({ error: "Failed to update automation" }, { status: 500 });
+  }
+}
+
+export async function PATCH(request: NextRequest, { params }: { params: Promise<{ id: string }> }) {
+  const session = await getServerAuthSession();
+  if (!session?.user) {
+    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  }
+  const { id } = await params;
+  try {
+    const body = await request.json();
+    const response = await controlPlaneUserFetch(`/automations/${encodeURIComponent(id)}`, {
+      method: "PATCH",
+      body: JSON.stringify({ userId: body.userId }),
+    });
+    return NextResponse.json(await response.json(), { status: response.status });
+  } catch (error) {
+    console.error("Failed to update automation executor:", error);
+    return NextResponse.json({ error: "Failed to update automation executor" }, { status: 500 });
   }
 }
 

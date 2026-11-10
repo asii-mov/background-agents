@@ -17,13 +17,12 @@ from urllib.parse import quote
 
 import httpx
 
-from .constants import (
-    BIN_INSTALL_DIR_ENV_VAR,
-    DEFAULT_BIN_INSTALL_DIR,
-    OPENCODE_PORT,
-)
+from .constants import OPENCODE_PORT
 from .git_excludes import install_runtime_git_excludes
+from .mcp_packages import McpPackageInstaller
+from .platform_context import opencode_instruction_files
 from .process_output import iter_process_lines
+from .sandbox_bin import install_bin_scripts
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping, Sequence
@@ -32,7 +31,10 @@ if TYPE_CHECKING:
     from .runtime_config import OpenCodeConfig
 
 _LOG_FORWARD_STREAM_LIMIT_BYTES = 1024 * 1024
-AGENT_TOOLS_GATED_ON_ENV = {"slack-notify.js": "AGENT_SLACK_NOTIFY_ENABLED"}
+AGENT_TOOLS_GATED_ON_ENV = {
+    "slack-notify.js": "AGENT_SLACK_NOTIFY_ENABLED",
+    "deploy-app.js": "AGENT_APP_DEPLOY_ENABLED",
+}
 AGENT_TOOLS_REQUIRING_REPOSITORY: set[str] = set()
 
 
@@ -68,6 +70,7 @@ class OpenCodeServer:
         self.provider = config.provider
         self.model = config.model
         self.mcp_servers = config.mcp_servers
+        self._mcp_packages = McpPackageInstaller(log)
         self._opencode_process: asyncio.subprocess.Process | None = None
 
     def _assemble_workspace_opencode(self, repositories: Sequence[RepoEntry]) -> None:
@@ -262,30 +265,8 @@ class OpenCodeServer:
         except Exception as e:
             self.log.warn("opencode.global_deps_seed_failed", exc=e)
         installed.update(self._install_skills(workdir))
-        self._install_bin_scripts()
+        install_bin_scripts(self.log)
         return installed
-
-    def _install_bin_scripts(self) -> None:
-        """Install standalone CLI scripts into the sandbox bin directory.
-
-        Scripts in bin/ are standalone CLIs (not OpenCode tool plugins) and must
-        NOT be placed in .opencode/tool/ — OpenCode would import() them during
-        tool discovery, executing module-level code with the parent process argv.
-        """
-        bin_dir = Path("/app/sandbox_runtime/bin")
-        if not bin_dir.is_dir():
-            return
-
-        install_dir = Path(os.environ.get(BIN_INSTALL_DIR_ENV_VAR, DEFAULT_BIN_INSTALL_DIR))
-        install_dir.mkdir(parents=True, exist_ok=True)
-        for script in bin_dir.iterdir():
-            if not script.is_file() or script.suffix not in {"", ".js"}:
-                continue
-            command_name = script.stem if script.suffix == ".js" else script.name
-            dest = install_dir / command_name
-            shutil.copy(script, dest)
-            dest.chmod(0o755)
-            self.log.info("bin.installed", script=command_name)
 
     def _install_skills(self, workdir: Path) -> set[str]:
         """Copy bundled Skills into the .opencode/skills directory."""
@@ -492,75 +473,13 @@ class OpenCodeServer:
             shutil.rmtree(staging, ignore_errors=True)
 
     async def _install_mcp_packages(self, servers: list[dict[str, Any]]) -> None:
-        """Pre-install npm packages for local MCP servers that use npx."""
-        packages: list[str] = []
+        ungoverned: list[Mapping[str, Any]] = []
         for server in servers:
-            if server.get("type") == "remote":
-                continue
             if server.get("artifactSha256") is not None:
                 await self._materialize_mcp_artifact(server)
-                continue
-            cmd = server.get("command", [])
-            if not cmd:
-                continue
-            parts = [c for c in cmd if isinstance(c, str)]
-            if not parts or parts[0] != "npx":
-                continue
-            # Extract package name: prefer -p/--package flag, else first non-flag arg
-            pkg: str | None = None
-            for i, part in enumerate(parts):
-                if part in ("-p", "--package") and i + 1 < len(parts):
-                    pkg = parts[i + 1]
-                    break
-            if pkg is None:
-                non_flags = [p for p in parts[1:] if not p.startswith("-")]
-                pkg = non_flags[0] if non_flags else None
-
-            if pkg:
-                if self._NPM_PKG_RE.match(pkg):
-                    packages.append(pkg)
-                else:
-                    self.log.warn(
-                        "mcp.invalid_package_name",
-                        package=pkg,
-                        note="package skipped — npx will attempt download at runtime",
-                    )
-
-        packages = list(dict.fromkeys(packages))  # deduplicate, preserve order
-        if not packages:
-            return
-
-        self.log.info("mcp.install_packages", packages=packages)
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                "npm",
-                "install",
-                "-g",
-                *packages,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            _stdout, stderr = await asyncio.wait_for(
-                proc.communicate(), timeout=self.MCP_PACKAGE_INSTALL_TIMEOUT_SECONDS
-            )
-            if proc.returncode == 0:
-                self.log.info("mcp.packages_installed", packages=packages)
             else:
-                self.log.warn(
-                    "mcp.packages_install_failed",
-                    packages=packages,
-                    stderr=(stderr or b"").decode()[:500],
-                )
-        except TimeoutError:
-            self.log.warn(
-                "mcp.packages_install_timeout",
-                packages=packages,
-                timeout_seconds=self.MCP_PACKAGE_INSTALL_TIMEOUT_SECONDS,
-            )
-            proc.kill()
-            await proc.wait()
-        except Exception as e:
-            self.log.warn("mcp.packages_install_error", packages=packages, exc=str(e))
+                ungoverned.append(server)
+        await self._mcp_packages.install(ungoverned)
 
     def _build_mcp_config(self, servers: Sequence[Mapping[str, Any]]) -> dict[str, dict[str, Any]]:
         """Convert MCP server list to OpenCode mcp config format."""
@@ -585,7 +504,7 @@ class OpenCodeServer:
                 config[name] = entry
         return config
 
-    async def start(self, repositories: tuple[RepoEntry, ...], workdir: Path) -> None:
+    async def start(self, repositories: Sequence[RepoEntry], workdir: Path) -> None:
         """Start OpenCode server with configuration."""
         self._setup_managed_oauth()
         self.log.info("opencode.start")
@@ -594,7 +513,28 @@ class OpenCodeServer:
         opencode_config: dict[str, Any] = {
             "model": f"{self.provider}/{self.model}",
             "permission": {"*": {"*": "allow"}},
+            "provider": {
+                "anthropic": {
+                    "models": {
+                        model: {
+                            "variants": {
+                                effort: {"thinking": {"type": "enabled", "budgetTokens": budget}}
+                                for effort, budget in (("high", 16_000), ("max", 31_999))
+                            }
+                        }
+                        for model in (
+                            "claude-haiku-4-5",
+                            "claude-sonnet-4-5",
+                            "claude-opus-4-5",
+                        )
+                    }
+                }
+            },
         }
+
+        instructions = opencode_instruction_files(resolve_opencode_global_config_dir())
+        if instructions:
+            opencode_config["instructions"] = instructions
 
         # Inject MCP servers
         mcp_servers = self._resolve_mcp_servers()

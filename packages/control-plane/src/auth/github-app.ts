@@ -12,7 +12,12 @@
 import type { InstallationRepository } from "@open-inspect/shared/types/repository-catalog";
 import { DEFAULT_APP_NAME } from "@open-inspect/shared/app-name";
 import type { CacheStore } from "@open-inspect/shared/cache-store";
+import { sha256Hex } from "@open-inspect/shared/service-auth";
 import { z } from "zod";
+import {
+  repositoryCredentialScope,
+  type CredentialScope,
+} from "../source-control/credential-scope";
 
 import { base64UrlEncode } from "./encoding";
 
@@ -25,10 +30,24 @@ export const INSTALLATION_TOKEN_CACHE_MAX_AGE_MS = 50 * 60 * 1000;
 /** Require at least this much remaining lifetime before using a cached token (ms). */
 export const INSTALLATION_TOKEN_MIN_REMAINING_MS = 5 * 60 * 1000;
 
+/** Maximum distinct token scopes retained in the process cache. */
+export const INSTALLATION_TOKEN_MEMORY_CACHE_MAX_ENTRIES = 128;
+
 /** Upper bound for KV cache TTL (seconds). */
 const INSTALLATION_TOKEN_CACHE_MAX_TTL_SECONDS = 3600;
 
-const INSTALLATION_TOKEN_CACHE_KEY_PREFIX = "github:installation-token:v1";
+const INSTALLATION_TOKEN_CACHE_KEY_PREFIX = "github:installation-token:v2";
+
+export type TokenScope = CredentialScope;
+
+/** Repository permissions a minted token is narrowed to; omitted, it carries every installation grant. */
+export type InstallationTokenPermissions = Readonly<Record<string, "read" | "write">>;
+
+interface InstallationTokenOptions {
+  scope: TokenScope;
+  permissions?: InstallationTokenPermissions;
+  forceRefresh?: boolean;
+}
 
 interface InstallationTokenCacheBindings {
   cacheStore?: CacheStore;
@@ -36,23 +55,18 @@ interface InstallationTokenCacheBindings {
   userAgent?: string;
 }
 
-type GitHubRepositoryPermission = "read" | "write";
-
-export interface GitHubInstallationTokenScope {
-  repositoryIds: readonly number[];
-  permissions?: Partial<Record<string, GitHubRepositoryPermission>>;
-}
-
 function resolveUserAgent(env: InstallationTokenCacheBindings | undefined): string {
   const value = env?.userAgent?.trim();
   return value && value.length > 0 ? value : DEFAULT_APP_NAME;
 }
 
-interface CachedInstallationToken {
-  token: string;
-  expiresAtEpochMs: number;
-  cachedAtEpochMs: number;
-}
+const cachedInstallationTokenSchema = z.object({
+  token: z.string(),
+  expiresAtEpochMs: z.number(),
+  cachedAtEpochMs: z.number(),
+});
+
+type CachedInstallationToken = z.infer<typeof cachedInstallationTokenSchema>;
 
 interface GitHubHttpError extends Error {
   status?: number;
@@ -65,7 +79,10 @@ function createHttpError(message: string, status: number): GitHubHttpError {
 }
 
 const installationTokenMemoryCache = new Map<string, CachedInstallationToken>();
-const installationTokenRefreshInFlight = new Map<string, Promise<CachedInstallationToken>>();
+const installationTokenRefreshInFlight = new Map<
+  string,
+  { promise: Promise<CachedInstallationToken>; options: { forceRefresh: boolean } }
+>();
 const importedPrivateKeyCache = new Map<string, Promise<CryptoKey>>();
 
 /** Fetch with an AbortController timeout. */
@@ -142,12 +159,14 @@ const repositoryBranchesResponseSchema = z.array(z.object({ name: z.string() }))
  * Parse PEM-encoded private key to raw bytes.
  */
 function parsePemPrivateKey(pem: string): Uint8Array {
-  // Remove PEM header/footer and newlines
+  // Remove PEM header/footer and newlines, including the two-character
+  // `\n` an environment file leaves in place of a newline.
   const pemContents = pem
     .replace(/-----BEGIN RSA PRIVATE KEY-----/g, "")
     .replace(/-----END RSA PRIVATE KEY-----/g, "")
     .replace(/-----BEGIN PRIVATE KEY-----/g, "")
     .replace(/-----END PRIVATE KEY-----/g, "")
+    .replace(/\\n/g, "")
     .replace(/\s/g, "");
 
   // Decode base64
@@ -253,15 +272,11 @@ async function getInstallationTokenWithMetadata(
   jwt: string,
   installationId: string,
   userAgent: string,
-  scope?: GitHubInstallationTokenScope
+  scope: TokenScope,
+  permissions: InstallationTokenPermissions | undefined
 ): Promise<InstallationTokenResponse> {
   const url = `https://api.github.com/app/installations/${installationId}/access_tokens`;
-  const body = scope
-    ? JSON.stringify({
-        repository_ids: scope.repositoryIds,
-        ...(scope.permissions ? { permissions: scope.permissions } : {}),
-      })
-    : undefined;
+  const narrowed = scope.kind === "repositories" || permissions !== undefined;
 
   const response = await fetchWithTimeout(url, {
     method: "POST",
@@ -270,9 +285,16 @@ async function getInstallationTokenWithMetadata(
       Accept: "application/vnd.github+json",
       "X-GitHub-Api-Version": "2022-11-28",
       "User-Agent": userAgent,
-      ...(body ? { "Content-Type": "application/json" } : {}),
+      ...(narrowed ? { "Content-Type": "application/json" } : {}),
     },
-    ...(body ? { body } : {}),
+    ...(narrowed
+      ? {
+          body: JSON.stringify({
+            ...(scope.kind === "repositories" ? { repository_ids: scope.repositoryIds } : {}),
+            ...(permissions ? { permissions } : {}),
+          }),
+        }
+      : {}),
   });
 
   if (!response.ok) {
@@ -299,26 +321,20 @@ async function getInstallationTokenWithMetadata(
   return parsed.data;
 }
 
-export async function createScopedInstallationTokenWithExpiry(
+export async function getInstallationTokenCacheKey(
   config: GitHubAppConfig,
-  scope: GitHubInstallationTokenScope,
-  env?: InstallationTokenCacheBindings
-): Promise<{ token: string; expiresAtEpochMs: number }> {
-  if (scope.repositoryIds.length === 0) {
-    throw new Error("Scoped GitHub installation token requires at least one repository id");
+  scope: TokenScope,
+  permissions?: InstallationTokenPermissions
+): Promise<string> {
+  let scopeHash = "all";
+  if (scope.kind === "repositories") {
+    const ids = repositoryCredentialScope(scope.repositoryIds).repositoryIds;
+    scopeHash = await sha256Hex(JSON.stringify(ids));
   }
-  const jwt = await generateAppJwt(config.appId, config.privateKey);
-  const token = await getInstallationTokenWithMetadata(
-    jwt,
-    config.installationId,
-    resolveUserAgent(env),
-    scope
-  );
-  return { token: token.token, expiresAtEpochMs: token.expiresAtEpochMs };
-}
-
-function getInstallationTokenCacheKey(config: GitHubAppConfig): string {
-  return `${INSTALLATION_TOKEN_CACHE_KEY_PREFIX}:${config.appId}:${config.installationId}`;
+  const key = `${INSTALLATION_TOKEN_CACHE_KEY_PREFIX}:${config.appId}:${config.installationId}:${scopeHash}`;
+  if (!permissions) return key;
+  const grants = Object.entries(permissions).sort(([a], [b]) => a.localeCompare(b));
+  return `${key}:${await sha256Hex(JSON.stringify(grants))}`;
 }
 
 function isTokenUsable(cached: CachedInstallationToken, nowEpochMs = Date.now()): boolean {
@@ -327,6 +343,20 @@ function isTokenUsable(cached: CachedInstallationToken, nowEpochMs = Date.now())
     return false;
   }
   return nowEpochMs < cached.expiresAtEpochMs - INSTALLATION_TOKEN_MIN_REMAINING_MS;
+}
+
+function cacheInstallationTokenInMemory(cacheKey: string, cached: CachedInstallationToken): void {
+  const nowEpochMs = Date.now();
+  for (const [key, token] of installationTokenMemoryCache) {
+    if (!isTokenUsable(token, nowEpochMs)) installationTokenMemoryCache.delete(key);
+  }
+  installationTokenMemoryCache.delete(cacheKey);
+  if (!isTokenUsable(cached, nowEpochMs)) return;
+  installationTokenMemoryCache.set(cacheKey, cached);
+  if (installationTokenMemoryCache.size > INSTALLATION_TOKEN_MEMORY_CACHE_MAX_ENTRIES) {
+    const oldestKey = installationTokenMemoryCache.keys().next().value;
+    if (oldestKey !== undefined) installationTokenMemoryCache.delete(oldestKey);
+  }
 }
 
 async function readInstallationTokenFromCache(
@@ -338,8 +368,10 @@ async function readInstallationTokenFromCache(
   }
 
   try {
-    const cached = await env.cacheStore.get<CachedInstallationToken>(cacheKey, "json");
-    return cached ?? null;
+    const result = cachedInstallationTokenSchema.safeParse(
+      await env.cacheStore.get(cacheKey, "json")
+    );
+    return result.success ? result.data : null;
   } catch {
     return null;
   }
@@ -373,12 +405,13 @@ async function writeInstallationTokenToCache(
   }
 }
 
-async function invalidateInstallationTokenCache(
+export async function invalidateInstallationTokenCache(
   env: InstallationTokenCacheBindings | undefined,
   cacheKey: string
 ): Promise<void> {
   installationTokenMemoryCache.delete(cacheKey);
-  installationTokenRefreshInFlight.delete(cacheKey);
+  const pending = installationTokenRefreshInFlight.get(cacheKey);
+  if (pending) pending.options.forceRefresh = true;
 
   if (!env?.cacheStore) {
     return;
@@ -394,14 +427,18 @@ async function invalidateInstallationTokenCache(
 async function refreshInstallationToken(
   config: GitHubAppConfig,
   env: InstallationTokenCacheBindings | undefined,
-  cacheKey: string
+  cacheKey: string,
+  scope: TokenScope,
+  permissions: InstallationTokenPermissions | undefined
 ): Promise<CachedInstallationToken> {
   const nowEpochMs = Date.now();
   const jwt = await generateAppJwt(config.appId, config.privateKey);
   const tokenData = await getInstallationTokenWithMetadata(
     jwt,
     config.installationId,
-    resolveUserAgent(env)
+    resolveUserAgent(env),
+    scope,
+    permissions
   );
   const cached: CachedInstallationToken = {
     token: tokenData.token,
@@ -409,41 +446,64 @@ async function refreshInstallationToken(
     cachedAtEpochMs: nowEpochMs,
   };
 
-  installationTokenMemoryCache.set(cacheKey, cached);
+  cacheInstallationTokenInMemory(cacheKey, cached);
   await writeInstallationTokenToCache(env, cacheKey, cached);
   return cached;
 }
 
 async function getOrRefreshCachedInstallationToken(
   config: GitHubAppConfig,
-  env?: InstallationTokenCacheBindings,
-  options?: { forceRefresh?: boolean }
+  env: InstallationTokenCacheBindings | undefined,
+  options: InstallationTokenOptions
 ): Promise<CachedInstallationToken> {
-  const cacheKey = getInstallationTokenCacheKey(config);
-  const forceRefresh = options?.forceRefresh ?? false;
+  const scope: TokenScope =
+    options.scope.kind === "all"
+      ? options.scope
+      : repositoryCredentialScope(options.scope.repositoryIds);
+  const cacheKey = await getInstallationTokenCacheKey(config, scope, options.permissions);
+  const forceRefresh = options.forceRefresh ?? false;
+
+  const pending = installationTokenRefreshInFlight.get(cacheKey);
+  if (pending) {
+    if (forceRefresh) pending.options.forceRefresh = true;
+    return pending.promise;
+  }
 
   if (!forceRefresh) {
     const memoryCached = installationTokenMemoryCache.get(cacheKey);
     if (memoryCached && isTokenUsable(memoryCached)) {
+      // Re-insert to mark most recently used; expired entries are pruned on insert.
+      installationTokenMemoryCache.delete(cacheKey);
+      installationTokenMemoryCache.set(cacheKey, memoryCached);
       return memoryCached;
     }
-
-    const persistentCached = await readInstallationTokenFromCache(env, cacheKey);
-    if (persistentCached && isTokenUsable(persistentCached)) {
-      installationTokenMemoryCache.set(cacheKey, persistentCached);
-      return persistentCached;
-    }
-
-    const inFlight = installationTokenRefreshInFlight.get(cacheKey);
-    if (inFlight) {
-      return inFlight;
-    }
+    installationTokenMemoryCache.delete(cacheKey);
   }
 
-  const refreshPromise = refreshInstallationToken(config, env, cacheKey).finally(() => {
-    installationTokenRefreshInFlight.delete(cacheKey);
+  const refreshOptions = { forceRefresh };
+  const refreshPromise = (async () => {
+    if (!refreshOptions.forceRefresh) {
+      const persistentCached = await readInstallationTokenFromCache(env, cacheKey);
+      // Invalidation or a forced caller can supersede a pending cache read.
+      if (!refreshOptions.forceRefresh && persistentCached && isTokenUsable(persistentCached)) {
+        cacheInstallationTokenInMemory(cacheKey, persistentCached);
+        // Forced callers must not join work that has already selected a cache hit.
+        if (installationTokenRefreshInFlight.get(cacheKey)?.options === refreshOptions) {
+          installationTokenRefreshInFlight.delete(cacheKey);
+        }
+        return persistentCached;
+      }
+    }
+    return refreshInstallationToken(config, env, cacheKey, scope, options.permissions);
+  })().finally(() => {
+    if (installationTokenRefreshInFlight.get(cacheKey)?.promise === refreshPromise) {
+      installationTokenRefreshInFlight.delete(cacheKey);
+    }
   });
-  installationTokenRefreshInFlight.set(cacheKey, refreshPromise);
+  installationTokenRefreshInFlight.set(cacheKey, {
+    promise: refreshPromise,
+    options: refreshOptions,
+  });
 
   return refreshPromise;
 }
@@ -453,8 +513,8 @@ async function getOrRefreshCachedInstallationToken(
  */
 export async function getCachedInstallationToken(
   config: GitHubAppConfig,
-  env?: InstallationTokenCacheBindings,
-  options?: { forceRefresh?: boolean }
+  env: InstallationTokenCacheBindings | undefined,
+  options: InstallationTokenOptions
 ): Promise<string> {
   const cached = await getOrRefreshCachedInstallationToken(config, env, options);
   return cached.token;
@@ -468,8 +528,8 @@ export async function getCachedInstallationToken(
  */
 export async function getCachedInstallationTokenWithExpiry(
   config: GitHubAppConfig,
-  env?: InstallationTokenCacheBindings,
-  options?: { forceRefresh?: boolean }
+  env: InstallationTokenCacheBindings | undefined,
+  options: InstallationTokenOptions
 ): Promise<{ token: string; expiresAtEpochMs: number }> {
   const cached = await getOrRefreshCachedInstallationToken(config, env, options);
   return { token: cached.token, expiresAtEpochMs: cached.expiresAtEpochMs };
@@ -492,7 +552,8 @@ export async function listInstallationRepositories(
   env?: InstallationTokenCacheBindings
 ): Promise<{ repos: InstallationRepository[]; timing: ListReposTiming }> {
   const tokenStart = performance.now();
-  let token = await getCachedInstallationToken(config, env);
+  const scope: TokenScope = { kind: "all" };
+  let token = await getCachedInstallationToken(config, env, { scope });
   const tokenGenerationMs = performance.now() - tokenStart;
 
   const perPage = 100;
@@ -554,8 +615,8 @@ export async function listInstallationRepositories(
       throw error;
     }
 
-    await invalidateInstallationTokenCache(env, getInstallationTokenCacheKey(config));
-    token = await getCachedInstallationToken(config, env, { forceRefresh: true });
+    await invalidateInstallationTokenCache(env, await getInstallationTokenCacheKey(config, scope));
+    token = await getCachedInstallationToken(config, env, { scope, forceRefresh: true });
     headers.Authorization = `Bearer ${token}`;
     first = await fetchPage(1);
   }
@@ -599,12 +660,13 @@ export async function getInstallationRepository(
   repo: string,
   env?: InstallationTokenCacheBindings
 ): Promise<InstallationRepository | null> {
-  const cacheKey = getInstallationTokenCacheKey(config);
+  const scope: TokenScope = { kind: "all" };
+  const cacheKey = await getInstallationTokenCacheKey(config, scope);
   let forceRefresh = false;
   let response!: Response;
 
   for (let attempt = 0; attempt < 2; attempt++) {
-    const token = await getCachedInstallationToken(config, env, { forceRefresh });
+    const token = await getCachedInstallationToken(config, env, { scope, forceRefresh });
     response = await fetchWithTimeout(`https://api.github.com/repos/${owner}/${repo}`, {
       headers: {
         Authorization: `Bearer ${token}`,
@@ -659,7 +721,7 @@ export async function listRepositoryBranches(
   repo: string,
   env?: InstallationTokenCacheBindings
 ): Promise<{ name: string }[]> {
-  const token = await getCachedInstallationToken(config, env);
+  const token = await getCachedInstallationToken(config, env, { scope: { kind: "all" } });
   const branches: { name: string }[] = [];
   let page = 1;
 

@@ -12,7 +12,7 @@ const generatedMapPath = resolve(repositoryRoot, "docs/REPO_MAP.md");
 const appRoot = resolve(repositoryRoot, "packages/web/src/app/(app)");
 const settingsNavPath = resolve(
   repositoryRoot,
-  "packages/web/src/components/settings/settings-nav.tsx"
+  "packages/web/src/components/settings/settings-registry.ts"
 );
 const verificationFixturePath = resolve(repositoryRoot, "packages/web/e2e/verification-test.ts");
 
@@ -74,16 +74,16 @@ function discoverAppRoutes() {
 
 function discoverSettingsTabs() {
   const source = readFileSync(settingsNavPath, "utf8");
-  const start = source.indexOf("const NAV_ITEMS");
+  const start = source.indexOf("export const SETTINGS_GROUPS");
   const end = source.indexOf("] as const", start);
   if (start === -1 || end === -1) {
-    throw new Error("Could not find the NAV_ITEMS Settings inventory.");
+    throw new Error("Could not find the SETTINGS_GROUPS Settings inventory.");
   }
 
   const tabs = [];
   const itemPattern = /\bid:\s*["']([^"']+)["']/g;
   for (const match of source.slice(start, end).matchAll(itemPattern)) tabs.push(match[1]);
-  if (tabs.length === 0) throw new Error("The NAV_ITEMS Settings inventory is empty.");
+  if (tabs.length === 0) throw new Error("The SETTINGS_GROUPS Settings inventory is empty.");
   return tabs;
 }
 

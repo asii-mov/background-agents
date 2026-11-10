@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  DEFAULT_FINAL_SNAPSHOT_BUFFER_MS,
   DEFAULT_CODE_SERVER_PORT,
   DEFAULT_TERMINAL_PORT,
   DEFAULT_VNC_PORT,
@@ -8,6 +9,7 @@ import {
 import {
   normalizeSandboxSettings,
   parsePersistedSandboxSettings,
+  parseSandboxTunnelsPolicy,
   SandboxSettingsValidationError,
 } from "./settings";
 
@@ -22,6 +24,12 @@ describe("parsePersistedSandboxSettings", () => {
     expect(
       parsePersistedSandboxSettings('{"sandboxTimeoutMs":14400000,"tunnelPorts":[3000,"bad"]}')
     ).toEqual({ sandboxTimeoutMs: 14_400_000, tunnelPorts: [3000] });
+  });
+
+  it("omits a persisted timeout that cannot accommodate the default final buffer", () => {
+    expect(
+      parsePersistedSandboxSettings('{"sandboxTimeoutMs":300000,"terminalEnabled":true}')
+    ).toEqual({ terminalEnabled: true });
   });
 
   it.each(["", "not-json"])("throws when persisted blob %j is not valid JSON", (settingsJson) => {
@@ -164,7 +172,7 @@ describe("normalizeSandboxSettings", () => {
         SandboxSettingsValidationError
       );
     }
-    expect(normalizeSandboxSettings({ sandboxTimeoutMs: 1000 })).toEqual({
+    expect(normalizeSandboxSettings({ sandboxTimeoutMs: 1000 }, { partial: true })).toEqual({
       sandboxTimeoutMs: 1000,
     });
   });
@@ -172,6 +180,95 @@ describe("normalizeSandboxSettings", () => {
   it("omits an invalid sandboxTimeoutMs while preserving valid fields", () => {
     expect(
       normalizeSandboxSettings({ sandboxTimeoutMs: -1, terminalEnabled: true }, { invalid: "omit" })
+    ).toEqual({ terminalEnabled: true });
+  });
+
+  it("validates final snapshot buffers and their effective default against timeout", () => {
+    expect(
+      normalizeSandboxSettings({
+        sandboxTimeoutMs: 1_200_000,
+        finalSnapshotBufferMs: 300_000,
+      })
+    ).toEqual({ sandboxTimeoutMs: 1_200_000, finalSnapshotBufferMs: 300_000 });
+    expect(() => normalizeSandboxSettings({ sandboxTimeoutMs: 300_000 })).toThrow(
+      SandboxSettingsValidationError
+    );
+    expect(() =>
+      normalizeSandboxSettings({
+        sandboxTimeoutMs: DEFAULT_FINAL_SNAPSHOT_BUFFER_MS,
+      })
+    ).toThrow(SandboxSettingsValidationError);
+    expect(() =>
+      normalizeSandboxSettings({
+        sandboxTimeoutMs: 1_200_000,
+        finalSnapshotBufferMs: 1_200_000,
+      })
+    ).toThrow(SandboxSettingsValidationError);
+  });
+
+  it.each([299_000, 300_001, Number.MAX_SAFE_INTEGER + 1, Number.NaN, Number.POSITIVE_INFINITY])(
+    "rejects malformed final snapshot buffer %s",
+    (finalSnapshotBufferMs) => {
+      expect(() => normalizeSandboxSettings({ finalSnapshotBufferMs })).toThrow(
+        SandboxSettingsValidationError
+      );
+    }
+  );
+
+  it("preserves partial override fields until merge validation", () => {
+    expect(
+      normalizeSandboxSettings(
+        { sandboxTimeoutMs: 360_000, finalSnapshotBufferMs: 600_000 },
+        { partial: true }
+      )
+    ).toEqual({ sandboxTimeoutMs: 360_000, finalSnapshotBufferMs: 600_000 });
+  });
+
+  it("omits unsafe effective relationships while preserving unrelated settings", () => {
+    expect(
+      normalizeSandboxSettings(
+        {
+          sandboxTimeoutMs: 1_200_000,
+          finalSnapshotBufferMs: 1_200_000,
+          terminalEnabled: true,
+        },
+        { invalid: "omit" }
+      )
+    ).toEqual({ sandboxTimeoutMs: 1_200_000, terminalEnabled: true });
+    expect(
+      normalizeSandboxSettings(
+        {
+          sandboxTimeoutMs: 300_000,
+          finalSnapshotBufferMs: 300_000,
+          terminalEnabled: true,
+        },
+        { invalid: "omit" }
+      )
+    ).toEqual({ terminalEnabled: true });
+  });
+
+  it("accepts valid session cost settings", () => {
+    expect(normalizeSandboxSettings({ maxSessionCostUsd: 12.5 })).toEqual({
+      maxSessionCostUsd: 12.5,
+    });
+  });
+
+  it.each([{ maxSessionCostUsd: 0 }, { maxSessionCostUsd: -1 }, { maxSessionCostUsd: Number.NaN }])(
+    "rejects invalid session cost settings %#",
+    (settings) => {
+      expect(() => normalizeSandboxSettings(settings)).toThrow(SandboxSettingsValidationError);
+    }
+  );
+
+  it("omits invalid session cost settings while preserving valid siblings", () => {
+    expect(
+      normalizeSandboxSettings(
+        {
+          maxSessionCostUsd: -1,
+          terminalEnabled: true,
+        },
+        { invalid: "omit" }
+      )
     ).toEqual({ terminalEnabled: true });
   });
 
@@ -260,5 +357,42 @@ describe("normalizeSandboxSettings", () => {
     ).toEqual({
       tunnelPorts: [3000],
     });
+  });
+});
+
+describe("sandbox tunnels policy", () => {
+  it("reads SANDBOX_TUNNELS_POLICY, keeping public tunnels when unset and failing closed otherwise", () => {
+    expect(parseSandboxTunnelsPolicy(undefined)).toBe("public");
+    expect(parseSandboxTunnelsPolicy("")).toBe("public");
+    expect(parseSandboxTunnelsPolicy("public")).toBe("public");
+    expect(parseSandboxTunnelsPolicy("disabled")).toBe("disabled");
+    expect(parseSandboxTunnelsPolicy("Disabled")).toBe("disabled");
+  });
+
+  it("accepts tunnel ports under the public policy", () => {
+    expect(normalizeSandboxSettings({ tunnelPorts: [3000] }, { tunnelsPolicy: "public" })).toEqual({
+      tunnelPorts: [3000],
+    });
+  });
+
+  it("rejects tunnel ports under the disabled policy and points at deploy-app", () => {
+    expect(() =>
+      normalizeSandboxSettings({ tunnelPorts: [3000] }, { tunnelsPolicy: "disabled" })
+    ).toThrow(/Deploy with the deploy-app tool instead/);
+  });
+
+  it("still accepts settings that expose no tunnel under the disabled policy", () => {
+    expect(
+      normalizeSandboxSettings(
+        { tunnelPorts: [], terminalEnabled: true },
+        { tunnelsPolicy: "disabled" }
+      )
+    ).toEqual({ terminalEnabled: true });
+  });
+
+  it("drops persisted tunnel ports under the disabled policy", () => {
+    expect(
+      parsePersistedSandboxSettings('{"tunnelPorts":[3000],"terminalEnabled":true}', "disabled")
+    ).toEqual({ terminalEnabled: true });
   });
 });

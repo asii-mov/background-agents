@@ -1,39 +1,67 @@
-import { applyIdentityEnforcement } from "../auth/identity-enforcement";
-import { SessionInternalPaths } from "../session/contracts";
-import type { Env } from "../types";
+import { Hono } from "hono";
+import { admit } from "../routing/admit";
+import type { ControlPlaneHonoEnv } from "../routing/hono-env";
+import { applyIdentityEnforcement } from "../routing/identity-enforcement";
+import { SessionInternalPaths, sessionScmDisplayFieldsSchema } from "../session/contracts";
+import { UserStore } from "../db/user-store";
+import { resolveGitHubEnrichmentForRequest, type GitHubEnrichment } from "../session/identity";
+import { resolveScmProviderFromEnv } from "../source-control/config";
 import {
-  defineRoutes,
-  error,
-  GITHUB_USER_OR_SERVICE_ROUTE,
-  parseJsonBody,
-  parsePattern,
-  type Route,
-} from "./shared";
-import { sessionRoute, type SessionRouteContext } from "./session-route";
+  GitHubAttributionUnavailableError,
+  resolveGitHubCredentialAuthority,
+} from "../source-control/github-credential-authority";
+import type { Env } from "../types";
+import { error, GITHUB_USER_OR_SERVICE_ROUTE, requireSession } from "./shared";
+import { parseJsonBody } from "./body";
+import { dispatchSession, type SessionRouteContext } from "./session-route";
 
-async function handleSessionWsToken(
+// Optional attribution must leave time for minting before the browser proxy aborts.
+const WS_GITHUB_ATTRIBUTION_TIMEOUT_MS = 5_000;
+
+export async function handleSessionWsToken(
   request: Request,
-  _env: Env,
-  match: RegExpMatchArray,
+  env: Env,
+  params: { id: string },
   ctx: SessionRouteContext
 ): Promise<Response> {
-  const sessionId = match.groups?.id;
-  if (!sessionId) return error("Session ID required");
+  const sessionId = params.id;
 
-  const body = await parseJsonBody<{
-    scmLogin?: string;
-    scmName?: string;
-    scmEmail?: string;
-  }>(request);
-  if (body instanceof Response) return body;
+  const rawBody = await parseJsonBody(request);
+  if (rawBody instanceof Response) return rawBody;
 
-  // The participant identity comes from the verified principal; body SCM
-  // credentials are rejected (tokens arrive via the exchange; enrichment
-  // reads the store server-side).
-  const enforcement = applyIdentityEnforcement(ctx, "ws-token", body);
+  // The participant identity comes from the verified principal. Current
+  // callers send identity/display fields only; token fields are rejected.
+  const enforcement = applyIdentityEnforcement(ctx, "ws-token", rawBody);
   if (enforcement.rejection) return enforcement.rejection;
+
+  const parsedBody = sessionScmDisplayFieldsSchema.safeParse(rawBody);
+  if (!parsedBody.success) return error("Invalid websocket token body", 400);
+  const body = parsedBody.data;
+
+  const authorization = ctx.authorization;
+  if (!authorization) return error("Authorization unavailable", 503);
   const userId = enforcement.enforced.participantUserId;
-  const canonicalUserId = enforcement.enforced.canonicalUserId;
+  const canonicalUserId = authorization.userId;
+  const isGitHub = resolveScmProviderFromEnv(env.SCM_PROVIDER) === "github";
+  let enrichment: GitHubEnrichment | null = null;
+  if (isGitHub) {
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    const deadline = new Promise<null>((resolve) => {
+      timeout = setTimeout(() => resolve(null), WS_GITHUB_ATTRIBUTION_TIMEOUT_MS);
+    });
+    try {
+      enrichment = await Promise.race([
+        resolveGitHubCredentialAuthority(ctx, request.headers).then((authority) =>
+          resolveGitHubEnrichmentForRequest(new UserStore(ctx.db), canonicalUserId, authority)
+        ),
+        deadline,
+      ]);
+    } catch (retrievalError) {
+      if (!(retrievalError instanceof GitHubAttributionUnavailableError)) throw retrievalError;
+    } finally {
+      if (timeout !== undefined) clearTimeout(timeout);
+    }
+  }
 
   return ctx.metrics.time("do_fetch", () =>
     ctx.sessionRuntime.fetch(sessionId, SessionInternalPaths.wsToken, {
@@ -42,18 +70,23 @@ async function handleSessionWsToken(
       body: JSON.stringify({
         userId,
         canonicalUserId,
-        scmLogin: body.scmLogin,
-        scmName: body.scmName,
-        scmEmail: body.scmEmail,
+        replaceScmIdentity: isGitHub,
+        scmUserId: enrichment?.scmUserId ?? null,
+        scmLogin: isGitHub ? (enrichment?.scmLogin ?? null) : body.scmLogin,
+        scmName: isGitHub ? (enrichment?.displayName ?? null) : body.scmName,
+        scmEmail: isGitHub ? (enrichment?.email ?? null) : body.scmEmail,
       }),
     })
   );
 }
 
-export const sessionWsTokenRoutes: Route[] = defineRoutes(GITHUB_USER_OR_SERVICE_ROUTE, [
-  sessionRoute({
-    method: "POST",
-    pattern: parsePattern("/sessions/:id/ws-token"),
-    handler: handleSessionWsToken,
+export const sessionWsTokenRoutes = new Hono<ControlPlaneHonoEnv>();
+
+sessionWsTokenRoutes.post(
+  "/sessions/:id/ws-token",
+  admit({
+    ...GITHUB_USER_OR_SERVICE_ROUTE,
+    authorization: requireSession("read"),
   }),
-]);
+  (c) => dispatchSession(c, handleSessionWsToken)
+);

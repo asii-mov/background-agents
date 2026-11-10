@@ -1,0 +1,90 @@
+{
+  "$comment": "Generated from packages/shared/src/apps.ts by `npm run generate:app-deploy-contract -w @open-inspect/shared`. Do not edit.",
+  "tool": {
+    "name": "deploy-app",
+    "path": "/apps",
+    "timeoutSeconds": 150,
+    "description": "Publish a built web app at https://<name>.<company apps domain>. Every visitor signs in through Cloudflare Access with company SSO; the platform configures that and verifies it in front of your code. If the app stores data, declare it in openinspect.app.json (data, secrets) and put schema files in migrations/; the platform provisions and binds them. Build first, then pass the build output directory and, if the app has server code, one bundled ES-module Worker file. Calling again with the same name updates the app.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "projectDir": {
+          "type": "string",
+          "description": "Directory containing openinspect.app.json (default: the repository root)."
+        },
+        "name": {
+          "type": "string",
+          "description": "Lowercase app name; first label of the URL. Optional when openinspect.app.json names the app."
+        },
+        "assetsDir": {
+          "type": "string",
+          "description": "Directory of built static files (for example dist)."
+        },
+        "workerFile": {
+          "type": "string",
+          "description": "Optional bundled ES-module Worker. It receives env.ASSETS, your declared bindings and secrets, and the signed-in user's identity in the x-openinspect-user-sub header."
+        }
+      },
+      "required": [],
+      "additionalProperties": false
+    }
+  },
+  "appManifestFile": "openinspect.app.json",
+  "defaultMigrationsDir": "migrations",
+  "migrationFilePattern": "^\\d{4}_[a-z0-9-]+\\.sql$",
+  "parts": {
+    "manifest": "manifest",
+    "app": "app",
+    "worker": "worker",
+    "assetPrefix": "a",
+    "migrationPrefix": "m"
+  },
+  "limits": {
+    "maxRequestBytes": 16777216,
+    "maxAssetCount": 2000,
+    "maxAssetBytes": 16777216,
+    "maxWorkerBytes": 3145728,
+    "maxAssetPathLength": 256,
+    "maxMigrationFiles": 200
+  },
+  "reasons": {
+    "feature_unavailable": "App hosting is not set up for this workspace. Tell the user; do not try other hosting.",
+    "invalid_bundle": "The build output could not be packaged. Fix the reported path or file and call deploy-app again.",
+    "bundle_too_large": "The build output is over 16 MiB. Remove source maps, media and unused files, then retry.",
+    "invalid_name": "Use a short lowercase name: letters, digits and single hyphens, starting and ending with a letter or digit.",
+    "reserved_name": "That name is reserved. Choose a more specific name and tell the user the new URL.",
+    "name_taken": "Another person already owns an app with this name. Choose a different name and tell the user.",
+    "app_taken_down": "An administrator took this app down. Do not redeploy under another name; tell the user to contact an administrator.",
+    "permission_denied": "The session owner is not allowed to deploy apps. Tell the user to ask an administrator.",
+    "hostname_conflict": "That web address is already used by something else. Choose a different name.",
+    "hosting_backend_changed": "The hosting platform changed since this app was deployed. Tell the user an administrator must migrate it.",
+    "hosting_rejected_script": "Cloudflare rejected the Worker code. Read the message, fix the Worker, rebuild, and deploy again.",
+    "access_guard_failed": "The sign-in protection for apps is misconfigured, so nothing was published. Tell the user to contact an administrator. Do not retry.",
+    "hosting_unavailable": "The deploy did not complete. Wait briefly and call deploy-app once more; every step is safe to repeat.",
+    "deadline_exceeded": "The deploy took too long. Call deploy-app once more; completed steps are reused.",
+    "data_policy_denied": "This data store is not allowed for this repository. Use the stores named in the organization standards (D1 for records, KV for caches, R2 for files) and tell the user in one sentence.",
+    "data_manifest_invalid": "Fix openinspect.app.json as described in the message. Binding names are UPPER_SNAKE_CASE; secrets are names only.",
+    "binding_kind_changed": "A binding name cannot change kind because the old data would be lost. Use a new binding name; the old one is retained for 30 days.",
+    "secret_missing": "The app needs a secret value a human must enter. Tell the user exactly which name to set on the app's page (Settings > Apps > this app > Secrets), then deploy again. Never ask the user to paste the value into the chat.",
+    "destructive_migration_requires_approval": "A migration would drop or rewrite production data. A backup point was recorded. Tell the user to review and approve it on the app's page (Schema changes), then deploy again. Do not work around it with a new table or a rename.",
+    "migration_file_changed": "An already-applied migration file was edited. Restore its original contents and add a new numbered migration file for the change.",
+    "migration_file_missing": "An applied migration file was removed. Restore it: applied migrations must stay in the repository.",
+    "migration_out_of_order": "New migration files must have a number higher than every applied migration. Rename the file.",
+    "migration_forbidden_statement": "Migrations may contain DDL and data statements only: no PRAGMA (except foreign_keys/defer_foreign_keys), ATTACH, DETACH or VACUUM.",
+    "migration_failed": "D1 rejected the migration. Read the message, fix the SQL in that file (it was never applied), and deploy again.",
+    "data_unavailable": "Data provisioning did not complete. Wait briefly and deploy again; every step is safe to repeat."
+  },
+  "bridgeErrorGuidance": "deploy-app could not reach the publishing service. Call deploy-app once more; if it fails again, tell the user that publishing is unavailable right now.",
+  "statusFallback": {
+    "400": "invalid_bundle",
+    "403": "permission_denied",
+    "409": "name_taken",
+    "413": "bundle_too_large",
+    "422": "hosting_rejected_script",
+    "423": "destructive_migration_requires_approval",
+    "424": "secret_missing",
+    "502": "hosting_unavailable",
+    "503": "feature_unavailable",
+    "504": "deadline_exceeded"
+  }
+}

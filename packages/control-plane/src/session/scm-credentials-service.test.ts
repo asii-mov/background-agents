@@ -1,10 +1,10 @@
 import { describe, expect, it, vi } from "vitest";
 import type { Logger } from "../logger";
-import type { SourceControlProvider } from "../source-control";
+import type { CredentialScope, SourceControlProvider } from "../source-control";
 import { SourceControlProviderError } from "../source-control/errors";
 import { ScmCredentialsService } from "./scm-credentials-service";
 
-const REPOSITORY = { owner: "acme", name: "web", providerRepoId: 42 };
+const credentialScope: CredentialScope = { kind: "repositories", repositoryIds: [99, 123] };
 
 function createTestLogger(): Logger {
   return {
@@ -26,6 +26,18 @@ function makeProvider(
   } as unknown as SourceControlProvider;
 }
 
+function getCredentials(
+  provider: SourceControlProvider,
+  log = createTestLogger(),
+  resolveCredentialScope = async () => credentialScope
+) {
+  return new ScmCredentialsService(provider, log, resolveCredentialScope).getCredentials({
+    owner: "acme",
+    name: "repo",
+    providerRepoId: 99,
+  });
+}
+
 describe("ScmCredentialsService", () => {
   it("returns credentials on success", async () => {
     const expiresAtEpochMs = Date.now() + 60 * 60 * 1000;
@@ -39,9 +51,7 @@ describe("ScmCredentialsService", () => {
       generateCredentialHelperAuth,
     });
 
-    const result = await new ScmCredentialsService(provider, createTestLogger()).getCredentials(
-      REPOSITORY
-    );
+    const result = await getCredentials(provider);
 
     expect(result).toEqual({
       ok: true,
@@ -49,7 +59,7 @@ describe("ScmCredentialsService", () => {
       password: "ghs_token",
       expiresAtEpochMs,
     });
-    expect(generateCredentialHelperAuth).toHaveBeenCalledWith({ repositories: [REPOSITORY] });
+    expect(provider.generateCredentialHelperAuth).toHaveBeenCalledWith(credentialScope);
   });
 
   it("rejects invalid provider credential payloads", async () => {
@@ -62,7 +72,7 @@ describe("ScmCredentialsService", () => {
       }),
     });
 
-    const result = await new ScmCredentialsService(provider, log).getCredentials(REPOSITORY);
+    const result = await getCredentials(provider, log);
 
     expect(result).toEqual({
       ok: false,
@@ -84,9 +94,7 @@ describe("ScmCredentialsService", () => {
       }),
     });
 
-    const result = await new ScmCredentialsService(provider, createTestLogger()).getCredentials(
-      REPOSITORY
-    );
+    const result = await getCredentials(provider);
 
     expect(result).toEqual({
       ok: false,
@@ -104,7 +112,7 @@ describe("ScmCredentialsService", () => {
         .mockRejectedValue(new SourceControlProviderError("App not configured", "permanent")),
     });
 
-    const result = await new ScmCredentialsService(provider, log).getCredentials(REPOSITORY);
+    const result = await getCredentials(provider, log);
 
     expect(result).toEqual({
       ok: false,
@@ -128,9 +136,7 @@ describe("ScmCredentialsService", () => {
         .mockRejectedValue(new SourceControlProviderError("GitHub API unavailable", "transient")),
     });
 
-    const result = await new ScmCredentialsService(provider, createTestLogger()).getCredentials(
-      REPOSITORY
-    );
+    const result = await getCredentials(provider);
 
     expect(result).toEqual({ ok: false, status: 502, error: "GitHub API unavailable" });
   });
@@ -141,7 +147,7 @@ describe("ScmCredentialsService", () => {
       generateCredentialHelperAuth: vi.fn().mockRejectedValue(new Error("network blew up")),
     });
 
-    const result = await new ScmCredentialsService(provider, log).getCredentials(REPOSITORY);
+    const result = await getCredentials(provider, log);
 
     expect(result).toEqual({
       ok: false,
@@ -149,5 +155,23 @@ describe("ScmCredentialsService", () => {
       error: "Failed to generate SCM credentials",
     });
     expect(log.error).toHaveBeenCalled();
+  });
+
+  it("maps credential scope failures without minting credentials", async () => {
+    const provider = makeProvider();
+
+    const result = await getCredentials(provider, createTestLogger(), async () => {
+      throw new SourceControlProviderError(
+        "Cannot resolve credential scope: session not found",
+        "permanent"
+      );
+    });
+
+    expect(result).toEqual({
+      ok: false,
+      status: 500,
+      error: "Cannot resolve credential scope: session not found",
+    });
+    expect(provider.generateCredentialHelperAuth).not.toHaveBeenCalled();
   });
 });

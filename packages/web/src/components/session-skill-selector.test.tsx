@@ -46,4 +46,33 @@ describe("SessionSkillSelector", () => {
     expect(screen.queryByText("2 ignored")).not.toBeInTheDocument();
     expect(screen.queryByText("...")).not.toBeInTheDocument();
   });
+
+  it("counts only skills a member can choose, not required governance skills", () => {
+    const skill = {
+      revisionId: "revision-1",
+      description: "A skill",
+      revisionNumber: 1,
+      revisionSha256: "ab".repeat(32),
+      totalBytes: 10,
+      assignmentSources: [],
+    };
+    render(
+      <SessionSkillSelector
+        value={{ mode: "all" }}
+        onChange={vi.fn()}
+        target={{ repositories: [] }}
+        preview={{
+          skills: [
+            { ...skill, skillId: "skill-1", name: "review-pr", required: false },
+            { ...skill, skillId: "skill-2", name: "stack-policy", required: true },
+          ],
+          totalBytes: 20,
+          ignoredProfileSkillIds: [],
+        }}
+        previewLoading={false}
+      />
+    );
+
+    expect(screen.getByText("(1)")).toBeInTheDocument();
+  });
 });

@@ -11,6 +11,15 @@ import { ImagesSettings } from "./images-settings";
 
 expect.extend(matchers);
 
+const mocks = vi.hoisted(() => ({ allowedPermissions: null as Set<string> | null }));
+
+vi.mock("@/hooks/use-current-user-authorization", () => ({
+  useCurrentUserAuthorization: () => ({
+    hasPermission: (permission: string) =>
+      mocks.allowedPermissions === null || mocks.allowedPermissions.has(permission),
+  }),
+}));
+
 vi.mock("@/hooks/use-repos", () => ({
   useRepos: () => ({
     repos: [
@@ -52,28 +61,27 @@ function renderWithFeed(feed: ImageBuildsFeed) {
 afterEach(() => {
   cleanup();
   vi.restoreAllMocks();
+  mocks.allowedPermissions = null;
 });
 
 describe("ImagesSettings", () => {
-  it("renders ready details from the primary repository_shas entry", () => {
+  it("renders ready details from the primary repository provenance entry", () => {
     renderWithFeed({
       units: [{ scopeKind: "repo", scopeId: "acme/web", repositoriesFingerprint: "fp" }],
       enabledRepos: [{ repoOwner: "acme", repoName: "web" }],
       images: [
         {
           id: "build-1",
-          scope_kind: "repo",
-          scope_id: "acme/web",
+          scopeKind: "repo",
+          scopeId: "acme/web",
           provider: "modal",
           status: "ready",
-          repositories_fingerprint: "fp",
-          repository_shas: JSON.stringify([
-            { repoOwner: "acme", repoName: "web", baseSha: "abc1234def5678" },
-          ]),
-          runtime_version: "60",
-          build_duration_seconds: 42,
-          error_message: null,
-          created_at: Date.now(),
+          repositoriesFingerprint: "fp",
+          repositoryShas: [{ repoOwner: "acme", repoName: "web", baseSha: "abc1234def5678" }],
+          runtimeVersion: "60",
+          buildDurationSeconds: 42,
+          errorMessage: null,
+          createdAt: Date.now(),
         },
       ],
     });
@@ -89,22 +97,49 @@ describe("ImagesSettings", () => {
       images: [
         {
           id: "build-1",
-          scope_kind: "repo",
-          scope_id: "acme/web",
+          scopeKind: "repo",
+          scopeId: "acme/web",
           provider: "modal",
           status: "failed",
-          repositories_fingerprint: "fp",
-          repository_shas: "[]",
-          runtime_version: "60",
-          build_duration_seconds: null,
-          error_message: "clone exploded",
-          created_at: Date.now(),
+          repositoriesFingerprint: "fp",
+          repositoryShas: [],
+          runtimeVersion: "60",
+          buildDurationSeconds: null,
+          errorMessage: "clone exploded",
+          createdAt: Date.now(),
         },
       ],
     });
 
     expect(screen.getByText("Failed")).toBeInTheDocument();
     expect(screen.getByText("clone exploded")).toBeInTheDocument();
+  });
+
+  it("says prebuilds are paused and offers no rebuild while admission is closed", () => {
+    renderWithFeed({
+      units: [{ scopeKind: "repo", scopeId: "acme/web", repositoriesFingerprint: "fp" }],
+      enabledRepos: [{ repoOwner: "acme", repoName: "web" }],
+      images: [],
+      admission: { open: false, reason: "daytona_prebuilds_disabled" },
+    });
+
+    expect(screen.getByText(/Prebuilds are paused/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Rebuild image" })).toBeDisabled();
+    // The toggle records intent an operator can set before admission opens.
+    expect(
+      screen.getByRole("switch", { name: "Toggle pre-built images for acme/web" })
+    ).toBeEnabled();
+  });
+
+  it("offers rebuilds when the control plane reports no admission state at all", () => {
+    renderWithFeed({
+      units: [{ scopeKind: "repo", scopeId: "acme/web", repositoriesFingerprint: "fp" }],
+      enabledRepos: [{ repoOwner: "acme", repoName: "web" }],
+      images: [],
+    });
+
+    expect(screen.queryByText(/Prebuilds are paused/)).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Rebuild image" })).toBeEnabled();
   });
 
   it("keeps the toggle enabled when unit resolution transiently dropped the repo", () => {
@@ -127,5 +162,38 @@ describe("ImagesSettings", () => {
     expect(
       screen.getByRole("switch", { name: "Toggle pre-built images for acme/web" })
     ).not.toBeChecked();
+  });
+
+  it("keeps image state visible but disables mutations for a read-only role", () => {
+    mocks.allowedPermissions = new Set(["image_builds.read"]);
+    renderWithFeed({
+      units: [],
+      enabledRepos: [{ repoOwner: "acme", repoName: "web" }],
+      images: [],
+    });
+
+    expect(
+      screen.getByRole("switch", { name: "Toggle pre-built images for acme/web" })
+    ).toBeDisabled();
+    expect(screen.queryByTitle("Rebuild image")).not.toBeInTheDocument();
+  });
+
+  it("shows an error instead of unchecked toggles when the feed fails", async () => {
+    render(
+      <SWRConfig
+        value={{
+          provider: () => new Map(),
+          fetcher: () => Promise.reject(new Error("boom")),
+          dedupingInterval: 0,
+          shouldRetryOnError: false,
+          revalidateOnFocus: false,
+        }}
+      >
+        <ImagesSettings />
+      </SWRConfig>
+    );
+
+    expect(await screen.findByText("Failed to load image build settings.")).toBeInTheDocument();
+    expect(screen.queryByRole("switch")).not.toBeInTheDocument();
   });
 });

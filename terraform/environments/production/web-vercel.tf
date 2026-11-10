@@ -6,11 +6,15 @@ module "web_app" {
   count  = var.web_platform == "vercel" ? 1 : 0
   source = "../../modules/vercel-project"
 
-  project_name = "open-inspect-${local.name_suffix}"
-  team_id      = var.vercel_team_id
-  framework    = "nextjs"
+  project_name  = "open-inspect-${local.name_suffix}"
+  team_id       = var.vercel_team_id
+  framework     = "nextjs"
+  custom_domain = local.vercel_custom_domain_enabled ? local.vercel_custom_domain : null
 
-  # No git_repository - deploy via CLI/CI instead of auto-deploy on push
+  # No git_repository - deploy via CLI/CI instead of auto-deploy on push.
+  # The Node.js runtime comes from `engines.node` in packages/web/package.json
+  # (the repository's own floor), which overrides the project setting and
+  # resolves to the newest supported major; vercel/vercel 2.x cannot set 24.x.
   root_directory  = "packages/web"
   install_command = "cd ../.. && npm install && npm run build -w @open-inspect/shared"
   build_command   = "next build"
@@ -56,5 +60,17 @@ module "web_app" {
     },
     # Append new variables to keep count indices stable and avoid Vercel
     # ENV_CONFLICT replacement races.
+    {
+      key       = "CF_ACCESS_TEAM_DOMAIN"
+      value     = var.cf_access_team_domain
+      targets   = ["production", "preview"]
+      sensitive = false
+    },
+    {
+      key       = "CF_ACCESS_AUD"
+      value     = var.cf_access_aud
+      targets   = ["production", "preview"]
+      sensitive = false
+    },
   ]
 }

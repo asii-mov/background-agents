@@ -1,7 +1,12 @@
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { env } from "cloudflare:test";
-import { UserStore } from "../../src/db/user-store";
+import { IdentityClaimStore } from "../../src/db/identity-claim-store";
+import { PlatformRoleStore } from "../../src/db/platform-roles";
+import { TeamMembershipStore } from "../../src/db/team-memberships";
+import { TeamStore } from "../../src/db/teams";
+import { parseEmailLinkPolicy, UserStore } from "../../src/db/user-store";
 import { cleanD1Tables } from "./cleanup";
+import { sqlDatabase } from "./helpers";
 
 const providerIssuers = [
   ["github", "https://github.com"],
@@ -10,12 +15,88 @@ const providerIssuers = [
   ["linear", null],
 ] as const;
 
+const BOT_PROVIDERS = ["slack", "linear"] as const;
+const CORP_LINKS = parseEmailLinkPolicy("corp.example");
+
 describe("UserStore", () => {
   let store: UserStore;
 
   beforeEach(async () => {
     await cleanD1Tables();
     store = new UserStore(env.DB);
+  });
+
+  describe("listCollaboratorCandidates", () => {
+    it("returns an empty list when there are no active users", async () => {
+      expect(await store.listCollaboratorCandidates({ includeEmail: true })).toEqual([]);
+    });
+
+    it("returns only active picker identities ordered by name with email fallback", async () => {
+      const zed = await store.createUser({ displayName: "zed" });
+      const alice = await store.createUser({
+        displayName: "ALICE",
+        avatarUrl: "https://example.com/alice.png",
+      });
+      const bob = await store.createUser({ email: "bob@example.com" });
+      const suspended = await store.createUser({ displayName: "Suspended" });
+      const unassigned = await store.createUser({ displayName: "Unassigned" });
+      await env.DB.batch([
+        env.DB.prepare("UPDATE users SET suspended_at = 1 WHERE id = ?").bind(suspended.id),
+        env.DB.prepare("DELETE FROM user_role_assignments WHERE user_id = ?").bind(unassigned.id),
+      ]);
+
+      expect(await store.listCollaboratorCandidates({ includeEmail: true })).toEqual([
+        {
+          userId: alice.id,
+          displayName: "ALICE",
+          email: null,
+          avatarUrl: "https://example.com/alice.png",
+        },
+        { userId: bob.id, displayName: null, email: "bob@example.com", avatarUrl: null },
+        { userId: zed.id, displayName: "zed", email: null, avatarUrl: null },
+      ]);
+    });
+
+    it("does not read or sort by email when email is excluded", async () => {
+      const user = await store.createUser({ email: "private@example.com" });
+      const db = sqlDatabase(env.DB);
+      const prepare = vi.fn((sql: string) => db.prepare(sql));
+      const candidates = await new UserStore({
+        prepare,
+        batch: db.batch.bind(db),
+      }).listCollaboratorCandidates({ includeEmail: false });
+      expect(candidates).toEqual([
+        { userId: user.id, displayName: null, email: null, avatarUrl: null },
+      ]);
+      expect(prepare).toHaveBeenCalledWith(expect.stringContaining("NULL AS email"));
+      expect(prepare.mock.calls[0][0]).not.toContain("users.email");
+    });
+  });
+
+  describe("getCollaboratorEligibility", () => {
+    it("requires an active user and, for a team, current membership", async () => {
+      const member = await store.createUser({ displayName: "Member" });
+      const outsider = await store.createUser({ displayName: "Outsider" });
+      const suspended = await store.createUser({ displayName: "Suspended" });
+      const unassigned = await store.createUser({ displayName: "Unassigned" });
+      const team = await new TeamStore(env.DB).create({
+        slug: "eligibility",
+        name: "Eligibility",
+        joinPolicy: "invite_only",
+      });
+      await new TeamMembershipStore(env.DB).add(team.id, member.id);
+      await env.DB.batch([
+        env.DB.prepare("UPDATE users SET suspended_at = 1 WHERE id = ?").bind(suspended.id),
+        env.DB.prepare("DELETE FROM user_role_assignments WHERE user_id = ?").bind(unassigned.id),
+      ]);
+
+      expect(await store.getCollaboratorEligibility("missing", null)).toBe("not_found");
+      expect(await store.getCollaboratorEligibility(suspended.id, null)).toBe("inactive");
+      expect(await store.getCollaboratorEligibility(unassigned.id, null)).toBe("inactive");
+      expect(await store.getCollaboratorEligibility(outsider.id, null)).toBe("eligible");
+      expect(await store.getCollaboratorEligibility(outsider.id, team.id)).toBe("not_team_member");
+      expect(await store.getCollaboratorEligibility(member.id, team.id)).toBe("eligible");
+    });
   });
 
   // ── resolveOrCreateUser ─────────────────────────────────────────
@@ -46,9 +127,14 @@ describe("UserStore", () => {
       expect(user).not.toBeNull();
       expect(user!.displayName).toBe("Alice");
       expect(user!.email).toBeNull();
+      expect(
+        await env.DB.prepare("SELECT team_id, source FROM team_memberships WHERE user_id = ?")
+          .bind(result.id)
+          .first()
+      ).toBeNull();
     });
 
-    it("creates a new user with email normalized to lowercase", async () => {
+    it("normalizes a reported email to lowercase on the identity", async () => {
       const result = await store.resolveOrCreateUser({
         provider: "github",
         providerUserId: "12345",
@@ -57,12 +143,6 @@ describe("UserStore", () => {
       });
 
       expect(result.isNew).toBe(true);
-      expect(result.email).toBe("alice@example.com");
-
-      const user = await store.getUserById(result.id);
-      expect(user!.email).toBe("alice@example.com");
-
-      // Identity email is also normalized
       const identity = await store.getIdentity("github", "12345");
       expect(identity!.providerEmail).toBe("alice@example.com");
     });
@@ -90,56 +170,37 @@ describe("UserStore", () => {
       expect(await store.getUserByEmail("   ")).toBeNull();
     });
 
-    it("attests slack- and linear-attributed emails as verified at creation", async () => {
-      // Both platforms verify mailbox ownership (Slack confirms address
-      // changes; Linear's email is its login credential), and the bots fetch
-      // the address server-side — so ingress writes count as proof.
-      const slack = await store.resolveOrCreateUser({
-        provider: "slack",
-        providerUserId: "U1ATTEST",
-        providerEmail: "slack.person@example.com",
-      });
-      const linear = await store.resolveOrCreateUser({
-        provider: "linear",
-        providerUserId: "linear-attest",
-        providerEmail: "linear.person@example.com",
-      });
+    it.each(["slack", "linear", "github"] as const)(
+      "keeps an allowed-domain email that %s reports off its new user",
+      async (provider) => {
+        const result = await store.resolveOrCreateUser(
+          { provider, providerUserId: `${provider}-reporter`, providerEmail: "alice@corp.example" },
+          CORP_LINKS
+        );
 
-      expect((await store.getUserById(slack.id))!.emailVerified).toBe(true);
-      expect((await store.getUserById(linear.id))!.emailVerified).toBe(true);
-    });
+        expect(await store.getUserById(result.id)).toMatchObject({
+          email: null,
+          emailVerified: false,
+        });
+        expect(await store.getIdentity(provider, `${provider}-reporter`)).toMatchObject({
+          providerEmail: "alice@corp.example",
+        });
+      }
+    );
 
-    it("stores non-attesting attribution as a claim, not proof", async () => {
-      const result = await store.resolveOrCreateUser({
-        provider: "github",
-        providerUserId: "12345",
-        providerEmail: "octocat@example.com",
-      });
+    it("keeps an email outside the allowed domains on the identity only", async () => {
+      const result = await store.resolveOrCreateUser(
+        {
+          provider: "slack",
+          providerUserId: "U-CONTRACTOR",
+          providerEmail: "alice@contractor.example",
+        },
+        CORP_LINKS
+      );
 
-      const user = await store.getUserById(result.id);
-      expect(user!.email).toBe("octocat@example.com");
-      expect(user!.emailVerified).toBe(false);
-    });
-
-    it("carries attestation through the late email backfill", async () => {
-      // Slack user first seen without an email, whose profile later reports
-      // one: the backfill write carries the same attestation as creation.
-      const first = await store.resolveOrCreateUser({
-        provider: "slack",
-        providerUserId: "U1LATE",
-      });
-      expect(first.email).toBeNull();
-
-      const second = await store.resolveOrCreateUser({
-        provider: "slack",
-        providerUserId: "U1LATE",
-        providerEmail: "late.person@example.com",
-      });
-
-      expect(second.id).toBe(first.id);
-      expect(await store.getUserById(first.id)).toMatchObject({
-        email: "late.person@example.com",
-        emailVerified: true,
+      expect(await store.getUserById(result.id)).toMatchObject({ email: null });
+      expect(await store.getIdentity("slack", "U-CONTRACTOR")).toMatchObject({
+        providerEmail: "alice@contractor.example",
       });
     });
 
@@ -166,62 +227,136 @@ describe("UserStore", () => {
       expect(user!.updatedAt).toBeGreaterThanOrEqual(beforeUpdate!.updatedAt);
     });
 
-    it("links new identity to existing user by matching email", async () => {
-      const github = await store.resolveOrCreateUser({
+    it("does not repair a missing role assignment during identity resolution", async () => {
+      const first = await store.resolveOrCreateUser({
         provider: "github",
-        providerUserId: "gh-123",
-        displayName: "Alice",
-        providerEmail: "alice@example.com",
+        providerUserId: "missing-assignment",
+      });
+      await env.DB.prepare("DELETE FROM user_role_assignments WHERE user_id = ?")
+        .bind(first.id)
+        .run();
+
+      await store.resolveOrCreateUser({
+        provider: "github",
+        providerUserId: "missing-assignment",
       });
 
-      const slack = await store.resolveOrCreateUser({
-        provider: "slack",
-        providerUserId: "USLACK456",
-        displayName: "Alice (Slack)",
-        providerEmail: "alice@example.com",
-      });
-
-      expect(slack.id).toBe(github.id);
-      expect(slack.isNew).toBe(false);
-
-      const identities = await store.getIdentitiesForUser(github.id);
-      expect(identities).toHaveLength(2);
-      expect(identities.map((i) => i.provider).sort()).toEqual(["github", "slack"]);
+      const assignment = await env.DB.prepare(
+        "SELECT role_id FROM user_role_assignments WHERE user_id = ?"
+      )
+        .bind(first.id)
+        .first();
+      expect(assignment).toBeNull();
     });
 
-    it("links a Google identity to an existing GitHub user by matching verified email (F1/F2 link surface)", async () => {
-      const github = await store.resolveOrCreateUser({
-        provider: "github",
-        providerUserId: "gh-900",
-        displayName: "Cole",
-        providerEmail: "cole@example.com",
-      });
+    it.each(BOT_PROVIDERS)(
+      "links a %s actor to the verified owner of an allowed-domain email",
+      async (provider) => {
+        const owner = await store.createUser({
+          displayName: "Alice",
+          email: "alice@corp.example",
+          emailVerified: true,
+        });
 
-      const google = await store.resolveOrCreateUser({
-        provider: "google",
-        providerUserId: "google-sub-900",
-        displayName: "Cole (Google)",
-        providerEmail: "cole@example.com",
-      });
+        const linked = await store.resolveOrCreateUser(
+          {
+            provider,
+            providerUserId: `${provider}-alice`,
+            displayName: "Alice (bot)",
+            providerEmail: "Alice@Corp.Example",
+          },
+          CORP_LINKS
+        );
 
-      expect(google.id).toBe(github.id);
-      expect(google.isNew).toBe(false);
+        expect(linked).toMatchObject({
+          id: owner.id,
+          isNew: false,
+          linkedByEmailDomain: "corp.example",
+        });
+        expect(await store.getIdentity(provider, `${provider}-alice`)).toMatchObject({
+          userId: owner.id,
+        });
+        expect(await env.DB.prepare("SELECT COUNT(*) AS count FROM users").first()).toEqual({
+          count: 1,
+        });
+      }
+    );
 
-      const identities = await store.getIdentitiesForUser(github.id);
-      expect(identities).toHaveLength(2);
-      expect(identities.map((i) => i.provider).sort()).toEqual(["github", "google"]);
+    it.each(
+      BOT_PROVIDERS.flatMap((provider) => [
+        {
+          provider,
+          refusal: "the owner's email is unverified",
+          email: "alice@corp.example",
+          ownerVerified: false,
+          policy: CORP_LINKS,
+        },
+        {
+          provider,
+          refusal: "no domain is allowed",
+          email: "alice@corp.example",
+          ownerVerified: true,
+          policy: parseEmailLinkPolicy(undefined),
+        },
+        {
+          provider,
+          refusal: "the domain is not allowed",
+          email: "alice@contractor.example",
+          ownerVerified: true,
+          policy: CORP_LINKS,
+        },
+      ])
+    )(
+      "keeps a $provider actor standalone when $refusal",
+      async ({ provider, email, ownerVerified, policy }) => {
+        const owner = await store.createUser({ email, emailVerified: ownerVerified });
 
-      // The Google login must not overwrite or masquerade as the GitHub identity:
-      // each provider keeps its own provider_user_id (a Google sub never lands
-      // under provider='github').
-      const githubIdentity = identities.find((i) => i.provider === "github");
-      const googleIdentity = identities.find((i) => i.provider === "google");
-      expect(githubIdentity!.providerUserId).toBe("gh-900");
-      expect(googleIdentity!.providerUserId).toBe("google-sub-900");
+        const result = await store.resolveOrCreateUser(
+          { provider, providerUserId: `${provider}-actor`, providerEmail: email },
+          policy
+        );
+
+        expect(result).toMatchObject({ isNew: true, linkedByEmailDomain: null });
+        expect(result.id).not.toBe(owner.id);
+        expect(await store.getUserById(result.id)).toMatchObject({
+          email: null,
+          emailVerified: false,
+        });
+        expect(await store.getIdentity(provider, `${provider}-actor`)).toMatchObject({
+          userId: result.id,
+          providerEmail: email,
+        });
+      }
+    );
+
+    it("links a Google identity to a verified owner without touching other providers' subjects", async () => {
+      const owner = await store.createUser({ email: "cole@corp.example", emailVerified: true });
+
+      const github = await store.resolveOrCreateUser(
+        { provider: "github", providerUserId: "gh-900", providerEmail: "cole@corp.example" },
+        CORP_LINKS
+      );
+      const google = await store.resolveOrCreateUser(
+        {
+          provider: "google",
+          providerUserId: "google-sub-900",
+          providerEmail: "cole@corp.example",
+        },
+        CORP_LINKS
+      );
+
+      expect(github.id).toBe(owner.id);
+      expect(google.id).toBe(owner.id);
+      const identities = await store.getIdentitiesForUser(owner.id);
+      expect(
+        identities.map(({ provider, providerUserId }) => ({ provider, providerUserId }))
+      ).toEqual([
+        { provider: "github", providerUserId: "gh-900" },
+        { provider: "google", providerUserId: "google-sub-900" },
+      ]);
     });
 
-    it("backfills email on existing user when email becomes available", async () => {
-      // Create user without email (e.g. Slack bot before users:read.email scope)
+    it("keeps a later-reported allowed-domain email off an email-less user", async () => {
       const first = await store.resolveOrCreateUser({
         provider: "slack",
         providerUserId: "UABC",
@@ -229,19 +364,35 @@ describe("UserStore", () => {
       });
       expect(first.email).toBeNull();
 
-      // Same identity, now with email
-      const second = await store.resolveOrCreateUser({
-        provider: "slack",
-        providerUserId: "UABC",
-        displayName: "Alice",
-        providerEmail: "alice@example.com",
+      const second = await store.resolveOrCreateUser(
+        {
+          provider: "slack",
+          providerUserId: "UABC",
+          displayName: "Alice",
+          providerEmail: "alice@corp.example",
+        },
+        CORP_LINKS
+      );
+
+      expect(second).toMatchObject({ id: first.id, email: null, linkedByEmailDomain: null });
+      expect(await store.getUserById(first.id)).toMatchObject({ email: null });
+      expect(await store.getIdentity("slack", "UABC")).toMatchObject({
+        providerEmail: "alice@corp.example",
       });
+    });
 
-      expect(second.id).toBe(first.id);
-      expect(second.email).toBe("alice@example.com");
+    it("grants no bootstrap admin role from a bot-reported email, even once OAuth proves it", async () => {
+      const roles = new PlatformRoleStore(env.DB, { adminUsers: "admin@corp.example" });
+      const actor = await store.resolveOrCreateUser(
+        { provider: "slack", providerUserId: "U-ADMIN-CLAIM", providerEmail: "admin@corp.example" },
+        CORP_LINKS
+      );
 
-      const user = await store.getUserById(first.id);
-      expect(user!.email).toBe("alice@example.com");
+      expect(await roles.getEffectiveRole(actor.id)).toBe("member");
+
+      await new IdentityClaimStore(env.DB).verifyEmailOwner("admin@corp.example");
+
+      expect(await roles.getEffectiveRole(actor.id)).toBe("member");
     });
 
     it("refreshes identity metadata on repeat sign-in", async () => {
@@ -270,40 +421,44 @@ describe("UserStore", () => {
       expect(after!.providerLogin).toBe("alice.smith");
     });
 
-    it("re-links identity to email-owning user when email conflict is discovered", async () => {
-      // User A owns the email (e.g. GitHub login)
-      const userA = await store.resolveOrCreateUser({
-        provider: "github",
-        providerUserId: "gh-111",
-        displayName: "User A",
-        providerEmail: "shared@example.com",
-      });
-
-      // User B created without email (e.g. Slack before users:read.email scope)
-      const userB = await store.resolveOrCreateUser({
+    it("re-links an email-less identity to the verified owner of its allowed-domain email", async () => {
+      const owner = await store.createUser({ email: "shared@corp.example", emailVerified: true });
+      const slackUser = await store.resolveOrCreateUser({
         provider: "slack",
         providerUserId: "slack-222",
-        displayName: "User B",
       });
-      expect(userB.email).toBeNull();
-      expect(userB.id).not.toBe(userA.id);
+      expect(slackUser.id).not.toBe(owner.id);
 
-      // User B's provider now reports the same email — identity should
-      // re-link to User A (same principle as step 3 email-based linking)
-      const result = await store.resolveOrCreateUser({
+      const result = await store.resolveOrCreateUser(
+        { provider: "slack", providerUserId: "slack-222", providerEmail: "shared@corp.example" },
+        CORP_LINKS
+      );
+
+      expect(result).toMatchObject({
+        id: owner.id,
+        email: "shared@corp.example",
+        linkedByEmailDomain: "corp.example",
+      });
+      expect(await store.getIdentity("slack", "slack-222")).toMatchObject({ userId: owner.id });
+    });
+
+    it("does not re-link an identity to an unverified owner of its email", async () => {
+      const owner = await store.createUser({ email: "shared@corp.example" });
+      const slackUser = await store.resolveOrCreateUser({
         provider: "slack",
         providerUserId: "slack-222",
-        displayName: "User B",
-        providerEmail: "shared@example.com",
       });
 
-      expect(result.id).toBe(userA.id);
-      expect(result.email).toBe("shared@example.com");
+      const result = await store.resolveOrCreateUser(
+        { provider: "slack", providerUserId: "slack-222", providerEmail: "shared@corp.example" },
+        CORP_LINKS
+      );
 
-      // Both identities now belong to User A
-      const identities = await store.getIdentitiesForUser(userA.id);
-      expect(identities).toHaveLength(2);
-      expect(identities.map((i) => i.provider).sort()).toEqual(["github", "slack"]);
+      expect(result).toMatchObject({ id: slackUser.id, email: null, linkedByEmailDomain: null });
+      expect(await store.getIdentity("slack", "slack-222")).toMatchObject({
+        userId: slackUser.id,
+      });
+      expect(await store.getUserById(owner.id)).toMatchObject({ emailVerified: false });
     });
 
     it("stores avatar_url on new user", async () => {
@@ -350,7 +505,6 @@ describe("UserStore", () => {
   describe("createIdentity", () => {
     it.each(providerIssuers)("stores the canonical issuer for %s", async (provider, issuer) => {
       const user = await store.createUser({ displayName: "Alice" });
-
       await store.createIdentity({
         userId: user.id,
         provider,
@@ -366,12 +520,7 @@ describe("UserStore", () => {
 
   describe("getUserById", () => {
     it("returns user when found", async () => {
-      const created = await store.resolveOrCreateUser({
-        provider: "github",
-        providerUserId: "12345",
-        displayName: "Alice",
-        providerEmail: "alice@example.com",
-      });
+      const created = await store.createUser({ displayName: "Alice", email: "alice@example.com" });
 
       const user = await store.getUserById(created.id);
       expect(user).not.toBeNull();
@@ -392,19 +541,20 @@ describe("UserStore", () => {
 
   describe("getIdentitiesForUser", () => {
     it("returns all identities for a user", async () => {
-      const user = await store.resolveOrCreateUser({
-        provider: "github",
-        providerUserId: "gh-123",
+      const user = await store.createUser({
         displayName: "Alice",
-        providerEmail: "alice@example.com",
+        email: "alice@example.com",
+        emailVerified: true,
       });
-
-      // Second identity linked via email
-      await store.resolveOrCreateUser({
-        provider: "slack",
-        providerUserId: "slack-456",
-        providerEmail: "alice@example.com",
-      });
+      const links = parseEmailLinkPolicy("example.com");
+      await store.resolveOrCreateUser(
+        { provider: "github", providerUserId: "gh-123", providerEmail: "alice@example.com" },
+        links
+      );
+      await store.resolveOrCreateUser(
+        { provider: "slack", providerUserId: "slack-456", providerEmail: "alice@example.com" },
+        links
+      );
 
       const identities = await store.getIdentitiesForUser(user.id);
       expect(identities).toHaveLength(2);

@@ -8,7 +8,6 @@
  * deployment, and the SCM-less harness split is the same as PR-4/PR-8.
  */
 
-import { buildServiceAuthHeaders } from "@open-inspect/shared/service-auth";
 import { describe, it, expect, beforeEach } from "vitest";
 import { SELF, env } from "cloudflare:test";
 import { ImageBuildStore } from "../../src/db/image-builds";
@@ -25,8 +24,9 @@ import { ImageBuildReaper } from "../../src/image-builds/reaper";
 import { resolveScopeEnabled } from "../../src/image-builds/scope";
 import type { DeleteImageInput, ImageBuildAdapter } from "../../src/image-builds/types";
 import { evaluateImageBuildForSpawn } from "../../src/sandbox/lifecycle/image-selection";
-import type { Env } from "../../src/types";
+import { createCloudflareEnv } from "../../src/cloudflare/platform";
 import { cleanD1Tables } from "./cleanup";
+import { serviceFetch } from "./helpers";
 import {
   RUNTIME_VERSION,
   REPOSITORY_SHAS,
@@ -46,37 +46,21 @@ const BASE = "https://test.local";
  */
 const WIRE_KEYS = [
   "id",
-  "scope_kind",
-  "scope_id",
+  "scopeKind",
+  "scopeId",
   "provider",
   "status",
-  "repositories_fingerprint",
-  "repository_shas",
-  "runtime_version",
-  "build_duration_seconds",
-  "error_message",
-  "created_at",
+  "repositoriesFingerprint",
+  "repositoryShas",
+  "runtimeVersion",
+  "buildDurationSeconds",
+  "errorMessage",
+  "createdAt",
 ].sort();
 
 // Modal-provider callback token: 64-hex like the planner mints (the route
 // only forwards token-shaped bearers to the workflow).
 const MODAL_BUILD_TOKEN = "ab".repeat(32);
-
-/** Call an internal route with a registered service credential. */
-async function serviceFetch(url: string, init?: { method?: string; body?: string }) {
-  const method = init?.method ?? "GET";
-  const headers = {
-    ...(await buildServiceAuthHeaders({
-      service: "linear-bot",
-      secret: "test-service-secret-linear-bot",
-      method,
-      url,
-      body: init?.body,
-    })),
-    ...(init?.body === undefined ? {} : { "Content-Type": "application/json" }),
-  };
-  return SELF.fetch(url, { method, headers, body: init?.body });
-}
 
 function tokenHeaders(token: string): Record<string, string> {
   return { Authorization: `Bearer ${token}`, "Content-Type": "application/json" };
@@ -422,6 +406,9 @@ describe("Image builds", () => {
             repositoriesFingerprint: await computeRepositoriesFingerprint(repositories),
           },
         ],
+        // The settings surfaces read this to stop offering builds a paused
+        // deployment would refuse.
+        admission: { open: true },
       });
     });
 
@@ -451,10 +438,10 @@ describe("Image builds", () => {
       // crowd it.
       const all = await serviceFetch(`${BASE}/image-builds/status`);
       const allBody = (await all.json()) as {
-        images: Array<{ id: string; scope_kind: string; scope_id: string }>;
+        images: Array<{ id: string; scopeKind: string; scopeId: string }>;
       };
       expect(allBody.images.map((i) => i.id).sort()).toEqual(["st-failed", "st-other", "st-ready"]);
-      expect(allBody.images.every((i) => i.scope_kind === "environment")).toBe(true);
+      expect(allBody.images.every((i) => i.scopeKind === "environment")).toBe(true);
 
       // Per-scope debug view keeps failed rows, drops only superseded.
       const filtered = await serviceFetch(
@@ -494,6 +481,25 @@ describe("Image builds", () => {
       assertWireKeysOnly(
         ((await perScope.json()) as { images: Array<Record<string, unknown>> }).images
       );
+    });
+
+    it("GET /image-builds/status decodes provenance and tolerates malformed stored JSON", async () => {
+      const environmentId = await seedEnvironment({ prebuildEnabled: true });
+      await seedImageRow({ id: "valid-provenance", environmentId, status: "ready" });
+      await env.DB.prepare("UPDATE image_builds SET repository_shas = ? WHERE id = ?")
+        .bind("not-json", "valid-provenance")
+        .run();
+
+      const response = await serviceFetch(
+        `${BASE}/image-builds/status?scope_kind=environment&scope_id=${environmentId}`
+      );
+      const body = (await response.json()) as {
+        images: Array<Record<string, unknown>>;
+      };
+
+      expect(response.status).toBe(200);
+      expect(body.images[0]).toHaveProperty("repositoryShas", null);
+      expect(body.images[0]).not.toHaveProperty("repository_shas");
     });
 
     it("GET /image-builds/status rejects a scope_kind/scope_id half-pair", async () => {
@@ -592,14 +598,14 @@ describe("Image builds", () => {
 
       const response = await serviceFetch(`${BASE}/image-builds/status`);
       const body = (await response.json()) as {
-        images: Array<{ id: string; status: string; scope_id: string }>;
+        images: Array<{ id: string; status: string; scopeId: string }>;
       };
 
       expect(body.images).toHaveLength(1);
       expect(body.images[0]).toMatchObject({
         id: "only-failed",
         status: "failed",
-        scope_id: environmentId,
+        scopeId: environmentId,
       });
     });
   });
@@ -715,18 +721,77 @@ describe("Image builds", () => {
   });
 
   describe("build callbacks", () => {
-    async function registerBuild(environmentId: string, buildId: string): Promise<void> {
+    async function registerBuild(
+      environmentId: string,
+      buildId: string,
+      provider: "modal" | "daytona" = "modal"
+    ): Promise<void> {
       const store = new ImageBuildStore(env.DB);
       await store.registerBuild({
         id: buildId,
         scope: environmentScope(environmentId),
-        provider: "modal",
+        provider,
         repositoriesFingerprint: "fp-cb",
-        callbackTokenHash: await hashImageBuildCallbackToken(MODAL_BUILD_TOKEN, env as Env),
+        callbackTokenHash: await hashImageBuildCallbackToken(
+          MODAL_BUILD_TOKEN,
+          createCloudflareEnv(env)
+        ),
         callbackTokenExpiresAt: Date.now() + 60_000,
       });
-      await store.bindProviderSession(buildId, "modal", `session-${buildId}`);
+      await store.bindProviderSession(buildId, provider, `session-${buildId}`);
     }
+
+    it("accepts a recorded-provider callback whatever the deployment now runs on", async () => {
+      const environmentId = await seedEnvironment();
+      await registerBuild(environmentId, "cb-daytona", "daytona");
+
+      const accepted = await SELF.fetch(`${BASE}/image-builds/build-complete`, {
+        method: "POST",
+        headers: tokenHeaders(MODAL_BUILD_TOKEN),
+        body: JSON.stringify({
+          build_id: "cb-daytona",
+          provider_session_id: "session-cb-daytona",
+          repository_shas: REPOSITORY_SHAS,
+          runtime_version: RUNTIME_VERSION,
+          build_duration_seconds: 42.5,
+        }),
+      });
+
+      // Callbacks authenticate against the row's own recorded provider, so a
+      // build accepted before a provider switch — or while its provider's
+      // admission is closed — can still report and finalize.
+      expect(accepted.status).toBe(202);
+      const row = await getRow("cb-daytona");
+      expect(row?.provider).toBe("daytona");
+      expect(row?.callback_token_used_at).not.toBeNull();
+
+      // The same payload replays idempotently; a conflicting one does not.
+      const replay = await SELF.fetch(`${BASE}/image-builds/build-complete`, {
+        method: "POST",
+        headers: tokenHeaders(MODAL_BUILD_TOKEN),
+        body: JSON.stringify({
+          build_id: "cb-daytona",
+          provider_session_id: "session-cb-daytona",
+          repository_shas: REPOSITORY_SHAS,
+          runtime_version: RUNTIME_VERSION,
+          build_duration_seconds: 42.5,
+        }),
+      });
+      expect(replay.status).toBe(202);
+
+      const conflicting = await SELF.fetch(`${BASE}/image-builds/build-complete`, {
+        method: "POST",
+        headers: tokenHeaders(MODAL_BUILD_TOKEN),
+        body: JSON.stringify({
+          build_id: "cb-daytona",
+          provider_session_id: "session-cb-daytona",
+          repository_shas: REPOSITORY_SHAS,
+          runtime_version: RUNTIME_VERSION,
+          build_duration_seconds: 99,
+        }),
+      });
+      expect(conflicting.status).toBe(409);
+    });
 
     it("POST /image-builds/build-complete durably accepts provider-session finalization", async () => {
       const environmentId = await seedEnvironment();
@@ -817,7 +882,10 @@ describe("Image builds", () => {
         scope: environmentScope(environmentId),
         provider: "modal",
         repositoriesFingerprint: "fp-cb",
-        callbackTokenHash: await hashImageBuildCallbackToken(MODAL_BUILD_TOKEN, env as Env),
+        callbackTokenHash: await hashImageBuildCallbackToken(
+          MODAL_BUILD_TOKEN,
+          createCloudflareEnv(env)
+        ),
         callbackTokenExpiresAt: Date.now() - 1,
       });
       await store.bindProviderSession("cb-expired", "modal", "session-cb-expired");
@@ -960,7 +1028,7 @@ describe("Image builds", () => {
         scope: TOKEN_SCOPE,
         provider: "vercel",
         repositoriesFingerprint: "fp-token",
-        callbackTokenHash: await hashImageBuildCallbackToken(token, env as Env),
+        callbackTokenHash: await hashImageBuildCallbackToken(token, createCloudflareEnv(env)),
         callbackTokenExpiresAt: Date.now() + 60_000,
       });
       await store.bindProviderSession("tok-malformed", "vercel", "vercel-session-1");
@@ -1140,7 +1208,7 @@ describe("Image builds", () => {
 
       const response = await serviceFetch(`${BASE}/image-builds/status`);
       const body = (await response.json()) as {
-        images: Array<{ id: string; scope_kind: string; scope_id: string }>;
+        images: Array<{ id: string; scopeKind: string; scopeId: string }>;
       };
 
       expect(body.images.map((i) => i.id).sort()).toEqual([
@@ -1149,8 +1217,8 @@ describe("Image builds", () => {
         "cs-repo-ready",
       ]);
       expect(body.images.find((i) => i.id === "cs-repo-ready")).toMatchObject({
-        scope_kind: "repo",
-        scope_id: "acme/web",
+        scopeKind: "repo",
+        scopeId: "acme/web",
       });
     });
 

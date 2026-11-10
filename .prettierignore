@@ -11,6 +11,7 @@ coverage/
 .artifacts/
 .audit/
 .mypy_cache/
+.cache/sandbox-images/
 
 # Python
 packages/modal-infra/
@@ -28,6 +29,13 @@ pnpm-lock.yaml
 yarn.lock
 
 # Generated files
+packages/docs/.source/
 *.d.ts
 *.min.js
 *.min.css
+packages/sandbox-runtime/src/sandbox_runtime/memory_contract.json
+packages/sandbox-runtime/src/sandbox_runtime/tools/_memory-contract.js
+packages/sandbox-runtime/src/sandbox_runtime/stack_policy_contract.json
+packages/sandbox-runtime/src/sandbox_runtime/app_deploy_contract.json
+packages/sandbox-runtime/src/sandbox_runtime/tools/_app-deploy-contract.js
+packages/sandbox-runtime/src/sandbox_runtime/conformance/app_data_contract.json

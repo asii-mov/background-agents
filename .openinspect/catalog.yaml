@@ -1,0 +1,5 @@
+schemaVersion: 1
+skills:
+  - path: skills/internal-app-auth
+    required: true
+    enabled: true

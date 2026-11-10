@@ -4,6 +4,10 @@
  * Split from ./environments so each routes file stays focused.
  */
 
+import { parseBody, parseJsonBody } from "./body";
+import { Hono } from "hono";
+import { admit, dispatch } from "../routing/admit";
+import type { ControlPlaneHonoEnv } from "../routing/hono-env";
 import { EnvironmentStore, type EnvironmentRow } from "../db/environments";
 import { EnvironmentSecretsStore } from "../db/environment-secrets";
 import { GlobalSecretsStore } from "../db/global-secrets";
@@ -14,17 +18,24 @@ import {
 } from "../image-builds/save-hooks";
 import { createLogger } from "../logger";
 import {
-  type Route,
   type RequestContext,
   GITHUB_USER_OR_SERVICE_ROUTE,
-  defineRoutes,
-  parsePattern,
   json,
   error,
-  parseJsonBody,
   resolveRepoOrError,
+  requireAll,
+  permissionRequirement,
+  environmentRequirement,
 } from "./shared";
+import {
+  environmentSecretsImportBodySchema,
+  secretsRequestBodySchema,
+} from "./secret-request-schemas";
 import type { Env } from "../types";
+import {
+  authorizeTeamRepositories,
+  authorizeWorkspaceRepositories,
+} from "./workspace-repository-authorization";
 
 const logger = createLogger("router:environment-secrets");
 
@@ -74,14 +85,13 @@ function requireSecretsConfig(env: Env): { key: string } | Response {
 async function handleListEnvironmentSecrets(
   _request: Request,
   env: Env,
-  match: RegExpMatchArray,
+  params: { id: string },
   ctx: RequestContext
 ): Promise<Response> {
   const config = requireSecretsConfig(env);
   if (config instanceof Response) return config;
 
-  const id = match.groups?.id;
-  if (!id) return error("Environment ID required", 400);
+  const id = params.id;
 
   const store = new EnvironmentStore(ctx.db);
   if (!(await store.getById(id))) return error("Environment not found", 404);
@@ -114,24 +124,24 @@ async function handleListEnvironmentSecrets(
 async function handleSetEnvironmentSecrets(
   request: Request,
   env: Env,
-  match: RegExpMatchArray,
+  params: { id: string },
   ctx: RequestContext
 ): Promise<Response> {
   const config = requireSecretsConfig(env);
   if (config instanceof Response) return config;
 
-  const id = match.groups?.id;
-  if (!id) return error("Environment ID required", 400);
+  const id = params.id;
 
   const store = new EnvironmentStore(ctx.db);
   const environment = await store.getById(id);
   if (!environment) return error("Environment not found", 404);
 
-  const body = await parseJsonBody<{ secrets?: Record<string, string> }>(request);
+  const body = await parseBody(
+    request,
+    secretsRequestBodySchema,
+    "Request body must include secrets object"
+  );
   if (body instanceof Response) return body;
-  if (!body?.secrets || typeof body.secrets !== "object") {
-    return error("Request body must include secrets object", 400);
-  }
 
   const secretsStore = new EnvironmentSecretsStore(ctx.db, config.key);
   try {
@@ -169,14 +179,14 @@ async function handleSetEnvironmentSecrets(
 async function handleDeleteEnvironmentSecret(
   _request: Request,
   env: Env,
-  match: RegExpMatchArray,
+  params: { id: string; key: string },
   ctx: RequestContext
 ): Promise<Response> {
   const config = requireSecretsConfig(env);
   if (config instanceof Response) return config;
 
-  const id = match.groups?.id;
-  const key = match.groups?.key;
+  const id = params.id;
+  const key = params.key;
   if (!id || !key) return error("Environment ID and key are required", 400);
 
   const secretsStore = new EnvironmentSecretsStore(ctx.db, config.key);
@@ -220,35 +230,30 @@ async function handleDeleteEnvironmentSecret(
 async function handleImportEnvironmentSecrets(
   request: Request,
   env: Env,
-  match: RegExpMatchArray,
+  params: { id: string },
   ctx: RequestContext
 ): Promise<Response> {
   const config = requireSecretsConfig(env);
   if (config instanceof Response) return config;
 
-  const id = match.groups?.id;
-  if (!id) return error("Environment ID required", 400);
+  const id = params.id;
 
   const store = new EnvironmentStore(ctx.db);
   const environment = await store.getById(id);
   if (!environment) return error("Environment not found", 404);
 
-  const body = await parseJsonBody<{ repoOwner?: string; repoName?: string; keys?: unknown }>(
-    request
-  );
-  if (body instanceof Response) return body;
-  if (!body?.repoOwner || !body?.repoName) {
+  const rawBody = await parseJsonBody(request);
+  if (rawBody instanceof Response) return rawBody;
+  const parsedBody = environmentSecretsImportBodySchema.safeParse(rawBody);
+  if (!parsedBody.success) {
+    const issue = parsedBody.error.issues[0];
+    if (issue?.path[0] === "keys") return error("keys must be an array of strings", 400);
     return error("repoOwner and repoName are required", 400);
   }
-  if (
-    body.keys !== undefined &&
-    (!Array.isArray(body.keys) || body.keys.some((k) => typeof k !== "string"))
-  ) {
-    return error("keys must be an array of strings", 400);
-  }
+  const body = parsedBody.data;
 
-  const srcOwner = body.repoOwner.trim().toLowerCase();
-  const srcName = body.repoName.trim().toLowerCase();
+  const srcOwner = body.repoOwner;
+  const srcName = body.repoName;
 
   // Authorization: the source repo must be one of the environment's repositories.
   const envRepos = await store.getRepositoriesForEnvironment(id);
@@ -257,15 +262,32 @@ async function handleImportEnvironmentSecrets(
     return error(`${srcOwner}/${srcName} is not a member of this environment`, 403);
   }
 
-  // Resolve the source repo_id (rows written before resolution may lack it).
-  let repoId = sourceRepo.repo_id;
-  if (repoId == null) {
-    repoId = (await resolveRepoOrError(env, srcOwner, srcName, ctx, logger)).repoId;
+  const { repoId } = await resolveRepoOrError(env, srcOwner, srcName, ctx, logger);
+  if (sourceRepo.repo_id !== null && sourceRepo.repo_id !== repoId) {
+    return json(
+      {
+        error: "Repository identity changed",
+        code: "repository_identity_mismatch",
+        repository: `${srcOwner}/${srcName}`,
+      },
+      409
+    );
   }
+  const denied = await authorizeTeamRepositories(ctx, {
+    teamId: environment.owner_team_id,
+    repositories: [{ owner: srcOwner, name: srcName, repoId }],
+  });
+  if (denied) return denied;
+
+  const sourceDenied = await authorizeWorkspaceRepositories(ctx, {
+    repositories: [{ owner: srcOwner, name: srcName, repoId }],
+    requireLead: true,
+  });
+  if (sourceDenied) return sourceDenied;
 
   const secretsStore = new EnvironmentSecretsStore(ctx.db, config.key);
   try {
-    const result = await secretsStore.importFromRepo(id, repoId, body.keys as string[] | undefined);
+    const result = await secretsStore.importFromRepo(id, repoId, body.keys);
     logger.info("environment.secrets_imported", {
       event: "environment.secrets_imported",
       environment_id: id,
@@ -298,25 +320,33 @@ async function handleImportEnvironmentSecrets(
   }
 }
 
-export const environmentSecretsRoutes: Route[] = defineRoutes(GITHUB_USER_OR_SERVICE_ROUTE, [
-  {
-    method: "GET",
-    pattern: parsePattern("/environments/:id/secrets"),
-    handler: handleListEnvironmentSecrets,
-  },
-  {
-    method: "PUT",
-    pattern: parsePattern("/environments/:id/secrets"),
-    handler: handleSetEnvironmentSecrets,
-  },
-  {
-    method: "POST",
-    pattern: parsePattern("/environments/:id/secrets/import"),
-    handler: handleImportEnvironmentSecrets,
-  },
-  {
-    method: "DELETE",
-    pattern: parsePattern("/environments/:id/secrets/:key"),
-    handler: handleDeleteEnvironmentSecret,
-  },
-]);
+const ENVIRONMENT_SECRETS_MANAGE = admit({
+  ...GITHUB_USER_OR_SERVICE_ROUTE,
+  authorization: requireAll(
+    permissionRequirement("environments.secrets.manage"),
+    environmentRequirement("manage")
+  ),
+});
+
+export const environmentSecretsRoutes = new Hono<ControlPlaneHonoEnv>();
+
+environmentSecretsRoutes.get(
+  "/environments/:id/secrets",
+  admit({
+    ...GITHUB_USER_OR_SERVICE_ROUTE,
+    authorization: requireAll(
+      permissionRequirement("environments.secrets.manage"),
+      environmentRequirement("read")
+    ),
+  }),
+  (c) => dispatch(c, handleListEnvironmentSecrets)
+);
+environmentSecretsRoutes.put("/environments/:id/secrets", ENVIRONMENT_SECRETS_MANAGE, (c) =>
+  dispatch(c, handleSetEnvironmentSecrets)
+);
+environmentSecretsRoutes.post("/environments/:id/secrets/import", ENVIRONMENT_SECRETS_MANAGE, (c) =>
+  dispatch(c, handleImportEnvironmentSecrets)
+);
+environmentSecretsRoutes.delete("/environments/:id/secrets/:key", ENVIRONMENT_SECRETS_MANAGE, (c) =>
+  dispatch(c, handleDeleteEnvironmentSecret)
+);

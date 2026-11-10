@@ -1,10 +1,13 @@
-import type {
-  CreateMcpServerRequest,
-  McpServerConfig,
-  McpServerLifecycle,
-  McpServerMetadata,
-  ValidatedCreateMcpServerInput,
-  ValidatedUpdateMcpServerInput,
+import {
+  type CreateMcpServerRequest,
+  type McpServerLifecycle,
+  mcpServerCommandSchema,
+  mcpServerCredentialMapSchema,
+  mcpServerTypeSchema,
+  type McpServerConfig,
+  type McpServerMetadata,
+  type ValidatedCreateMcpServerInput,
+  type ValidatedUpdateMcpServerInput,
 } from "@open-inspect/shared/types/integrations";
 import {
   DEFAULT_MCP_SERVER_ENABLED,
@@ -69,24 +72,40 @@ function parseScopes(raw: string | null | undefined): string[] | null {
 
 function safeJsonParseCommand(raw: string | null): string[] | undefined {
   if (!raw) return undefined;
+  let parsed: unknown;
   try {
-    return JSON.parse(raw);
+    parsed = JSON.parse(raw);
   } catch {
     return [raw];
   }
+  return mcpServerCommandSchema.parse(parsed);
 }
 
-function safeJsonParseEnv(raw: string): Record<string, string> {
+function safeJsonParseEnv(raw: string, serverId: string): Record<string, string> {
+  let parsed: unknown;
   try {
-    const parsed: unknown = JSON.parse(raw);
-    // JSON.parse accepts non-object documents ("null", numbers, strings);
-    // callers iterate keys, so anything but a plain object is "no env".
-    return parsed && typeof parsed === "object" && !Array.isArray(parsed)
-      ? (parsed as Record<string, string>)
-      : {};
+    parsed = JSON.parse(raw);
   } catch {
     return {};
   }
+  const result = mcpServerCredentialMapSchema.safeParse(parsed);
+  if (result.success) return result.data;
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
+
+  const credentials: Record<string, string> = {};
+  const rejectedKeys: string[] = [];
+  for (const [key, value] of Object.entries(parsed)) {
+    if (typeof value === "string") credentials[key] = value;
+    else rejectedKeys.push(key);
+  }
+  if (rejectedKeys.length > 0) {
+    log.warn("MCP server env entries rejected", {
+      event: "mcp_server.env_entries_rejected",
+      server_id: serverId,
+      rejected_keys: rejectedKeys,
+    });
+  }
+  return credentials;
 }
 
 function safeJsonParseUpdatePolicy(raw: string | null) {
@@ -105,15 +124,16 @@ function safeJsonParseUpdatePolicy(raw: string | null) {
 }
 
 function rowToConfig(row: McpServerRow, payload: Record<string, string>): McpServerConfig {
+  const type = mcpServerTypeSchema.parse(row.type);
   const envOrHeaders: Pick<McpServerConfig, "env" | "headers"> =
-    row.type === "remote" ? { headers: payload } : { env: payload };
+    type === "remote" ? { headers: payload } : { env: payload };
   return {
     id: row.id,
     revision: row.revision,
     name: row.name,
-    type: row.type as "local" | "remote",
-    command: row.type === "local" ? safeJsonParseCommand(row.command) : undefined,
-    url: row.type === "remote" ? (row.url ?? undefined) : undefined,
+    type,
+    command: type === "local" ? safeJsonParseCommand(row.command) : undefined,
+    url: type === "remote" ? (row.url ?? undefined) : undefined,
     ...envOrHeaders,
     repoScopes: parseScopes(row.repo_scope),
     environmentScopes: parseScopes(row.environment_scope),
@@ -127,16 +147,17 @@ function rowToConfig(row: McpServerRow, payload: Record<string, string>): McpSer
 }
 
 function rowToMetadata(row: McpServerRow): McpServerMetadata {
+  const type = mcpServerTypeSchema.parse(row.type);
   const hasCredentials = row.env !== "" && row.env !== "{}" && row.env !== "null";
   return {
     id: row.id,
     revision: row.revision,
     name: row.name,
-    type: row.type as "local" | "remote",
-    command: row.type === "local" ? safeJsonParseCommand(row.command) : undefined,
-    url: row.type === "remote" ? (row.url ?? undefined) : undefined,
-    hasEnv: row.type === "local" && hasCredentials,
-    hasHeaders: row.type === "remote" && hasCredentials,
+    type,
+    command: type === "local" ? safeJsonParseCommand(row.command) : undefined,
+    url: type === "remote" ? (row.url ?? undefined) : undefined,
+    hasEnv: type === "local" && hasCredentials,
+    hasHeaders: type === "remote" && hasCredentials,
     repoScopes: parseScopes(row.repo_scope),
     environmentScopes: parseScopes(row.environment_scope),
     lifecycle: row.lifecycle ?? "approved",
@@ -150,6 +171,7 @@ function rowToMetadata(row: McpServerRow): McpServerMetadata {
       : {}),
     ...(row.resolved_version ? { resolvedVersion: row.resolved_version } : {}),
     ...(row.resolved_integrity ? { resolvedIntegrity: row.resolved_integrity } : {}),
+
     enabled: row.enabled === 1,
   };
 }
@@ -199,7 +221,7 @@ export class McpServerStore {
     return encryptToken(plain, this.encryptionKey);
   }
 
-  private async decryptEnv(raw: string): Promise<Record<string, string>> {
+  private async decryptEnv(raw: string, rowId: string): Promise<Record<string, string>> {
     // The write side stores an empty credential map as plaintext "{}" (see
     // encryptEnv) — recognize the full credential-free sentinel set that
     // rowToMetadata classifies ("", "{}", "null") before attempting a decrypt
@@ -207,10 +229,10 @@ export class McpServerStore {
     if (!raw || raw === "{}" || raw === "null") return {};
     try {
       const plain = await decryptToken(raw, this.encryptionKey);
-      return safeJsonParseEnv(plain);
+      return safeJsonParseEnv(plain, rowId);
     } catch {
       // Decryption failed — try plaintext fallback (pre-encryption row)
-      const plaintext = safeJsonParseEnv(raw);
+      const plaintext = safeJsonParseEnv(raw, rowId);
       if (Object.keys(plaintext).length > 0) {
         log.warn("MCP server env decryption failed — treating as pre-encryption plaintext row", {
           event: "mcp_server.env_decrypt_fallback",
@@ -225,7 +247,7 @@ export class McpServerStore {
   }
 
   private async decryptRow(row: McpServerRow): Promise<McpServerConfig> {
-    const env = await this.decryptEnv(row.env);
+    const env = await this.decryptEnv(row.env, row.id);
     return rowToConfig(row, env);
   }
 
@@ -332,7 +354,7 @@ export class McpServerStore {
       throw new McpServerConflictError("MCP server changed; reload and try again");
     }
 
-    const mergedType = patch.type ?? (row.type as "local" | "remote");
+    const mergedType = patch.type ?? mcpServerTypeSchema.parse(row.type);
     if (mergedType === "local" && (patch.url !== undefined || patch.headers !== undefined)) {
       throw new McpServerValidationError("Local MCP servers do not support url or headers");
     }

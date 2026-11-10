@@ -1,15 +1,32 @@
 import { describe, it, expect, beforeEach } from "vitest";
-import { SELF, env } from "cloudflare:test";
+import { SELF, createExecutionContext, env } from "cloudflare:test";
 import {
   DEFAULT_MAX_CONCURRENT_CHILD_SESSIONS,
   DEFAULT_MAX_TOTAL_CHILD_SESSIONS,
 } from "@open-inspect/shared/types/integrations";
 import { EnvironmentStore } from "../../src/db/environments";
 import { cleanD1Tables } from "./cleanup";
-import { serviceFetch } from "./helpers";
+import { routeRequest, serviceFetch, serviceRequestHeaders } from "./helpers";
+import { assignCustomRole } from "./ownership-test-helpers";
 
 describe("Integration settings API", () => {
   beforeEach(cleanD1Tables);
+
+  it.each(["/integration-settings/github", "/integration-settings/github/repos/acme/widgets"])(
+    "accepts empty settings and rejects malformed JSON at %s",
+    async (path) => {
+      const endpoint = `https://test.local${path}`;
+      const reset = await serviceFetch(endpoint, {
+        method: "PUT",
+        body: JSON.stringify({ settings: {} }),
+      });
+      expect(reset.status).toBe(200);
+
+      const malformed = await serviceFetch(endpoint, { method: "PUT", body: "{" });
+      expect(malformed.status).toBe(400);
+      expect(await malformed.json()).toEqual({ error: "Invalid JSON body" });
+    }
+  );
 
   describe("auth", () => {
     it("returns 401 without auth header", async () => {
@@ -88,6 +105,95 @@ describe("Integration settings API", () => {
       expect(body.settings.defaults.autoReviewOnOpen).toBe(false);
       expect(body.settings.enabledRepos).toEqual(["acme/widgets"]);
     });
+
+    it("does not grandfather invalid sandbox timing across real D1 API round-trips", async () => {
+      const endpoint = "https://test.local/integration-settings/sandbox";
+      await env.DB.prepare(
+        `INSERT INTO integration_settings (integration_id, settings, created_at, updated_at)
+         VALUES (?, ?, ?, ?)`
+      )
+        .bind("sandbox", JSON.stringify({ defaults: { sandboxTimeoutMs: 300_000 } }), 1, 1)
+        .run();
+
+      const getStoredInvalid = await serviceFetch(endpoint);
+      expect(getStoredInvalid.status).toBe(200);
+      const storedBody = await getStoredInvalid.json<{
+        settings: { defaults: Record<string, unknown> };
+      }>();
+      expect(storedBody.settings.defaults).toEqual({});
+
+      const unrelatedSave = await serviceFetch(endpoint, {
+        method: "PUT",
+        body: JSON.stringify({
+          settings: { defaults: { sandboxTimeoutMs: 300_000, terminalEnabled: true } },
+        }),
+      });
+      expect(unrelatedSave.status).toBe(400);
+      const persisted = await env.DB.prepare(
+        "SELECT settings FROM integration_settings WHERE integration_id = ?"
+      )
+        .bind("sandbox")
+        .first<{ settings: string }>();
+      expect(JSON.parse(persisted!.settings)).toEqual({
+        defaults: { sandboxTimeoutMs: 300_000 },
+      });
+
+      const editedTimeout = await serviceFetch(endpoint, {
+        method: "PUT",
+        body: JSON.stringify({ settings: { defaults: { sandboxTimeoutMs: 360_000 } } }),
+      });
+      expect(editedTimeout.status).toBe(400);
+
+      await env.DB.prepare("DELETE FROM integration_settings WHERE integration_id = ?")
+        .bind("sandbox")
+        .run();
+      const newShortTimeout = await serviceFetch(endpoint, {
+        method: "PUT",
+        body: JSON.stringify({ settings: { defaults: { sandboxTimeoutMs: 300_000 } } }),
+      });
+      expect(newShortTimeout.status).toBe(400);
+
+      const explicitBuffer = await serviceFetch(endpoint, {
+        method: "PUT",
+        body: JSON.stringify({
+          settings: {
+            defaults: { sandboxTimeoutMs: 360_000, finalSnapshotBufferMs: 300_000 },
+          },
+        }),
+      });
+      expect(explicitBuffer.status).toBe(200);
+      const removedBuffer = await serviceFetch(endpoint, {
+        method: "PUT",
+        body: JSON.stringify({ settings: { defaults: { sandboxTimeoutMs: 360_000 } } }),
+      });
+      expect(removedBuffer.status).toBe(400);
+    });
+
+    it.each([null, [], "invalid", 42, {}, { settings: [] }, { settings: null }])(
+      "rejects invalid settings body %j without replacing stored settings",
+      async (invalidBody) => {
+        const endpoint = "https://test.local/integration-settings/github";
+        const settings = { defaults: { autoReviewOnOpen: false } };
+        expect(
+          (
+            await serviceFetch(endpoint, {
+              method: "PUT",
+              body: JSON.stringify({ settings }),
+            })
+          ).status
+        ).toBe(200);
+        const response = await serviceFetch("https://test.local/integration-settings/github", {
+          method: "PUT",
+          body: JSON.stringify(invalidBody),
+        });
+
+        expect(response.status).toBe(400);
+        expect(await response.json()).toEqual({
+          error: "Request body must include settings object",
+        });
+        expect(await (await serviceFetch(endpoint)).json()).toMatchObject({ settings });
+      }
+    );
   });
 
   describe("DELETE /integration-settings/github", () => {
@@ -159,6 +265,24 @@ describe("Integration settings API", () => {
       const afterBody = await afterRes.json<{ settings: unknown }>();
       expect(afterBody.settings).toBeNull();
     });
+
+    it.each([null, [], "invalid", 42, {}, { settings: [] }, { settings: null }])(
+      "rejects invalid settings body %j",
+      async (invalidBody) => {
+        const response = await serviceFetch(
+          "https://test.local/integration-settings/github/repos/acme/widgets",
+          {
+            method: "PUT",
+            body: JSON.stringify(invalidBody),
+          }
+        );
+
+        expect(response.status).toBe(400);
+        expect(await response.json()).toEqual({
+          error: "Request body must include settings object",
+        });
+      }
+    );
 
     it("rejects invalid model ID with 400", async () => {
       const response = await serviceFetch(
@@ -347,6 +471,7 @@ describe("Integration settings API", () => {
               allowUserPreferenceOverride: true,
               allowLabelModelOverride: true,
               emitToolProgressActivities: true,
+              unboundChannels: "reject",
             },
           },
         }),
@@ -372,6 +497,7 @@ describe("Integration settings API", () => {
           allowUserPreferenceOverride: boolean;
           allowLabelModelOverride: boolean;
           emitToolProgressActivities: boolean;
+          unboundChannels: string;
           enabledRepos: string[] | null;
         };
       }>();
@@ -381,6 +507,7 @@ describe("Integration settings API", () => {
       expect(body.config.allowUserPreferenceOverride).toBe(false);
       expect(body.config.allowLabelModelOverride).toBe(true);
       expect(body.config.emitToolProgressActivities).toBe(true);
+      expect(body.config.unboundChannels).toBe("reject");
       expect(body.config.enabledRepos).toEqual(["acme/widgets"]);
     });
 
@@ -396,6 +523,7 @@ describe("Integration settings API", () => {
           allowUserPreferenceOverride: boolean;
           allowLabelModelOverride: boolean;
           emitToolProgressActivities: boolean;
+          unboundChannels: string;
           enabledRepos: string[] | null;
         };
       }>();
@@ -405,6 +533,7 @@ describe("Integration settings API", () => {
       expect(body.config.allowUserPreferenceOverride).toBe(true);
       expect(body.config.allowLabelModelOverride).toBe(true);
       expect(body.config.emitToolProgressActivities).toBe(true);
+      expect(body.config.unboundChannels).toBe("workspace");
       expect(body.config.enabledRepos).toBeNull();
     });
 
@@ -487,41 +616,7 @@ describe("Integration settings API", () => {
   });
 
   describe("sandbox settings API", () => {
-    async function seedMemberActor(): Promise<void> {
-      const now = Date.now();
-      await env.DB.batch([
-        env.DB.prepare(
-          `INSERT INTO users
-             (id, display_name, email, email_verified, avatar_url, platform_role, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
-        ).bind(
-          "network-member",
-          "Network Member",
-          "member@test.local",
-          1,
-          null,
-          "member",
-          now,
-          now
-        ),
-        env.DB.prepare(
-          `INSERT INTO user_identities
-             (id, user_id, provider, provider_user_id, provider_login, provider_email,
-              provider_issuer, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
-        ).bind(
-          "network-member-github",
-          "network-member",
-          "github",
-          "network-member-gh",
-          "network-member",
-          "member@test.local",
-          "https://github.com",
-          now,
-          now
-        ),
-      ]);
-    }
+    const NETWORK_MEMBER = "44444444444444444444444444444444";
 
     it("GET /integration-settings/sandbox returns null settings when unconfigured", async () => {
       const response = await serviceFetch("https://test.local/integration-settings/sandbox");
@@ -562,12 +657,14 @@ describe("Integration settings API", () => {
         body: JSON.stringify({ settings: { defaults: { networkPolicy: approvedPolicy } } }),
       });
       expect(configured.status).toBe(200);
-      await seedMemberActor();
+      const member = { userId: NETWORK_MEMBER, role: "member" } as const;
+      await serviceFetch("https://test.local/me/authorization", { as: member });
+      // Workspace integration administration does not confer the fork's editor ownership.
+      await assignCustomRole(NETWORK_MEMBER, ["integrations.read", "integrations.manage"]);
 
       const memberRequest = (defaults: Record<string, unknown>) =>
         serviceFetch("https://test.local/integration-settings/sandbox", {
-          service: "github-bot",
-          actor: "github:network-member-gh",
+          as: member,
           method: "PUT",
           body: JSON.stringify({ settings: { defaults } }),
         });
@@ -588,6 +685,49 @@ describe("Integration settings API", () => {
       await expect(resolved.json()).resolves.toMatchObject({
         config: { networkPolicy: approvedPolicy, terminalEnabled: true },
       });
+    });
+
+    it("rejects tunnel ports at every settings level while tunnels are disabled", async () => {
+      await new EnvironmentStore(env.DB).create(
+        {
+          id: "env_tunnels",
+          owner_team_id: null,
+          name: "Env tunnels",
+          description: null,
+          prebuild_enabled: 0,
+          channel_associations: null,
+          created_at: Date.now(),
+          updated_at: Date.now(),
+        },
+        [{ position: 0, repo_owner: "acme", repo_name: "web", repo_id: 1, base_branch: "main" }]
+      );
+      const putWithTunnelsDisabled = async (path: string, settings: unknown) => {
+        const url = `https://test.local/integration-settings/sandbox${path}`;
+        const body = JSON.stringify({ settings });
+        const headers = await serviceRequestHeaders(url, { method: "PUT", body });
+        return routeRequest(
+          new Request(url, { method: "PUT", body, headers }),
+          { ...env, SANDBOX_TUNNELS_POLICY: "disabled" },
+          createExecutionContext()
+        );
+      };
+      const levels = [
+        { path: "", settings: (s: object) => ({ defaults: s }) },
+        { path: "/repos/acme/widgets", settings: (s: object) => s },
+        { path: "/environments/env_tunnels", settings: (s: object) => s },
+      ];
+
+      for (const { path, settings } of levels) {
+        const refused = await putWithTunnelsDisabled(path, settings({ tunnelPorts: [3000] }));
+        expect(refused.status).toBe(400);
+        await expect(refused.json()).resolves.toEqual({
+          error:
+            "Public preview tunnels are disabled in this workspace. Deploy with the deploy-app tool instead.",
+        });
+        for (const allowed of [{ tunnelPorts: [] }, { terminalEnabled: true }]) {
+          expect((await putWithTunnelsDisabled(path, settings(allowed))).status).toBe(200);
+        }
+      }
     });
 
     it("PUT /integration-settings/sandbox with invalid tunnelPorts returns 400", async () => {
@@ -779,6 +919,7 @@ describe("Integration settings API", () => {
       await store.create(
         {
           id,
+          owner_team_id: null,
           name: `Env ${id}`,
           description: null,
           prebuild_enabled: 0,
@@ -827,6 +968,26 @@ describe("Integration settings API", () => {
       const afterDeleteBody = await afterDelete.json<{ settings: unknown }>();
       expect(afterDeleteBody.settings).toBeNull();
     });
+
+    it.each([null, [], "invalid", 42, {}, { settings: [] }, { settings: null }])(
+      "rejects invalid settings body %j",
+      async (invalidBody) => {
+        await seedEnvironment("env_settings_shape");
+
+        const response = await serviceFetch(
+          "https://test.local/integration-settings/sandbox/environments/env_settings_shape",
+          {
+            method: "PUT",
+            body: JSON.stringify(invalidBody),
+          }
+        );
+
+        expect(response.status).toBe(400);
+        expect(await response.json()).toEqual({
+          error: "Request body must include settings object",
+        });
+      }
+    );
 
     it("returns 404 for an environment that does not exist", async () => {
       const response = await serviceFetch(

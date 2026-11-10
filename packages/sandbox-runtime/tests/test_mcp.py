@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import httpx
 import pytest
 
+from sandbox_runtime.mcp_packages import NPM_PACKAGE_RE, McpPackageInstaller
 from tests.runtime_helpers import make_opencode_server
 
 
@@ -54,6 +55,14 @@ class TestResolveMcpServers:
 
 
 class TestInstallMcpPackages:
+    @pytest.fixture(autouse=True)
+    def global_root(self, tmp_path, monkeypatch):
+        async def resolve_root(installer):
+            installer._root = tmp_path
+            return tmp_path
+
+        monkeypatch.setattr(McpPackageInstaller, "_global_root", resolve_root)
+
     def _mock_proc(self, returncode=0):
         """Create a mock async subprocess with the given return code."""
         proc = AsyncMock()
@@ -300,8 +309,7 @@ class TestNpmPackageRegex:
 
     @pytest.fixture
     def regex(self):
-        sup = _make_supervisor()
-        return sup._NPM_PKG_RE
+        return NPM_PACKAGE_RE
 
     @pytest.mark.parametrize(
         "pkg",

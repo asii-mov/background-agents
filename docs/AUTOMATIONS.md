@@ -11,8 +11,8 @@ Trigger types:
 | **Schedule**        | Run on a cron schedule                    | Available          |
 | **Inbound Webhook** | Trigger from any system with an HTTP POST | Available          |
 | **Sentry Alert**    | Trigger from a Sentry Custom Integration  | Available          |
-| **Slack Message**   | Trigger on messages in watched channels   | Available (opt-in) |
-| **GitHub Event**    | Trigger on GitHub activity                | Planned            |
+| **Slack Message**   | Trigger on messages in watched channels   | Available          |
+| **GitHub Event**    | Trigger on GitHub activity                | Available (opt-in) |
 | **Linear Event**    | Trigger on Linear activity                | Planned            |
 
 Common use cases include nightly dependency updates, reacting to deploy or incident events, triaging
@@ -24,13 +24,27 @@ new Sentry issues, and recurring report generation.
 
 Navigate to **Automations** in the sidebar, then click **Create Automation**.
 
+Creation requires both `automations.create` and `sessions.create`, plus permission to use the
+selected targets. The creator becomes the initial executor. The web creation and template entry
+points also require both permissions; automation creation permission alone is insufficient.
+
 Start by choosing a **Trigger Type**. The rest of the form adjusts based on that choice.
+
+Choose workspace ownership or an owning team; team pages also expose an **Automations** tab. The
+creator must belong to the selected active team, and that team's grants must cover the selected
+repositories, including repositories resolved from environment targets. Newly created teams have no
+repository grants. When `requireTeamOnCreate` is enabled, new automation definitions must have a
+team. Existing workspace automations are not migrated or blocked from running by that setting alone.
+
+Ownership is fixed at creation: an automation cannot move between teams or between a team and the
+workspace. Its **executor**, initially the creator, is a separate user identity that can be
+reassigned without changing ownership.
 
 ### Required Fields
 
 | Field                        | Description                                                                                                                                                                                                                                      |
 | ---------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| **Trigger Type**             | How the automation starts: schedule, inbound webhook, Sentry alert, or Slack message.                                                                                                                                                            |
+| **Trigger Type**             | How the automation starts: schedule, inbound webhook, Sentry alert, GitHub event, or Slack message.                                                                                                                                              |
 | **Name**                     | A short label for the automation (max 200 characters). Appears in the automations list and in session titles prefixed with `[Auto]`.                                                                                                             |
 | **Repository Configuration** | Pick no repository, one repository, or (for scheduled automations) up to 10 repositories. Selecting several fans each firing out into one session per repository. Only repositories installed on the GitHub App are available.                   |
 | **Instructions**             | The prompt sent to the coding agent each time the automation fires (max 15,000 characters). Write this as you would a normal session prompt and reference the trigger context when useful. Multi-repo automations share one prompt across repos. |
@@ -42,7 +56,7 @@ Start by choosing a **Trigger Type**. The rest of the form adjusts based on that
 | **Branch**     | The base branch for each session (shown when exactly one repository is selected). Multi-repo selections use each repository's default branch. |
 | **Model**      | The AI model to use. Defaults to the system default model.                                                                                    |
 | **Reasoning**  | Optional reasoning level for models that support it.                                                                                          |
-| **Conditions** | Optional trigger filters for event-driven automations such as inbound webhooks and Sentry alerts.                                             |
+| **Conditions** | Optional trigger filters for event-driven automations such as inbound webhooks, GitHub events, and Sentry alerts.                             |
 
 ### Trigger-Specific Fields
 
@@ -51,6 +65,7 @@ Start by choosing a **Trigger Type**. The rest of the form adjusts based on that
 | **Schedule**        | **Schedule** and **Timezone**                                                                |
 | **Inbound Webhook** | No extra required fields                                                                     |
 | **Sentry Alert**    | **Event Type** and **Sentry Client Secret**                                                  |
+| **GitHub Event**    | **Event Type** and optional **Conditions**                                                   |
 | **Slack Message**   | **Conditions** (a Slack Channel condition is required; a Message Text condition is optional) |
 
 For non-schedule automations, schedule fields are not used.
@@ -194,13 +209,19 @@ means separate deliveries for the same automation can run at the same time.
 Successful requests return JSON in this shape:
 
 ```json
-{ "ok": true, "triggered": 1, "skipped": 0 }
+{ "ok": true, "triggered": 1, "skipped": 0, "steered": 0, "invocationId": "3f2a…" }
 ```
 
-`triggered` is the number of automation runs started.
+`triggered` is the number of automation runs started. `invocationId` identifies the firing this
+request belongs to (for a repeated `idempotencyKey`, the original firing), or is `null` when nothing
+was recorded. Read its status with the same API key at
+`GET /webhooks/automation/<automation-id>/invocations/<invocation-id>`, which returns
+`{ invocationId, status, runs: [{ id, status, sessionId }] }` and never session content.
 
-`skipped` is the number of matching runs that were ignored because of duplicate delivery or
-concurrency protection.
+`skipped` includes runs not started because of duplicate delivery, concurrency protection, or
+runtime authorization denial. Authorization denial does not pause an event-driven automation or
+record a run-history invocation; restore the required executor/team/target access before sending
+another delivery.
 
 ### Error Responses
 
@@ -214,17 +235,47 @@ concurrency protection.
 
 ---
 
+## GitHub Event Triggers
+
+A **GitHub Event** automation starts a session when a supported webhook event arrives for its
+repository. Pick one repository and one event type. The GitHub App must subscribe to that event and
+have its required repository permission. Set `enable_github_bot = true`, then complete the
+[GitHub bot setup](GETTING_STARTED.md#github-bot-optional) to deploy the webhook worker and
+configure event delivery.
+
+**Workflow Run Completed** handles completed GitHub Actions workflow runs. It requires the GitHub
+App's read-only Actions permission and the **Workflow runs** event subscription. Use these
+conditions to restrict it:
+
+- **Workflow Name** matches the workflow name exactly.
+- **Conclusion** matches `success`, `failure`, `neutral`, `cancelled`, `timed_out`,
+  `action_required`, `stale`, or `skipped`.
+
+All configured conditions must match. Open-Inspect includes the workflow name, conclusion, and run
+ID in the untrusted event context sent to the agent. When GitHub supplies them, the context also
+includes the branch, commit SHA, workflow path, and run URL. Open-Inspect includes the attempt
+number in its deduplication key, so it can admit each GitHub rerun once.
+
+**Conclusion** also works for completed check suites. **Check Conclusion** remains available for
+existing check-suite automations.
+
+Each event type offers only the conditions its payload can answer, so the choices change with the
+event you pick — pull requests offer branch, target branch, label, and actor; issues offer label and
+actor; comments offer actor. Changing the event type removes conditions the new one cannot answer,
+and the form says which. GitHub webhook payloads carry no file list, so path-pattern filtering is
+not offered for any GitHub event.
+
+---
+
 ## Slack Message Triggers
 
 A **Slack Message** automation starts a session when someone posts a matching message in a watched
 Slack channel. Unlike `@mention` sessions (which are explicit, interactive requests), these triggers
 fire on ambient channel messages that match the conditions you define.
 
-This source is opt-in per deployment and ships **disabled by default**. Enabling it requires the
-operator to set the `SLACK_TRIGGERS_ENABLED` flag and configure the Slack app — see
+The Slack app must be configured to deliver channel messages. See
 [the Slack integration guide](integrations/SLACK.md#channel-message-triggers) for setup and the
-threat model. The web form and these conditions are always available to author; messages are only
-ingested once the flag is on.
+threat model.
 
 ### Conditions
 
@@ -328,6 +379,36 @@ Examples:
 
 ## Managing Automations
 
+Workspace automations are readable with `automations.read`; team automations additionally require
+owning-team membership or a workspace Owner/Administrator role. Executors and owning-team leads can
+manage and trigger eligible automations with the corresponding `own` permissions; `any` permissions
+allow those actions across eligible automations. Built-in Owners and Administrators have the latter;
+Viewers cannot manage or trigger. These resource checks apply even in `off` or `shadow` session
+enforcement mode.
+
+Scheduled and event runs use the executor's authority. Each run checks that the execution user is
+active, can create sessions and use its targets, and, for team automations, is a current member of
+the active owning team. Current team grants must cover all repositories being launched. Generated
+sessions inherit the automation's owning team and that team's default visibility; workspace runs
+remain workspace-owned and workspace-visible. Environment targets must have the same ownership as
+the automation; unlike the team session picker, a team automation cannot select a workspace-owned
+environment.
+
+If a scheduled run is denied execution authorization, it is recorded as **Skipped** and the
+automation is paused immediately, clearing its next run time without adding a failure strike.
+Restore the required access or reassign the executor, then click **Resume**. Restoring access or
+reassigning alone does not resume the schedule. Event-driven authorization denials skip the event
+without pausing the automation.
+
+### Executor Reassignment
+
+A team lead or workspace Owner/Administrator with automation management access can use
+`PATCH /automations/:id` with `{"userId":"<canonical-user-id>"}` to change the executor. Being the
+executor alone does not permit reassignment. The replacement must be active, able to launch the
+stored targets, and a member of the active owning team for a team automation. The change is audited
+as `automation.executor_changed`. Reassignment allows recovery when the old executor loses access
+without recreating the definition; it does not move ownership or rewrite existing sessions.
+
 ### Pause and Resume
 
 **Pausing** an automation stops it from firing. Scheduled automations will not run on their cron,
@@ -345,6 +426,11 @@ selection. For scheduled automations, this does not affect the next scheduled ru
 triggers follow the same concurrency rules as all other runs: if a run is already active, the
 trigger is rejected. Trigger Now also works while the automation is paused, so you can verify a fix
 before resuming.
+
+Manual runs use the requester's authority and linked source-control credentials, not the stored
+executor's. In addition to trigger permission, the requester must pass runtime session/target checks
+and be a current member of the active owning team for a team automation, even if they are a
+workspace Owner or Administrator.
 
 ### Edit
 
@@ -365,8 +451,17 @@ any sessions it created are preserved.
 
 ## Run History
 
-Each automation's detail page shows a chronological list of runs — one row per firing — with status,
-duration, and links to the underlying sessions.
+Each automation's detail page shows a chronological list of runs — one row per recorded invocation —
+with status, duration, and links to the underlying sessions. Generic event execution-authorization
+denials do not create invocation records and do not appear in this history.
+
+GitHub repository-grant denials are an exception. Matching events without an owning-team grant for
+the repository can record a sessionless **Unauthorized** invocation with reason `repo_not_granted`
+before executor authorization, including when the executor cannot be resolved. A missing executor
+alone does not create that record. These denials increment the event response's `skipped` count, do
+not pause the automation, and neither add a failure strike nor reset existing failures. See
+`packages/control-plane/src/automation/github-event-admission.ts` and
+`packages/control-plane/src/db/github-automation-store.ts` for this pre-admission path.
 
 A single-repository firing renders as a flat row, exactly as before. A multi-repository firing
 renders as one expandable row summarizing its repositories (for example "10 repositories — 8
@@ -375,16 +470,20 @@ reason, and session link.
 
 ### Run Statuses
 
-| Status              | Meaning                                                                                                |
-| ------------------- | ------------------------------------------------------------------------------------------------------ |
-| **Starting**        | A session is being created for this run.                                                               |
-| **Running**         | At least one session is actively executing.                                                            |
-| **Completed**       | Every session finished successfully.                                                                   |
-| **Failed**          | Every session encountered an error. The failure reason is shown on the run.                            |
-| **Partial failure** | A multi-repository run where some repositories completed and some failed.                              |
-| **Skipped**         | The run was skipped because a previous run was still active (see [Concurrent Runs](#concurrent-runs)). |
+| Status              | Meaning                                                                                                             |
+| ------------------- | ------------------------------------------------------------------------------------------------------------------- |
+| **Starting**        | A session is being created for this run.                                                                            |
+| **Running**         | At least one session is actively executing.                                                                         |
+| **Completed**       | Every session finished successfully.                                                                                |
+| **Failed**          | Every session encountered an error. The failure reason is shown on the run.                                         |
+| **Partial failure** | A multi-repository run where some repositories completed and some failed.                                           |
+| **Skipped**         | A previous run was still active, or a scheduled firing was denied execution authorization.                          |
+| **Unauthorized**    | GitHub event admission found no owning-team grant for the repository (`repo_not_granted`); no session was launched. |
 
-Click **View session** on any run to jump to the full session with its output and artifacts.
+When authorized, click **View session** to open the session with its output and artifacts.
+Automation read access is not session read access: history redacts session IDs, titles, and artifact
+summaries for sessions the viewer cannot read. Lists do not expose private sessions solely through
+an Owner's break-glass privilege; a qualifying single-run read audits that access.
 
 ---
 
@@ -392,11 +491,11 @@ Click **View session** on any run to jump to the full session with its output an
 
 Automations display one of three statuses:
 
-| Status       | Meaning                                                                               |
-| ------------ | ------------------------------------------------------------------------------------- |
-| **Enabled**  | Running normally and ready to respond to its trigger.                                 |
-| **Degraded** | Enabled but has recent consecutive failures. The failure count is shown on the badge. |
-| **Paused**   | Not firing. Either manually paused or auto-paused after repeated failures.            |
+| Status       | Meaning                                                                                                                                 |
+| ------------ | --------------------------------------------------------------------------------------------------------------------------------------- |
+| **Enabled**  | Running normally and ready to respond to its trigger.                                                                                   |
+| **Degraded** | Enabled but has recent consecutive failures. The failure count is shown on the badge.                                                   |
+| **Paused**   | Not firing. Manually paused, auto-paused after repeated failures, or immediately paused after scheduled execution authorization denial. |
 
 ---
 

@@ -1,4 +1,5 @@
 import { env } from "cloudflare:test";
+import type { SessionSnapshot } from "@open-inspect/shared/types/server-messages";
 import { beforeEach, describe, expect, it } from "vitest";
 import { encryptToken } from "../../src/auth/crypto";
 import { cleanD1Tables } from "./cleanup";
@@ -7,11 +8,41 @@ import {
   openClientWs,
   queryDO,
   seedEvents,
+  serviceFetch,
   waitForSandboxStatus,
 } from "./helpers";
 
 describe("session snapshot synchronization", () => {
   beforeEach(cleanD1Tables);
+
+  it.each(["22222222222222222222222222222222", null])(
+    "returns the D1 ownerUserId for a private snapshot despite a stale DO owner (%s)",
+    async (ownerUserId) => {
+      const name = `snapshot-owner-${crypto.randomUUID()}`;
+      const { stub } = await initNamedSession(name, { userId: "stale-runtime-owner" });
+      await waitForSandboxStatus(stub, "failed");
+      await env.DB.prepare("UPDATE sessions SET user_id = ?, visibility = 'private' WHERE id = ?")
+        .bind(ownerUserId, name)
+        .run();
+
+      expect(
+        await queryDO<{ user_id: string }>(
+          stub,
+          "SELECT user_id FROM participants WHERE role = 'owner'"
+        )
+      ).toEqual([{ user_id: "stale-runtime-owner" }]);
+
+      const response = await serviceFetch(`https://test.local/sessions/${name}`);
+
+      expect(response.status).toBe(200);
+      const snapshot = await response.json<SessionSnapshot>();
+      expect(snapshot.session).toMatchObject({
+        ownerUserId,
+        visibility: "private",
+        capabilities: { canRead: true, canSandbox: false },
+      });
+    }
+  );
 
   it("returns a secret-free snapshot with stable event identities", async () => {
     const name = `snapshot-${Date.now()}`;
@@ -47,7 +78,7 @@ describe("session snapshot synchronization", () => {
     const response = await stub.fetch("http://internal/internal/snapshot");
     expect(response.status).toBe(200);
     expect(response.headers.get("Cache-Control")).toBe("private, no-store");
-    const snapshot = await response.json<Record<string, any>>();
+    const snapshot = await response.json<SessionSnapshot>();
 
     expect(snapshot.session).toMatchObject({
       id: name,
@@ -73,6 +104,8 @@ describe("session snapshot synchronization", () => {
       codeServer: { url: "https://code.example.test", password: "code-secret" },
       vnc: { url: "https://desktop.example.test", password: "vnc-secret" },
       ttyd: { url: "https://terminal.example.test", token: "terminal-secret" },
+      tunnelUrls: null,
+      sandboxDashboardUrl: null,
     });
 
     const { ws, messages } = await openClientWs(name, { subscribe: true });
@@ -81,6 +114,7 @@ describe("session snapshot synchronization", () => {
     expect(messages![0].session).not.toHaveProperty("codeServerPassword");
     expect(messages![0].session).not.toHaveProperty("vncPassword");
     expect(messages![0].session).not.toHaveProperty("ttydToken");
+    expect(messages![0].canManageBudget).toBe(true);
     expect(messages![0].timeline).toHaveProperty("events");
     expect(JSON.stringify(messages![0])).not.toContain("code-secret");
     expect(JSON.stringify(messages![0])).not.toContain("vnc-secret");

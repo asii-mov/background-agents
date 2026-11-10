@@ -1,6 +1,11 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { EnvironmentStore, type EnvironmentRepositoryRow } from "../db/environments";
 import type { ImageBuildStore } from "../db/image-builds";
 import type { SqlDatabase } from "../db/sql-database";
+import type { Job } from "../jobs";
+import { readCachedInstallationRepositories } from "../repos/cache";
+import type * as ReposCacheModule from "../repos/cache";
+import { createTestEnv } from "../router.test-support";
 import type { SourceControlProvider } from "../source-control";
 import type { Env } from "../types";
 import type { ImageBuildScope } from "./model";
@@ -10,9 +15,67 @@ import type { ResolvedImageBuildTarget } from "./scope";
 import { COMPATIBLE_RUNTIME_VERSION } from "./test-helpers";
 import type { ImageBuildWorkflow } from "./workflow";
 
+vi.mock("../repos/cache", async (importOriginal) => ({
+  ...(await importOriginal<typeof ReposCacheModule>()),
+  readCachedInstallationRepositories: vi.fn(),
+}));
+
+const ENV_TARGET: ResolvedImageBuildTarget = {
+  kind: "environment",
+  repositories: [
+    { repoOwner: "acme", repoName: "web", baseBranch: "main" },
+    { repoOwner: "acme", repoName: "api", baseBranch: "develop" },
+  ],
+  repositoriesFingerprint: "fp-env",
+};
+const ENV_REPOSITORIES: EnvironmentRepositoryRow[] = ENV_TARGET.repositories.map(
+  (repository, position) => ({
+    environment_id: "env_1",
+    position,
+    repo_owner: repository.repoOwner,
+    repo_name: repository.repoName,
+    repo_id: null,
+    base_branch: repository.baseBranch,
+  })
+);
+
+beforeEach(() => {
+  vi.clearAllMocks();
+  vi.spyOn(EnvironmentStore.prototype, "getById").mockResolvedValue({
+    id: "env_1",
+    name: "Environment",
+    description: null,
+    prebuild_enabled: 1,
+    channel_associations: null,
+    owner_team_id: null,
+    created_at: 1,
+    updated_at: 1,
+  });
+  vi.spyOn(EnvironmentStore.prototype, "getRepositoriesForEnvironment").mockResolvedValue(
+    ENV_REPOSITORIES
+  );
+  vi.mocked(readCachedInstallationRepositories).mockResolvedValue(
+    [
+      { id: 1, name: "web" },
+      { id: 2, name: "api" },
+      { id: 99, name: "sibling" },
+    ].map((repository) => ({
+      ...repository,
+      owner: "acme",
+      fullName: `acme/${repository.name}`,
+      description: null,
+      private: true,
+      defaultBranch: "main",
+      archived: false,
+    }))
+  );
+});
+
+afterEach(() => vi.restoreAllMocks());
+
 function harness(
   options: {
-    provider?: "modal" | null;
+    provider?: "modal" | "daytona" | null;
     sourceControl?: SourceControlProvider | null;
     env?: Env;
   } = {}
@@ -36,9 +99,9 @@ function harness(
     },
   ]);
   const clearProviderSessionCleanup = vi.fn(async () => true);
-  const listScopes = vi.fn(
-    async (): Promise<ImageBuildScope[]> => [{ kind: "repo", id: "acme/web" }]
-  );
+  const listScopes = vi.fn(async (): Promise<ImageBuildScope[]> => [
+    { kind: "repo", id: "acme/web" },
+  ]);
   const listRecoverableFinalizations = vi.fn(
     async (): Promise<
       Array<{ id: string; completion_hash: string; callback_token_used_at: number }>
@@ -55,6 +118,36 @@ function harness(
     listSessionCleanup,
     clearProviderSessionCleanup,
     listRecoverableFinalizations,
+    // The scheduler constructs its reaper internally, so the cleanup phase
+    // runs real reap logic over these rows: one failed and one superseded
+    // artifact delete → artifactsReaped 2, two aged rows → rowsAged 2.
+    getFailedImagesWithArtifacts: vi.fn(async () => [
+      {
+        id: "reap-failed",
+        scope_kind: "environment" as const,
+        scope_id: "env_1",
+        provider: "modal" as const,
+        provider_image_id: "im-failed",
+        provider_session_id: null,
+        created_at: 1,
+      },
+    ]),
+    clearFailedImageArtifact: vi.fn(async () => true),
+    deleteOldFailedBuilds: vi.fn(async () => 2),
+    getSupersededImages: vi.fn(async () => [
+      {
+        id: "reap-superseded",
+        scope_kind: "environment" as const,
+        scope_id: "env_1",
+        provider: "modal" as const,
+        provider_image_id: "im-superseded",
+        provider_session_id: null,
+        created_at: 2,
+      },
+    ]),
+    deleteSupersededImage: vi.fn(async () => true),
+    listUnboundSourceIntents: vi.fn(async () => []),
+    listUnresolvedOperations: vi.fn(async () => []),
     finalization: {
       clearSessionCleanup: clearProviderSessionCleanup,
     },
@@ -73,11 +166,6 @@ function harness(
       type: "triggered" as const,
       buildId: "build-new",
     })),
-    cleanupImages: vi.fn(async () => ({
-      deletedFailed: 2,
-      reapedFailed: 1,
-      reapedSuperseded: 1,
-    })),
   };
   const resolveTarget = vi.fn(
     async (
@@ -92,7 +180,7 @@ function harness(
     })
   );
   const scheduler = new ImageBuildScheduler(
-    options.env ?? ({} as Env),
+    options.env ?? createTestEnv(),
     {} as SqlDatabase,
     options.provider === undefined ? "modal" : options.provider,
     store as unknown as ImageBuildStore,
@@ -112,6 +200,31 @@ function harness(
     listSessionCleanup,
     listRecoverableFinalizations,
   };
+}
+
+function mockReadyImages({ store, resolveTarget }: ReturnType<typeof harness>): void {
+  store.getReconciliationStatus.mockImplementation(async (scope: ImageBuildScope) => {
+    const target = await resolveTarget({} as Env, {} as SqlDatabase, scope);
+    return [
+      {
+        id: `build-${scope.id}`,
+        scopeKind: scope.kind,
+        scopeId: scope.id,
+        provider: "modal",
+        status: "ready",
+        repositoriesFingerprint: target.repositoriesFingerprint,
+        repositoryShas: target.repositories.map((repository) => ({
+          repoOwner: repository.repoOwner,
+          repoName: repository.repoName,
+          baseSha: "abc123",
+        })),
+        runtimeVersion: COMPATIBLE_RUNTIME_VERSION,
+        buildDurationSeconds: 1,
+        errorMessage: null,
+        createdAt: 1,
+      },
+    ];
+  });
 }
 
 describe("ImageBuildScheduler", () => {
@@ -179,21 +292,22 @@ describe("ImageBuildScheduler", () => {
   });
 
   it("continues reconciliation and artifact cleanup when a cleanup phase query fails", async () => {
-    const { scheduler, store, workflow } = harness();
+    const { scheduler, store } = harness();
     store.listSessionCleanup.mockRejectedValueOnce(new Error("D1 cleanup unavailable"));
 
     const stats = await scheduler.run({ request_id: "cron-1", trace_id: "cron-1" });
 
     expect(stats.scopesScanned).toBe(1);
     expect(stats.triggered).toBe(1);
-    expect(workflow.cleanupImages).toHaveBeenCalledOnce();
+    expect(store.deleteOldFailedBuilds).toHaveBeenCalledOnce();
   });
 
   it("checks every enabled scope in one full scan", async () => {
     const getBranchHead = vi.fn(async () => "abc123");
-    const { scheduler, store, resolveTarget, listScopes } = harness({
+    const h = harness({
       sourceControl: { getBranchHead } as unknown as SourceControlProvider,
     });
+    const { scheduler, resolveTarget, listScopes } = h;
     listScopes.mockResolvedValue(
       Array.from({ length: 41 }, (_, index) => ({
         kind: "repo" as const,
@@ -216,35 +330,74 @@ describe("ImageBuildScheduler", () => {
         };
       }
     );
-    store.getReconciliationStatus.mockImplementation(async (scope: ImageBuildScope) => {
-      const target = await resolveTarget({} as Env, {} as SqlDatabase, scope);
-      return [
-        {
-          id: `build-${scope.id}`,
-          scope_kind: scope.kind,
-          scope_id: scope.id,
-          provider: "modal",
-          status: "ready",
-          repositories_fingerprint: target.repositoriesFingerprint,
-          repository_shas: JSON.stringify(
-            target.repositories.map((repository) => ({
-              repoOwner: repository.repoOwner,
-              repoName: repository.repoName,
-              baseSha: "abc123",
-            }))
-          ),
-          runtime_version: COMPATIBLE_RUNTIME_VERSION,
-          build_duration_seconds: 1,
-          error_message: null,
-          created_at: 1,
-        },
-      ];
-    });
+    mockReadyImages(h);
 
     const stats = await scheduler.run({ request_id: "cron-1", trace_id: "cron-1" });
 
     expect(stats.scopesScanned).toBe(41);
     expect(stats.branchLookups).toBe(41);
+  });
+
+  it("scopes every environment branch read to the resolved member ids", async () => {
+    const getBranchHead = vi.fn(async () => "abc123");
+    const env = createTestEnv();
+    const h = harness({
+      env,
+      sourceControl: { getBranchHead } as unknown as SourceControlProvider,
+    });
+    h.listScopes.mockResolvedValue([{ kind: "environment", id: "env_1" }]);
+    h.resolveTarget.mockResolvedValue(ENV_TARGET);
+    mockReadyImages(h);
+
+    const stats = await h.scheduler.run({ request_id: "cron-1", trace_id: "cron-1" });
+
+    const expectedScope = { kind: "repositories", repositoryIds: [1, 2] };
+    expect(readCachedInstallationRepositories).toHaveBeenCalledExactlyOnceWith(env);
+    expect(getBranchHead).toHaveBeenCalledWith(
+      { owner: "acme", name: "web", branch: "main" },
+      expectedScope
+    );
+    expect(getBranchHead).toHaveBeenCalledWith(
+      { owner: "acme", name: "api", branch: "develop" },
+      expectedScope
+    );
+    expect(stats.branchMatched).toBe(2);
+  });
+
+  it("skips branch reads and rebuilds after environment membership changes", async () => {
+    vi.mocked(EnvironmentStore.prototype.getRepositoriesForEnvironment).mockResolvedValue([
+      ENV_REPOSITORIES[0],
+      { ...ENV_REPOSITORIES[1], repo_name: "sibling" },
+    ]);
+    const getBranchHead = vi.fn(async () => "abc123");
+    const h = harness({ sourceControl: { getBranchHead } as unknown as SourceControlProvider });
+    h.listScopes.mockResolvedValue([{ kind: "environment", id: "env_1" }]);
+    h.resolveTarget.mockResolvedValue(ENV_TARGET);
+    mockReadyImages(h);
+
+    const stats = await h.scheduler.run({ request_id: "cron-1", trace_id: "cron-1" });
+
+    expect(stats.scopesScanned).toBe(1);
+    expect(stats.branchLookups).toBe(0);
+    expect(getBranchHead).not.toHaveBeenCalled();
+    expect(h.workflow.triggerBuildWithTarget).not.toHaveBeenCalled();
+  });
+
+  it("does not broaden repository scope when the provider refuses branch auth", async () => {
+    const getBranchHead = vi.fn(async () => {
+      throw new Error("Token scope denied");
+    });
+    const h = harness({ sourceControl: { getBranchHead } as unknown as SourceControlProvider });
+    mockReadyImages(h);
+
+    const stats = await h.scheduler.run({ request_id: "cron-1", trace_id: "cron-1" });
+
+    expect(getBranchHead).toHaveBeenCalledExactlyOnceWith(
+      { owner: "acme", name: "web", branch: "main" },
+      { kind: "repositories", repositoryIds: [1] }
+    );
+    expect(stats.branchUnknown).toBe(1);
+    expect(h.workflow.triggerBuildWithTarget).not.toHaveBeenCalled();
   });
 
   it("starts every required build found by the full scan", async () => {
@@ -264,7 +417,7 @@ describe("ImageBuildScheduler", () => {
   });
 
   it("runs provider-neutral maintenance when rebuild reconciliation is unavailable", async () => {
-    const { scheduler, listScopes, workflow } = harness({
+    const { scheduler, store, listScopes } = harness({
       provider: null,
       sourceControl: null,
     });
@@ -275,13 +428,13 @@ describe("ImageBuildScheduler", () => {
     expect(stats.cleanupAttempted).toBe(2);
     expect(stats.scopesScanned).toBe(0);
     expect(listScopes).not.toHaveBeenCalled();
-    expect(workflow.cleanupImages).toHaveBeenCalledOnce();
+    expect(store.deleteOldFailedBuilds).toHaveBeenCalledOnce();
   });
 
   it("republishes persisted artifacts left behind by exhausted Queue delivery", async () => {
     const send = vi.fn(async () => undefined);
     const { scheduler, listRecoverableFinalizations } = harness({
-      env: { IMAGE_BUILD_FINALIZATION_QUEUE: { send } } as unknown as Env,
+      env: createTestEnv({ JOBS: { send } }),
     });
     listRecoverableFinalizations.mockResolvedValue([
       {
@@ -295,18 +448,19 @@ describe("ImageBuildScheduler", () => {
 
     expect(stats.finalizationsRepublished).toBe(1);
     expect(send).toHaveBeenCalledWith({
-      version: 1,
-      buildId: "build-recover",
-      completionHash: "a".repeat(64),
+      kind: "image_build.finalize",
+      payload: { version: 1, buildId: "build-recover", completionHash: "a".repeat(64) },
     });
   });
 
   it("republishes every recoverable finalization and contains a publish failure", async () => {
-    const send = vi.fn(async ({ buildId }: { buildId: string }) => {
-      if (buildId === "build-05") throw new Error("queue unavailable");
+    const send = vi.fn(async (job: Job) => {
+      if (job.kind === "image_build.finalize" && job.payload.buildId === "build-05") {
+        throw new Error("queue unavailable");
+      }
     });
     const { scheduler, listRecoverableFinalizations } = harness({
-      env: { IMAGE_BUILD_FINALIZATION_QUEUE: { send } } as unknown as Env,
+      env: createTestEnv({ JOBS: { send } }),
     });
     const recoverable = Array.from({ length: 21 }, (_, index) => ({
       id: `build-${String(index + 1).padStart(2, "0")}`,
@@ -321,9 +475,40 @@ describe("ImageBuildScheduler", () => {
     expect(send).toHaveBeenCalledTimes(21);
     expect(listRecoverableFinalizations).toHaveBeenCalledWith(expect.any(Number));
     expect(send).toHaveBeenCalledWith({
-      version: 1,
-      buildId: "build-21",
-      completionHash: "21".repeat(32),
+      kind: "image_build.finalize",
+      payload: { version: 1, buildId: "build-21", completionHash: "21".repeat(32) },
     });
+  });
+});
+
+describe("ImageBuildScheduler admission", () => {
+  it("keeps every maintenance phase running while new builds are paused", async () => {
+    const { scheduler, store, listScopes, workflow } = harness({
+      provider: "daytona",
+      env: createTestEnv({ SANDBOX_PROVIDER: "daytona" }),
+    });
+
+    const stats = await scheduler.run({ request_id: "cron-1", trace_id: "cron-1" });
+
+    expect(stats.admissionOpen).toBe(false);
+    // No new builds...
+    expect(listScopes).not.toHaveBeenCalled();
+    expect(workflow.triggerBuildWithTarget).not.toHaveBeenCalled();
+    // ...but everything that reclaims what already exists still runs.
+    expect(stats.staleMarked).toBe(1);
+    expect(stats.cleanupAttempted).toBe(2);
+    expect(store.deleteOldFailedBuilds).toHaveBeenCalledOnce();
+  });
+
+  it("reconciles scopes again once admission opens", async () => {
+    const { scheduler, listScopes } = harness({
+      provider: "daytona",
+      env: createTestEnv({ SANDBOX_PROVIDER: "daytona", DAYTONA_PREBUILDS_ENABLED: "true" }),
+    });
+
+    const stats = await scheduler.run({ request_id: "cron-1", trace_id: "cron-1" });
+
+    expect(stats.admissionOpen).toBe(true);
+    expect(listScopes).toHaveBeenCalled();
   });
 });

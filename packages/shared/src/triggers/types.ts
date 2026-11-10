@@ -64,7 +64,17 @@ const triggerConditionSchema = z.discriminatedUnion("type", [
     value: stringArrayConditionValueSchema,
   }),
   z.object({
+    type: z.literal("conclusion"),
+    operator: z.literal("eq"),
+    value: z.string(),
+  }),
+  z.object({
     type: z.literal("check_conclusion"),
+    operator: z.literal("eq"),
+    value: z.string(),
+  }),
+  z.object({
+    type: z.literal("workflow_name"),
     operator: z.literal("eq"),
     value: z.string(),
   }),
@@ -138,6 +148,8 @@ const baseAutomationEventSchema = {
 export const githubAutomationEventSchema = z.object({
   ...baseAutomationEventSchema,
   source: z.literal("github"),
+  /** Stable GitHub repository identity for routing; owner/name are display metadata. */
+  repositoryId: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
   repoOwner: z.string().min(1),
   repoName: z.string().min(1),
   /** Pull request head ref when the event is tied to a PR. */
@@ -147,7 +159,10 @@ export const githubAutomationEventSchema = z.object({
   labels: z.array(z.string()).optional(),
   actor: z.string().optional(),
   changedFiles: z.array(z.string()).optional(),
+  conclusion: z.string().optional(),
+  /** Compatibility field for independently deployed pre-conclusion producers and consumers. */
   checkConclusion: z.string().optional(),
+  workflowName: z.string().optional(),
   /** Present only on pull_request events. */
   pullRequest: z
     .object({

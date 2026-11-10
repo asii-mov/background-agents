@@ -1,19 +1,33 @@
 "use client";
 
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { createSessionResponseSchema } from "@open-inspect/shared/types/session-api";
+import type { HarnessId } from "@open-inspect/shared/harnesses";
 import type { ModelProviderSelections } from "@open-inspect/shared/types/provider-accounts";
 import type { SessionSkillSelection } from "@open-inspect/shared/types/skills";
+import type { SessionVisibility } from "@open-inspect/shared/types/teams";
 import { browserApiFetch } from "@/lib/browser-api-fetch";
 import type { SessionTargetRequestFields } from "@/lib/session-target";
 import { retireWarmDraftSession } from "@/lib/warm-session";
 import type { InteractiveProviderRoutingIdentity } from "@/lib/provider-selection";
 
 export type WarmDraftSessionRequest = SessionTargetRequestFields & {
+  harness: HarnessId;
   model: string;
   reasoningEffort?: string;
   skillSelection: SessionSkillSelection;
+  includePersonalMemories?: boolean;
   providerSelections: ModelProviderSelections;
+  teamId: string | null;
+  visibility: SessionVisibility;
 };
+
+interface WarmDraftSessionError {
+  message: string;
+  code: string | null;
+  status: number;
+  terminal: boolean;
+}
 
 export function warmDraftSessionIdentity(
   request: WarmDraftSessionRequest | null,
@@ -45,8 +59,10 @@ export function useWarmDraftSession(
   const sessionIdRef = useRef<string | null>(null);
   const creationRef = useRef<Promise<string | null> | null>(null);
   const abortControllerRef = useRef<AbortController | null>(null);
+  const errorRef = useRef<WarmDraftSessionError | null>(null);
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [isWarming, setIsWarming] = useState(false);
+  const [error, setError] = useState<WarmDraftSessionError | null>(null);
 
   useLayoutEffect(() => {
     requestRef.current = request;
@@ -58,6 +74,8 @@ export function useWarmDraftSession(
     abortControllerRef.current = null;
     creationRef.current = null;
     setIsWarming(false);
+    errorRef.current = null;
+    setError(null);
 
     const supersededSessionId = sessionIdRef.current;
     sessionIdRef.current = null;
@@ -77,6 +95,7 @@ export function useWarmDraftSession(
   const warm = useCallback(async (): Promise<string | null> => {
     if (sessionIdRef.current) return sessionIdRef.current;
     if (creationRef.current) return creationRef.current;
+    if (errorRef.current?.terminal) return null;
 
     const launchRequest = requestRef.current;
     const launchIdentity = identityRef.current;
@@ -85,6 +104,8 @@ export function useWarmDraftSession(
     const abortController = new AbortController();
     abortControllerRef.current = abortController;
     setIsWarming(true);
+    errorRef.current = null;
+    setError(null);
 
     const creation = (async () => {
       try {
@@ -94,18 +115,49 @@ export function useWarmDraftSession(
           body: JSON.stringify(launchRequest),
           signal: abortController.signal,
         });
-        if (!response.ok) return null;
-
-        const payload = (await response.json()) as { sessionId?: unknown };
-        if (typeof payload.sessionId !== "string" || payload.sessionId.length === 0) return null;
-        if (identityRef.current !== launchIdentity) {
-          void retireWarmDraftSession(payload.sessionId);
+        if (!response.ok) {
+          const failure: unknown = await response.json().catch(() => null);
+          if (identityRef.current !== launchIdentity || abortController.signal.aborted) return null;
+          let message = "Failed to create session";
+          let code: string | null = null;
+          if (failure && typeof failure === "object") {
+            if ("error" in failure && typeof failure.error === "string") message = failure.error;
+            if ("code" in failure && typeof failure.code === "string") code = failure.code;
+            if (
+              code === "target_team_missing_grant" &&
+              "repository" in failure &&
+              typeof failure.repository === "string"
+            ) {
+              message = `This team has no repository grant for ${failure.repository}.`;
+            }
+          }
+          const creationError: WarmDraftSessionError = {
+            message: code ? `${message} (${code})` : message,
+            code,
+            status: response.status,
+            // Grants can be restored without changing the draft's identity.
+            terminal:
+              code !== "target_team_missing_grant" &&
+              [400, 403, 404, 409].includes(response.status),
+          };
+          errorRef.current = creationError;
+          setError(creationError);
           return null;
         }
 
-        sessionIdRef.current = payload.sessionId;
-        setSessionId(payload.sessionId);
-        return payload.sessionId;
+        const parsed = createSessionResponseSchema.safeParse(
+          await response.json().catch(() => null)
+        );
+        if (!parsed.success) return null;
+        const { sessionId } = parsed.data;
+        if (identityRef.current !== launchIdentity || abortController.signal.aborted) {
+          void retireWarmDraftSession(sessionId);
+          return null;
+        }
+
+        sessionIdRef.current = sessionId;
+        setSessionId(sessionId);
+        return sessionId;
       } catch (error) {
         if (!(error instanceof Error && error.name === "AbortError")) {
           console.error("Failed to create session for warming:", error);
@@ -130,5 +182,5 @@ export function useWarmDraftSession(
     setSessionId(null);
   }, []);
 
-  return { sessionId, isWarming, warm, consume };
+  return { identity, sessionId, isWarming, warm, consume, error };
 }

@@ -9,6 +9,7 @@ import {
   buildIssueContextBlock,
   buildPullRequestContextBlock,
   buildReviewCommentContextBlock,
+  buildWorkflowRunContextBlock,
 } from "./context";
 import {
   GITHUB_WEBHOOK_EVENT_CATALOG,
@@ -17,12 +18,14 @@ import {
   issuesEventSchema,
   pullRequestEventSchema,
   pullRequestReviewCommentEventSchema,
+  workflowRunEventSchema,
   type CheckSuitePayload,
   type GitHubEventBase,
   type IssueCommentPayload,
   type IssuesPayload,
   type PullRequestPayload,
   type PullRequestReviewCommentPayload,
+  type WorkflowRunPayload,
 } from "./webhook-types";
 
 // ─── Supported event type map ─────────────────────────────────────────────────
@@ -103,6 +106,12 @@ export function normalizeGitHubEvent(
       return normalizeCheckSuite(eventType, parsed.data);
     }
 
+    case "workflow_run": {
+      const parsed = workflowRunEventSchema.safeParse(payload);
+      if (!parsed.success) return null;
+      return normalizeWorkflowRun(eventType, parsed.data);
+    }
+
     case "issues": {
       const parsed = issuesEventSchema.safeParse(payload);
       if (!parsed.success) return null;
@@ -175,6 +184,7 @@ function normalizePullRequest(
     eventType,
     triggerKey: `pr:${pr.number}:${action}:${headSha ?? "unknown"}`,
     concurrencyKey: `pr:${pr.number}`,
+    repositoryId: payload.repository.id,
     repoOwner: getRepoOwner(payload),
     repoName: getRepoName(payload),
     branch,
@@ -203,6 +213,7 @@ function normalizeIssueComment(
     eventType,
     triggerKey: `issue_comment:${commentId}`,
     concurrencyKey: `issue_comment:${commentId}`,
+    repositoryId: payload.repository.id,
     repoOwner: getRepoOwner(payload),
     repoName: getRepoName(payload),
     actor: getActor(payload),
@@ -227,6 +238,7 @@ function normalizeReviewComment(
     eventType,
     triggerKey: `pr_review_comment:${commentId}`,
     concurrencyKey: `pr:${pr.number}`,
+    repositoryId: payload.repository.id,
     repoOwner: getRepoOwner(payload),
     repoName: getRepoName(payload),
     branch: pr.head?.ref,
@@ -250,14 +262,49 @@ function normalizeCheckSuite(eventType: string, payload: CheckSuitePayload): Git
     eventType,
     triggerKey: `check_suite:${checkSuite.id}`,
     concurrencyKey: `check_suite:${checkSuite.id}`,
+    repositoryId: payload.repository.id,
     repoOwner: getRepoOwner(payload),
     repoName: getRepoName(payload),
     branch: checkSuite.head_branch ?? undefined,
     actor: getActor(payload),
+    conclusion,
     checkConclusion: conclusion,
     contextBlock: buildCheckSuiteContextBlock(payload),
     meta: {
       checkSuiteId: checkSuite.id,
+      conclusion,
+    },
+  };
+}
+
+/**
+ * Normalize `workflow_run.completed`. The attempt number deduplicates each
+ * attempt independently, while the run id keeps all attempts in one concurrency scope.
+ */
+function normalizeWorkflowRun(
+  eventType: string,
+  payload: WorkflowRunPayload
+): GitHubAutomationEvent {
+  const run = payload.workflow_run;
+  const conclusion = run.conclusion ?? undefined;
+
+  return {
+    source: "github",
+    eventType,
+    triggerKey: `workflow_run:${run.id}:${run.run_attempt}`,
+    concurrencyKey: `workflow_run:${run.id}`,
+    repositoryId: payload.repository.id,
+    repoOwner: getRepoOwner(payload),
+    repoName: getRepoName(payload),
+    branch: run.head_branch ?? undefined,
+    actor: getActor(payload),
+    conclusion,
+    workflowName: run.name,
+    contextBlock: buildWorkflowRunContextBlock(payload),
+    meta: {
+      workflowRunId: run.id,
+      workflowRunAttempt: run.run_attempt,
+      workflowName: run.name,
       conclusion,
     },
   };
@@ -275,6 +322,7 @@ function normalizeIssue(
     eventType,
     triggerKey: `issue:${issue.number}:${action}`,
     concurrencyKey: `issue:${issue.number}`,
+    repositoryId: payload.repository.id,
     repoOwner: getRepoOwner(payload),
     repoName: getRepoName(payload),
     labels: getIssueLabels(issue),

@@ -89,6 +89,13 @@ class FakeStatement implements SqlStatement {
   }
 
   first<T = Record<string, unknown>>(): Promise<T | null> {
+    if (this.query === "SELECT * FROM sessions WHERE id = ?") {
+      this.db.sessionIndexBinds.push(this.bound[0]);
+      return Promise.resolve(this.db.sessionIndexRow as T | null);
+    }
+    if (this.query.includes("FROM model_provider_accounts")) {
+      return Promise.resolve((this.db.accountRow as T | null) ?? null);
+    }
     return Promise.reject(new Error(`first() is not used by the resolver: ${this.query}`));
   }
 
@@ -107,9 +114,14 @@ class FakeSqlDatabase implements SqlDatabase {
   readonly queries: string[] = [];
   readonly providerAuthBinds: unknown[] = [];
   providerAuthRows: D1Row[] = [];
+  /** The bound provider account the pre-spawn check reads; null means removed. */
+  accountRow: D1Row | null = null;
+  sessionIndexRow: D1Row | null = null;
+  readonly sessionIndexBinds: unknown[] = [];
   globalSecretRows: D1Row[] = [];
   readonly repoSecretRowsByRepoId = new Map<number, D1Row[]>();
   readonly environmentSecretRowsById = new Map<string, D1Row[]>();
+  readonly teamSecretRowsById = new Map<string, D1Row[]>();
 
   prepare(query: string): SqlStatement {
     return new FakeStatement(this, query.replace(/\s+/g, " ").trim());
@@ -127,6 +139,9 @@ class FakeSqlDatabase implements SqlDatabase {
     }
     if (query === "SELECT key, encrypted_value FROM global_secrets") {
       return this.globalSecretRows;
+    }
+    if (query === "SELECT key, encrypted_value FROM team_secrets WHERE team_id = ?") {
+      return this.teamSecretRowsById.get(bound[0] as string) ?? [];
     }
     if (query === "SELECT key, encrypted_value FROM repo_secrets WHERE repo_id = ?") {
       return this.repoSecretRowsByRepoId.get(bound[0] as number) ?? [];
@@ -149,17 +164,37 @@ async function secretRows(secrets: Record<string, string>): Promise<D1Row[]> {
 function providerAuthRows(modes: {
   openai: SessionProviderAuthMode;
   xai: SessionProviderAuthMode;
+  anthropic?: SessionProviderAuthMode;
 }): D1Row[] {
-  return (["openai", "xai"] as const).map((provider) => ({
+  return (["openai", "xai", "anthropic"] as const).map((provider) => ({
     provider,
-    auth_mode: modes[provider],
+    auth_mode: modes[provider] ?? "api_key",
     provider_account_id: modes[provider] === "provider_account" ? "1".repeat(32) : null,
     selection_source: "explicit",
     inherited_from_session_id: null,
   }));
 }
 
-const API_KEY_MODES = { openai: "api_key", xai: "api_key" } as const;
+const API_KEY_MODES = { openai: "api_key", xai: "api_key", anthropic: "api_key" } as const;
+
+function accountRow(status: string, overrides: Partial<D1Row> = {}): D1Row {
+  return {
+    id: "1".repeat(32),
+    provider: "anthropic",
+    display_name: "Owner Claude",
+    external_account_id: null,
+    status,
+    created_by: null,
+    updated_by: null,
+    last_verified_at: null,
+    last_used_at: null,
+    created_at: 1,
+    updated_at: 1,
+    archived_at: null,
+    lifecycle_version: 0,
+    ...overrides,
+  };
+}
 
 function sessionRow(overrides: Partial<SessionRow> = {}): SessionRow {
   return {
@@ -173,16 +208,20 @@ function sessionRow(overrides: Partial<SessionRow> = {}): SessionRow {
     branch_name: null,
     base_sha: null,
     current_sha: null,
-    opencode_session_id: null,
+    agent_session_id: null,
+    harness: "opencode",
     model: "anthropic/claude-sonnet-4-5",
     reasoning_effort: null,
     status: "active",
+    status_revision: 1,
     parent_session_id: null,
     spawn_source: "user",
     spawn_depth: 0,
     code_server_enabled: 0,
     vnc_enabled: 0,
     total_cost: 0,
+    max_cost_usd: null,
+    budget_exhausted: 0,
     sandbox_settings: null,
     environment_id: null,
     created_at: 1,
@@ -213,8 +252,6 @@ function makeHarness(
   options: {
     session?: SessionRow | null;
     memberRows?: SessionRepositoryRow[];
-    /** Model a deployment where the DB binding is missing. */
-    withoutDb?: boolean;
     /** Defaults to ENCRYPTION_KEY — the key is required in production. */
     encryptionKey?: string;
     /** Omit to model an unset SECRETS_CAP_ENFORCEMENT (fail-closed enforce). */
@@ -225,6 +262,28 @@ function makeHarness(
   const session = options.session === undefined ? sessionRow() : options.session;
   const storage = fakeSqlStorage({ session, memberRows: options.memberRows ?? [] });
   const db = new FakeSqlDatabase();
+  db.sessionIndexRow = session
+    ? {
+        ...session,
+        id: session.session_name ?? session.id,
+        root_session_id: session.session_name ?? session.id,
+        automation_id: null,
+        automation_run_id: null,
+        scm_login: null,
+        user_id: null,
+        owner_team_id: null,
+        visibility: "workspace",
+        project_id: null,
+        active_duration_ms: 0,
+        message_count: 0,
+        pr_count: 0,
+        input_tokens: 0,
+        output_tokens: 0,
+        reasoning_tokens: 0,
+        cache_read_tokens: 0,
+        cache_write_tokens: 0,
+      }
+    : null;
   const logs: LogEntry[] = [];
   const log = recordingLogger(logs);
   const sessionCoreRepository = new SessionCoreRepository(storage.sql, (closure) => closure());
@@ -240,7 +299,7 @@ function makeHarness(
       ));
 
   const resolver = new UserEnvResolver({
-    db: options.withoutDb ? null : db,
+    db,
     sessionCoreRepository,
     resolveRepoId: (sessionForRepoId) => {
       resolveRepoIdCalls += 1;
@@ -287,14 +346,6 @@ describe("UserEnvResolver", () => {
     });
   });
 
-  it("throws when a session exists but D1 is unavailable", async () => {
-    const h = makeHarness({ withoutDb: true });
-
-    await expect(h.resolver.getUserEnvVars()).rejects.toThrow(
-      "D1 is required to load session provider auth"
-    );
-  });
-
   describe("with no stored secrets", () => {
     it("returns undefined (not {}) when no provider is managed", async () => {
       const h = makeHarness();
@@ -305,6 +356,95 @@ describe("UserEnvResolver", () => {
   });
 
   describe("session-target secret fold", () => {
+    it("loads team secrets from current D1 ownership without advertising team-only OAuth", async () => {
+      const h = makeHarness();
+      h.db.sessionIndexRow!.owner_team_id = "team_a";
+      h.db.providerAuthRows = providerAuthRows({ ...API_KEY_MODES, xai: "legacy_scoped_oauth" });
+      h.db.globalSecretRows = await secretRows({ SHARED: "global" });
+      h.db.teamSecretRowsById.set(
+        "team_a",
+        await secretRows({
+          SHARED: "team",
+          XAI_OAUTH_REFRESH_TOKEN: "team-refresh",
+        })
+      );
+      expect(await h.resolver.getUserEnvVars()).toEqual({ SHARED: "team" });
+      expect(h.db.sessionIndexBinds).toEqual(["sess-public-1"]);
+    });
+
+    it.each([
+      ["openai", null],
+      ["openai", "env-1"],
+      ["xai", null],
+      ["xai", "env-1"],
+    ] as const)(
+      "retains the %s API key when only team OAuth is configured for %s",
+      async (provider, environmentId) => {
+        const h = makeHarness({ session: sessionRow({ environment_id: environmentId }) });
+        h.db.sessionIndexRow!.owner_team_id = "team_a";
+        h.db.providerAuthRows = providerAuthRows({
+          ...API_KEY_MODES,
+          [provider]: "legacy_scoped_oauth",
+        });
+        const prefix = provider.toUpperCase();
+        h.db.teamSecretRowsById.set(
+          "team_a",
+          await secretRows({
+            [`${prefix}_API_KEY`]: "team-api-key",
+            [`${prefix}_OAUTH_REFRESH_TOKEN`]: "unreadable-team-token",
+          })
+        );
+        expect(await h.resolver.getUserEnvVars()).toEqual({
+          [`${prefix}_API_KEY`]: "team-api-key",
+        });
+        expect(await h.resolver.getProviderAuthenticationError(`${provider}/model`)).toBeNull();
+        h.db.teamSecretRowsById.set(
+          "team_a",
+          await secretRows({
+            [`${prefix}_OAUTH_REFRESH_TOKEN`]: "unreadable-team-token",
+          })
+        );
+        expect(await h.resolver.getProviderAuthenticationError(`${provider}/model`)).toContain(
+          "authentication"
+        );
+      }
+    );
+
+    it.each([null, "env-1"])(
+      "still advertises readable global OAuth for target %s",
+      async (environmentId) => {
+        const h = makeHarness({ session: sessionRow({ environment_id: environmentId }) });
+        h.db.sessionIndexRow!.owner_team_id = "team_a";
+        h.db.providerAuthRows = providerAuthRows({ ...API_KEY_MODES, xai: "legacy_scoped_oauth" });
+        h.db.globalSecretRows = await secretRows({
+          XAI_OAUTH_REFRESH_TOKEN: "readable-global-token",
+        });
+        h.db.teamSecretRowsById.set(
+          "team_a",
+          await secretRows({
+            XAI_API_KEY: "team-key",
+            XAI_OAUTH_REFRESH_TOKEN: "unreadable-team-token",
+          })
+        );
+        expect(await h.resolver.getUserEnvVars()).toEqual({ XAI_OAUTH_MANAGED: "1" });
+      }
+    );
+
+    it("does not query team secrets for workspace ownership", async () => {
+      const h = makeHarness();
+      h.db.providerAuthRows = providerAuthRows(API_KEY_MODES);
+      h.db.teamSecretRowsById.set("team_a", await secretRows({ TEAM_ONLY: "private" }));
+      expect(await h.resolver.getUserEnvVars()).toBeUndefined();
+      expect(h.db.queries.some((query) => query.includes("team_secrets"))).toBe(false);
+    });
+
+    it("fails closed when the authoritative session index row is missing", async () => {
+      const h = makeHarness();
+      h.db.sessionIndexRow = null;
+      h.db.providerAuthRows = providerAuthRows(API_KEY_MODES);
+      await expect(h.resolver.getUserEnvVars()).rejects.toThrow("Session index row not found");
+    });
+
     async function foldHarness(
       secondarySecrets: Record<string, string>,
       primarySecrets: Record<string, string>
@@ -313,7 +453,11 @@ describe("UserEnvResolver", () => {
         memberRows: [memberRow(0, "acme", "web", 90101), memberRow(1, "acme", "backend", 90102)],
         encryptionKey: ENCRYPTION_KEY,
       });
-      h.db.providerAuthRows = providerAuthRows({ openai: "api_key", xai: "legacy_scoped_oauth" });
+      h.db.providerAuthRows = providerAuthRows({
+        openai: "api_key",
+        xai: "legacy_scoped_oauth",
+        anthropic: "api_key",
+      });
       h.db.globalSecretRows = await secretRows({ SHARED: "global", ONLY_GLOBAL: "g" });
       h.db.repoSecretRowsByRepoId.set(90101, await secretRows(primarySecrets));
       h.db.repoSecretRowsByRepoId.set(90102, await secretRows(secondarySecrets));
@@ -363,7 +507,11 @@ describe("UserEnvResolver", () => {
         session: sessionRow({ environment_id: "env-1" }),
         encryptionKey: ENCRYPTION_KEY,
       });
-      h.db.providerAuthRows = providerAuthRows({ openai: "api_key", xai: "legacy_scoped_oauth" });
+      h.db.providerAuthRows = providerAuthRows({
+        openai: "api_key",
+        xai: "legacy_scoped_oauth",
+        anthropic: "api_key",
+      });
       h.db.globalSecretRows = await secretRows({ SHARED: "global", ONLY_GLOBAL: "g" });
       h.db.environmentSecretRowsById.set(
         "env-1",
@@ -502,10 +650,37 @@ describe("UserEnvResolver", () => {
 
     it("returns null when the provider is authenticated", async () => {
       const h = makeHarness();
-      h.db.providerAuthRows = providerAuthRows({ openai: "provider_account", xai: "api_key" });
+      h.db.providerAuthRows = providerAuthRows({
+        openai: "provider_account",
+        xai: "api_key",
+        anthropic: "api_key",
+      });
+      h.db.accountRow = accountRow("active");
 
       await expect(h.resolver.getProviderAuthenticationError("openai/gpt-5")).resolves.toBeNull();
     });
+
+    it.each([
+      ["disabled", accountRow("disabled"), "disabled"],
+      ["fenced", accountRow("reconnect_required"), "needs to be reconnected"],
+      ["archived", accountRow("active", { archived_at: 5 }), "was removed"],
+      ["missing", null, "was removed"],
+    ] as const)(
+      "fails the prompt before spawn when the bound account is %s",
+      async (_label, row, fragment) => {
+        const h = makeHarness();
+        h.db.providerAuthRows = providerAuthRows({
+          openai: "api_key",
+          xai: "api_key",
+          anthropic: "provider_account",
+        });
+        h.db.accountRow = row;
+
+        await expect(
+          h.resolver.getProviderAuthenticationError("anthropic/claude-sonnet-4-6")
+        ).resolves.toContain(fragment);
+      }
+    );
 
     it("returns null for non-subscription providers", async () => {
       const h = makeHarness();

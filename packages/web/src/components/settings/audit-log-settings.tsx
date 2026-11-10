@@ -1,0 +1,367 @@
+"use client";
+
+import { useEffect, useRef, useState } from "react";
+import {
+  AUTHORIZATION_DECISION_ACTIONS,
+  interpretAuditEvent,
+  type AuditEvent,
+  type AuditEventInterpretation,
+  type AuditObservationAction,
+  type AuditOperationAction,
+  type AuditOperationResult,
+} from "@open-inspect/shared/types/audit-events";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import {
+  Select,
+  SelectTrigger,
+  SelectValue,
+  SelectContent,
+  SelectItem,
+} from "@/components/ui/select";
+import { useAuditEvents } from "@/hooks/use-audit-events";
+import { useTeams } from "@/hooks/use-teams";
+import { useCurrentUserAuthorization } from "@/hooks/use-current-user-authorization";
+import { formatHttpStatus } from "@/lib/http-status";
+import { formatRelativeTime } from "@/lib/time";
+
+interface BadgeTreatment {
+  label: string;
+  className: string;
+}
+
+const ALL_TEAMS_VALUE = "all-teams";
+
+const OPERATION_OUTCOMES: Record<AuditOperationResult, BadgeTreatment> = {
+  applied: { label: "Applied", className: "bg-success-muted text-success" },
+  no_op: { label: "No change", className: "bg-muted text-muted-foreground" },
+  denied: { label: "Denied", className: "bg-destructive-muted text-destructive" },
+  rejected: { label: "Rejected", className: "bg-warning-muted text-warning" },
+};
+
+// An allowed decision is informational: admission does not prove the operation succeeded.
+const AUTHORIZATION_DECISIONS: Record<"allowed" | "denied", BadgeTreatment> = {
+  allowed: { label: "Allowed", className: "bg-info-muted text-info" },
+  denied: { label: "Denied", className: "bg-destructive-muted text-destructive" },
+};
+
+const OBSERVATIONS: Record<"would_deny", BadgeTreatment> = {
+  would_deny: { label: "Would deny", className: "bg-info-muted text-info" },
+};
+
+// The client cannot say what an unrecognized action's stored result means.
+const UNRECOGNIZED: BadgeTreatment = {
+  label: "Unrecognized",
+  className: "bg-muted text-muted-foreground",
+};
+
+const OPERATION_LABELS: Record<AuditOperationAction, string> = {
+  "memory.created": "Memory created",
+  "memory.revised": "Memory revised",
+  "memory.archived": "Memory archived",
+  "memory.restored": "Memory restored",
+  "memory.approved": "Memory approved",
+  "memory.rejected": "Memory rejected",
+  "memory.superseded": "Memory superseded",
+  "session.private_break_glass": "Private session break-glass read",
+  "session.visibility_changed": "Session visibility changed",
+  "session.moved": "Session moved",
+  "session.collaborator_added": "Session collaborator added",
+  "session.collaborator_removed": "Session collaborator removed",
+  "session.created_private": "Private session created",
+  "workspace.member_role_updated": "Member role updated",
+  "workspace.member_status_updated": "Member status updated",
+  "workspace.default_role_assigned": "Default role assigned",
+  "workspace.owner_bootstrapped": "Owner bootstrapped",
+  "workspace.user_merged": "Users merged",
+  "team.created": "Team created",
+  "team.updated": "Team updated",
+  "team.archived": "Team archived",
+  "team.restored": "Team restored",
+  "team.member_added": "Team member added",
+  "team.member_role_changed": "Team member role changed",
+  "team.member_removed": "Team member removed",
+  "team.member_joined": "Team member joined",
+  "team.grant_added": "Team repository grant added",
+  "team.grant_removed": "Team repository grant removed",
+  "team.secret_set": "Team secret set",
+  "team.secret_deleted": "Team secret deleted",
+  "team.binding_added": "Team channel binding added",
+  "team.binding_removed": "Team channel binding removed",
+  "automation.executor_changed": "Automation executor changed",
+};
+
+const OBSERVATION_LABELS: Record<AuditObservationAction, string> = {
+  "session.shadow_denied": "Session read shadow observation",
+};
+
+const ACTION_LABELS = new Map<string, string>([
+  [AUTHORIZATION_DECISION_ACTIONS.allowed, "Authorization allowed"],
+  [AUTHORIZATION_DECISION_ACTIONS.denied, "Authorization denied"],
+  ...Object.entries(OBSERVATION_LABELS),
+  ...Object.entries(OPERATION_LABELS),
+]);
+
+function auditActionLabel(action: string): string {
+  return ACTION_LABELS.get(action) ?? action;
+}
+
+function badgeTreatment(interpretation: AuditEventInterpretation): BadgeTreatment {
+  switch (interpretation.kind) {
+    case "authorization_decision":
+      return AUTHORIZATION_DECISIONS[interpretation.decision];
+    case "observation":
+      return OBSERVATIONS[interpretation.observation];
+    case "operation":
+      return OPERATION_OUTCOMES[interpretation.result];
+    case "unknown":
+      return UNRECOGNIZED;
+  }
+}
+
+function actorSummary(event: AuditEvent): string {
+  if (event.actorServiceSnapshot && event.actorUserIdSnapshot) {
+    return `Service / ${event.actorServiceSnapshot} / User actor / ${event.actorUserIdSnapshot}`;
+  }
+  if (event.actorServiceSnapshot) return `Service / ${event.actorServiceSnapshot}`;
+  if (event.actorUserIdSnapshot) return `User / ${event.actorUserIdSnapshot}`;
+  return `${event.principalKind.charAt(0).toUpperCase()}${event.principalKind.slice(1)} principal`;
+}
+
+function resourceSummary(event: AuditEvent): string {
+  const resource = event.resourceId
+    ? `${event.resourceType} / ${event.resourceId}`
+    : event.resourceType;
+  return event.targetUserIdSnapshot
+    ? `${resource} / Target user ${event.targetUserIdSnapshot}`
+    : resource;
+}
+
+export function AuditEventCard({ event }: { event: AuditEvent }) {
+  const interpretation = interpretAuditEvent(event);
+  const badge = badgeTreatment(interpretation);
+  const localTimestamp = new Date(event.occurredAt).toLocaleString();
+
+  return (
+    <li className="min-w-0 px-4 py-4 sm:px-5">
+      <article aria-labelledby={`audit-event-${event.id}`}>
+        <div className="flex min-w-0 flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
+          <div className="min-w-0">
+            <h3 id={`audit-event-${event.id}`} className="text-sm font-medium text-foreground">
+              {auditActionLabel(event.action)}
+            </h3>
+            <time
+              dateTime={new Date(event.occurredAt).toISOString()}
+              title={localTimestamp}
+              className="mt-0.5 block text-xs text-muted-foreground"
+            >
+              {localTimestamp} / {formatRelativeTime(event.occurredAt)}
+            </time>
+          </div>
+          <Badge className={`w-fit shrink-0 ${badge.className}`}>{badge.label}</Badge>
+        </div>
+
+        <dl className="mt-3 grid min-w-0 gap-x-5 gap-y-2 text-xs sm:grid-cols-2">
+          <div className="min-w-0">
+            <dt className="text-muted-foreground">Actor</dt>
+            <dd className="break-words font-mono text-foreground">{actorSummary(event)}</dd>
+          </div>
+          <div className="min-w-0">
+            <dt className="text-muted-foreground">Resource</dt>
+            <dd className="break-words font-mono text-foreground">{resourceSummary(event)}</dd>
+          </div>
+          <div className="min-w-0">
+            <dt className="text-muted-foreground">Request</dt>
+            <dd className="break-all font-mono text-foreground">{event.requestId}</dd>
+          </div>
+          <div className="min-w-0">
+            <dt className="text-muted-foreground">Reason</dt>
+            <dd className="break-words font-mono text-foreground">{event.reasonCode}</dd>
+          </div>
+          {interpretation.kind === "authorization_decision" && (
+            <div className="min-w-0">
+              <dt className="text-muted-foreground">HTTP response</dt>
+              <dd className="break-words font-mono text-foreground">
+                {interpretation.httpStatus === null
+                  ? "Not recorded"
+                  : formatHttpStatus(interpretation.httpStatus)}
+              </dd>
+            </div>
+          )}
+        </dl>
+
+        <details className="mt-3 text-xs">
+          <summary className="w-fit cursor-pointer rounded-sm text-muted-foreground outline-none hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring">
+            Structured details
+          </summary>
+          <pre className="mt-2 max-w-full overflow-x-auto whitespace-pre-wrap break-words rounded-md bg-muted p-3 font-mono text-[11px] leading-5 text-foreground">
+            {JSON.stringify(
+              {
+                eventId: event.id,
+                action: event.action,
+                principalKind: event.principalKind,
+                operationResult: event.operationResult,
+                metadata: event.metadata,
+              },
+              null,
+              2
+            )}
+          </pre>
+        </details>
+      </article>
+    </li>
+  );
+}
+
+/** Read-only, cursor-paginated view of durable workspace audit events. */
+export function AuditLogSettings() {
+  const { hasPermission } = useCurrentUserAuthorization();
+  const canReadAudit = hasPermission("workspace.audit.read");
+  const { teams, loading: teamsLoading, error: teamsError } = useTeams(canReadAudit);
+  const [teamId, setTeamId] = useState("");
+  const audit = useAuditEvents({ teamId: teamId || undefined, enabled: canReadAudit });
+  const headingRef = useRef<HTMLHeadingElement>(null);
+  const focusAfterPaginationRef = useRef(false);
+
+  useEffect(() => {
+    if (!focusAfterPaginationRef.current || audit.loading || audit.error) return;
+    focusAfterPaginationRef.current = false;
+    headingRef.current?.focus({ preventScroll: true });
+    headingRef.current?.scrollIntoView({ block: "start" });
+  }, [audit.error, audit.loading, audit.page]);
+
+  const changePage = (navigate: () => void) => {
+    focusAfterPaginationRef.current = true;
+    navigate();
+  };
+
+  if (!canReadAudit) {
+    return (
+      <p className="text-sm text-muted-foreground">You do not have access to the audit log.</p>
+    );
+  }
+
+  return (
+    <section aria-labelledby="audit-log-heading">
+      <h2
+        ref={headingRef}
+        id="audit-log-heading"
+        tabIndex={-1}
+        className="mb-1 rounded-sm text-xl font-semibold text-foreground outline-none focus-visible:ring-2 focus-visible:ring-ring"
+      >
+        Audit log
+      </h2>
+      <p className="mb-2 text-sm text-muted-foreground">
+        Review workspace operations, authorization decisions, and observations. Events are shown
+        newest first.
+      </p>
+      <p className="mb-6 text-sm text-muted-foreground">
+        Authorization decisions record whether a request was allowed or denied and the HTTP response
+        it returned. They do not confirm that the requested change took effect. Applied, No change,
+        and Rejected are recorded only by the operation that made or refused the change. Shadow
+        observations marked Would deny describe hypothetical denials, not enforced denials or
+        operation outcomes.
+      </p>
+
+      <div className="mb-6 flex flex-wrap items-center gap-3">
+        <label htmlFor="audit-team-filter" className="text-sm font-medium">
+          Team
+        </label>
+        <Select
+          value={teamId || ALL_TEAMS_VALUE}
+          onValueChange={(value) => setTeamId(value === ALL_TEAMS_VALUE ? "" : value)}
+          disabled={teamsLoading || !!teamsError}
+        >
+          <SelectTrigger id="audit-team-filter" className="w-auto min-w-48 max-w-full">
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value={ALL_TEAMS_VALUE}>All teams</SelectItem>
+            {teams.map((team) => (
+              <SelectItem key={team.id} value={team.id}>
+                {team.name}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+        {teamsError && (
+          <p role="status" className="text-xs text-destructive">
+            Unable to load team filters.
+          </p>
+        )}
+      </div>
+
+      {audit.error && audit.events.length > 0 && (
+        <div
+          role="status"
+          className="mb-4 flex flex-wrap items-center justify-between gap-3 rounded-md border border-destructive-border px-4 py-3"
+        >
+          <p className="text-sm text-destructive">
+            Unable to refresh the audit log. Showing the most recently loaded events.
+          </p>
+          <Button size="sm" variant="outline" onClick={() => void audit.retry()}>
+            Retry
+          </Button>
+        </div>
+      )}
+
+      {audit.loading ? (
+        <div className="rounded-md border border-border-muted py-12 text-center" aria-live="polite">
+          <div
+            className="mx-auto size-6 animate-spin rounded-full border-2 border-current border-t-transparent text-muted-foreground"
+            aria-hidden="true"
+          />
+          <p className="mt-3 text-sm text-muted-foreground">Loading audit events...</p>
+        </div>
+      ) : audit.error && audit.events.length === 0 ? (
+        <div role="alert" className="rounded-md border border-destructive-border p-5">
+          <p className="text-sm font-medium text-destructive">Unable to load the audit log.</p>
+          <p className="mt-1 text-xs text-muted-foreground">Try the request again.</p>
+          <Button className="mt-4" size="sm" variant="outline" onClick={() => void audit.retry()}>
+            Retry
+          </Button>
+        </div>
+      ) : audit.events.length === 0 ? (
+        <div className="rounded-md border border-dashed border-border py-12 text-center">
+          <p className="text-sm font-medium text-foreground">No audit events yet</p>
+          <p className="mt-1 text-xs text-muted-foreground">
+            Workspace activity will appear here as it is recorded.
+          </p>
+        </div>
+      ) : (
+        <ul className="min-w-0 divide-y divide-border-muted rounded-md border border-border-muted">
+          {audit.events.map((event) => (
+            <AuditEventCard key={event.id} event={event} />
+          ))}
+        </ul>
+      )}
+
+      {(audit.events.length > 0 || audit.hasPrevious) && (
+        <nav
+          className="mt-4 flex items-center justify-between gap-3"
+          aria-label="Audit log pagination"
+        >
+          <Button
+            size="sm"
+            variant="outline"
+            disabled={!audit.hasPrevious || audit.loading || audit.validating}
+            onClick={() => changePage(audit.previous)}
+          >
+            Previous
+          </Button>
+          <span className="text-xs text-muted-foreground" aria-live="polite">
+            Page {audit.page}
+          </span>
+          <Button
+            size="sm"
+            variant="outline"
+            disabled={!audit.hasNext || audit.loading || audit.validating || Boolean(audit.error)}
+            onClick={() => changePage(audit.next)}
+          >
+            Next
+          </Button>
+        </nav>
+      )}
+    </section>
+  );
+}

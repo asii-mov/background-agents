@@ -5,6 +5,64 @@ import reactHooksPlugin from "eslint-plugin-react-hooks";
 import eslintConfigPrettier from "eslint-config-prettier";
 import globals from "globals";
 
+// App hosting's internals (broker client, store, bundle parser) stay behind apps/index. Its ports
+// (apps/host) are public, so app-data/ can use them without importing the composition root.
+const appsInternalImports = [
+  {
+    regex: "^(?:\\.\\.?/(?:.*/)?|@/)apps/(?!(?:index|host)(?:\\.[cm]?[jt]sx?)?$)",
+    message:
+      "Import app hosting from apps/index (or its ports from apps/host); its modules are internal.",
+  },
+];
+
+const sandboxImplementationImports = [
+  {
+    regex: "(?:^|/)sandbox-repository(?:\\.[cm]?[jt]sx?)?$",
+    message:
+      "Only session composition constructs SandboxRepository. Consumers use sandbox-ports; lifecycle effects use their storage port.",
+  },
+  {
+    regex: "(?:^|/)lifecycle/manager(?:\\.[cm]?[jt]sx?)?$",
+    importNames: ["SandboxLifecycleManager"],
+    message:
+      "Only session composition constructs the lifecycle manager. Consumers depend on focused lifecycle ports.",
+  },
+  {
+    regex: "(?:^|/)lifecycle/launch-context(?:\\.[cm]?[jt]sx?)?$",
+    message: "Launch inputs are internal to lifecycle composition. Consumers use lifecycle ports.",
+  },
+  {
+    regex: "(?:^|/)lifecycle/sandbox-access(?:\\.[cm]?[jt]sx?)?$",
+    message:
+      "Access mechanics are internal to lifecycle composition. Consumers use lifecycle ports and session access readers.",
+  },
+  {
+    regex: "(?:^|/)lifecycle/vm-startup-reconciliation(?:\\.[cm]?[jt]sx?)?$",
+    message:
+      "VM startup reconciliation is internal to the lifecycle manager. Consumers use lifecycle ports.",
+  },
+  {
+    regex: "(?:^|/)lifecycle/allocation-cleanup(?:\\.[cm]?[jt]sx?)?$",
+    message:
+      "Allocation cleanup is internal to the lifecycle manager. Consumers use lifecycle ports.",
+  },
+  {
+    regex: "(?:^|/)lifecycle/provider-stop(?:\\.[cm]?[jt]sx?)?$",
+    message:
+      "Bounded provider-stop mechanics are internal to lifecycle. Consumers use lifecycle ports.",
+  },
+  {
+    regex: "(?:^|/)lifecycle/startup-errors(?:\\.[cm]?[jt]sx?)?$",
+    message:
+      "Startup abandonment errors are internal to lifecycle. Consumers use lifecycle outcomes.",
+  },
+  {
+    regex: "(?:^|/)lifecycle/watchdog-effects(?:\\.[cm]?[jt]sx?)?$",
+    message:
+      "Watchdog effects are internal to the lifecycle manager. Consumers use lifecycle ports.",
+  },
+];
+
 export default tseslint.config(
   // Global ignores
   {
@@ -12,12 +70,17 @@ export default tseslint.config(
       "**/node_modules/**",
       "**/dist/**",
       "**/.next/**",
+      "**/.source/**",
       "**/build/**",
       "**/.wrangler/**",
       "**/coverage/**",
       "**/.venv/**",
       "**/venv/**",
+      ".cache/sandbox-images/**",
       "opencode-reference/**",
+      // Design sketches and out-of-tree verification scripts, not built code.
+      "docs/plans/governed-apps/sketch/**",
+      "docs/plans/governed-apps/harness/**",
       "**/*.d.ts",
       // Bundled/generated files
       "packages/modal-infra/**/*.js",
@@ -30,11 +93,27 @@ export default tseslint.config(
   js.configs.recommended,
   ...tseslint.configs.recommended,
 
+  // Repository-authored and runtime-injected OpenCode extensions run under Node.js.
   {
-    files: ["scripts/**/*.{js,mjs}"],
+    files: [".opencode/**/*.{js,ts}"],
     languageOptions: {
+      globals: globals.node,
+    },
+    rules: {
+      "@typescript-eslint/no-unused-vars": ["error", { argsIgnorePattern: "^_" }],
+    },
+  },
+
+  // Plain Node scripts that run outside a bundler: the compose smoke's driver
+  // and its stand-in sandbox host.
+  {
+    files: ["**/*.mjs", "scripts/**/*.js"],
+    languageOptions: {
+      ecmaVersion: 2022,
+      sourceType: "module",
       globals: {
         ...globals.node,
+        ...globals.es2022,
       },
     },
   },
@@ -126,15 +205,69 @@ export default tseslint.config(
     },
   },
 
+  // The app broker runs on workerd in the apps account. Its production modules
+  // never import Node built-ins or the in-memory Cloudflare fake its tests use.
+  {
+    files: ["packages/app-broker/{src,guard,dispatcher}/**/*.ts"],
+    ignores: ["packages/app-broker/**/*.test.ts"],
+    rules: {
+      "no-restricted-imports": [
+        "error",
+        {
+          patterns: [
+            { regex: "^node:", message: "The broker runs on workerd; use Web APIs." },
+            {
+              regex: "(?:^|/)test/",
+              message: "Production broker code must not import test support such as the fake.",
+            },
+          ],
+        },
+      ],
+    },
+  },
+
   // Control-plane data-layer boundary: all production code must use the
   // injected SqlDatabase (ctx.db, a DO's db field, or a db parameter), never
   // the raw env.DB binding — reading the binding elsewhere would silently
   // bypass the injection path and, on request paths, query instrumentation.
-  // The only legitimate reads are the composition roots (router.ts and the
-  // two Durable Object constructors), each carrying an inline
-  // eslint-disable with justification.
+  // The only legitimate reads are the composition roots (the Worker entry,
+  // the Hono lifecycle, the Durable Object constructor), each carrying an
+  // inline eslint-disable with justification.
+  //
+  // Platform boundary, same family: Cloudflare's binding types are named
+  // only where the Worker's bindings are turned into the platform ports
+  // (src/cloudflare/** and src/index.ts). Everything else depends on the
+  // port — SqlDatabase, CacheStore, ObjectStorage, SessionRuntimeClient,
+  // FetchClient, the queue ports — so it compiles unchanged on the Node host.
+  // Flat-config gotcha: a later object's config for the same rule REPLACES
+  // the earlier one for files both match, so the exempted files re-declare
+  // the env.DB ban that still applies to them.
   {
     files: ["packages/control-plane/src/**/*.ts"],
+    ignores: [
+      "packages/control-plane/src/**/*.test.ts",
+      "packages/control-plane/src/cloudflare/**/*.ts",
+      "packages/control-plane/src/index.ts",
+    ],
+    rules: {
+      "no-restricted-syntax": [
+        "error",
+        {
+          selector: 'MemberExpression[property.name="DB"]',
+          message:
+            "Use the injected SqlDatabase (ctx.db / this.db / a db param) instead of env.DB; the binding is read only at composition roots.",
+        },
+        {
+          selector:
+            "TSTypeReference[typeName.name=/^(D1Database|D1PreparedStatement|KVNamespace|R2Bucket|DurableObjectNamespace|Fetcher|Queue)$/]",
+          message:
+            "Cloudflare binding types are named only in src/cloudflare/** and src/index.ts; depend on the platform port (see Platform in types.ts) instead.",
+        },
+      ],
+    },
+  },
+  {
+    files: ["packages/control-plane/src/cloudflare/**/*.ts", "packages/control-plane/src/index.ts"],
     ignores: ["packages/control-plane/src/**/*.test.ts"],
     rules: {
       "no-restricted-syntax": [
@@ -152,35 +285,97 @@ export default tseslint.config(
   // bans, both via the base no-restricted-imports rule so they stack with the
   // repo-wide @typescript-eslint/no-restricted-imports paths config:
   //  - the composition root (session/components.ts) is the platform adapter's
-  //    private wiring: only durable-object.ts may import it — services take
-  //    their dependencies as constructor inputs, never by reaching into the
-  //    root;
-  //  - the platform adapter (session/durable-object.ts) is the Cloudflare
+  //    private wiring: only cloudflare/durable-object.ts may import it —
+  //    services take their dependencies as constructor inputs, never by
+  //    reaching into the root;
+  //  - the platform adapter (cloudflare/durable-object.ts) is the Cloudflare
   //    edge of the session: only the worker entrypoint may import it, so
   //    nothing the factory builds can hold a reference back to the DO.
+  //  - the Node host's adapters (src/node/**) import Node built-ins that the
+  //    worker bundle marks external: nothing outside that directory may
+  //    import them, so the workerd build cannot pick them up.
   // Flat-config gotcha: a later object's config for the same rule REPLACES
   // the earlier one for files both match, so this general block carries both
   // bans and each exempted file re-declares the ban that still applies to it.
   {
     files: ["packages/control-plane/src/**/*.ts"],
     ignores: [
-      "packages/control-plane/src/session/durable-object.ts",
+      "packages/control-plane/src/cloudflare/durable-object.ts",
       "packages/control-plane/src/index.ts",
       "packages/control-plane/src/**/*.test.ts",
+      "packages/control-plane/src/node/**/*.ts",
     ],
     rules: {
       "no-restricted-imports": [
         "error",
         {
           patterns: [
+            ...sandboxImplementationImports,
+            ...appsInternalImports,
             {
               // Last-segment match: covers any relative depth (./, ../, ../../)
               // and extension-bearing specifiers. The basename is unique in
               // this package, so anchoring on it is precise.
               regex: "(?:^|/)components(?:\\.[cm]?[jt]sx?)?$",
               message:
-                "Only the platform adapter (session/durable-object.ts) may import the composition root. Take dependencies as constructor inputs instead.",
+                "Only the platform adapters (cloudflare/durable-object.ts, node/host.ts) may import the composition root. Take dependencies as constructor inputs instead.",
             },
+            {
+              regex: "(?:^|/)durable-object(?:\\.[cm]?[jt]sx?)?$",
+              message:
+                "Only the worker entrypoint (src/index.ts) may import the platform adapter. Depend on the session collaborators, not the Durable Object.",
+            },
+            {
+              // The directory and anything under it, by relative path or the
+              // `@/` alias, at any depth: `../node`, `../node/x`, `@/node/y/z`.
+              // Package subpaths such as `better-auth/node` are not ours.
+              regex: "^(?:\\.\\.?/(?:.*/)?|@/)node(?:/|$)",
+              message:
+                "Only the Node host (src/node/**) may import its adapters; the worker bundle must not reach node:* modules.",
+            },
+          ],
+        },
+      ],
+    },
+  },
+  // The Node host's adapters may import each other but not the Cloudflare
+  // edge or the composition root. The Node host itself (src/node/host.ts)
+  // is the Node counterpart of the Durable Object adapter: it builds the
+  // session runtime, so it may import the composition root, and it alone.
+  {
+    files: ["packages/control-plane/src/node/**/*.ts"],
+    ignores: ["packages/control-plane/src/**/*.test.ts", "packages/control-plane/src/node/host.ts"],
+    rules: {
+      "no-restricted-imports": [
+        "error",
+        {
+          patterns: [
+            ...sandboxImplementationImports,
+            ...appsInternalImports,
+            {
+              regex: "(?:^|/)components(?:\\.[cm]?[jt]sx?)?$",
+              message:
+                "Only the platform adapters (cloudflare/durable-object.ts, node/host.ts) may import the composition root. Take dependencies as constructor inputs instead.",
+            },
+            {
+              regex: "(?:^|/)durable-object(?:\\.[cm]?[jt]sx?)?$",
+              message:
+                "Only the worker entrypoint (src/index.ts) may import the platform adapter. Depend on the session collaborators, not the Durable Object.",
+            },
+          ],
+        },
+      ],
+    },
+  },
+  {
+    files: ["packages/control-plane/src/node/host.ts"],
+    rules: {
+      "no-restricted-imports": [
+        "error",
+        {
+          patterns: [
+            ...sandboxImplementationImports,
+            ...appsInternalImports,
             {
               regex: "(?:^|/)durable-object(?:\\.[cm]?[jt]sx?)?$",
               message:
@@ -200,13 +395,23 @@ export default tseslint.config(
         "error",
         {
           patterns: [
+            ...sandboxImplementationImports,
+            ...appsInternalImports,
             {
               // Last-segment match: covers any relative depth (./, ../, ../../)
               // and extension-bearing specifiers. The basename is unique in
               // this package, so anchoring on it is precise.
               regex: "(?:^|/)components(?:\\.[cm]?[jt]sx?)?$",
               message:
-                "Only the platform adapter (session/durable-object.ts) may import the composition root. Take dependencies as constructor inputs instead.",
+                "Only the platform adapters (cloudflare/durable-object.ts, node/host.ts) may import the composition root. Take dependencies as constructor inputs instead.",
+            },
+            {
+              // The directory and anything under it, by relative path or the
+              // `@/` alias, at any depth: `../node`, `../node/x`, `@/node/y/z`.
+              // Package subpaths such as `better-auth/node` are not ours.
+              regex: "^(?:\\.\\.?/(?:.*/)?|@/)node(?:/|$)",
+              message:
+                "Only the Node host (src/node/**) may import its adapters; the worker bundle must not reach node:* modules.",
             },
           ],
         },
@@ -214,9 +419,20 @@ export default tseslint.config(
     },
   },
 
-  // React-specific configuration for web package
+  // The Cloudflare host composes the session runtime, not individual implementations.
   {
-    files: ["packages/web/**/*.{ts,tsx}"],
+    files: ["packages/control-plane/src/cloudflare/durable-object.ts"],
+    rules: {
+      "no-restricted-imports": [
+        "error",
+        { patterns: [...sandboxImplementationImports, ...appsInternalImports] },
+      ],
+    },
+  },
+
+  // React-specific configuration for browser packages
+  {
+    files: ["packages/{docs,web}/**/*.{ts,tsx}"],
     plugins: {
       react: reactPlugin,
       "react-hooks": reactHooksPlugin,
@@ -282,6 +498,19 @@ export default tseslint.config(
         {
           name: "fetch",
           message: "Use an app-owned HTTP transport instead of raw fetch.",
+        },
+      ],
+    },
+  },
+  {
+    files: ["packages/web/src/**/*.tsx"],
+    rules: {
+      "no-restricted-syntax": [
+        "error",
+        {
+          selector: 'JSXOpeningElement[name.name="select"]',
+          message:
+            "Use Select / SelectTrigger / SelectContent / SelectItem from @/components/ui/select instead of a native <select>.",
         },
       ],
     },

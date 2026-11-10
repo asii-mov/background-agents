@@ -1,12 +1,13 @@
 import useSWR from "swr";
-import type { ZodType } from "zod";
-import { useAuthSession } from "@/lib/auth-session";
+import { z, type ZodType } from "zod";
+import { useCurrentUserAuthorization } from "@/hooks/use-current-user-authorization";
 import { browserApiFetch, type BrowserApiPath } from "@/lib/browser-api-fetch";
 import {
   modelProviderAccountDefaultsResponseSchema,
   modelProviderAccountDefaultResponseSchema,
   modelProviderAccountResponseSchema,
   modelProviderAccountsResponseSchema,
+  providerAuthorizationCodeStatusResponseSchema,
   providerDeviceAuthorizationIdSchema,
   providerDeviceAuthorizationStatusResponseSchema,
   createModelProviderAccountResponseSchema,
@@ -14,12 +15,18 @@ import {
   SUBSCRIPTION_PROVIDER_DISPLAY_METADATA,
   SUBSCRIPTION_PROVIDER_IDS,
   subscriptionProviderIdSchema,
+  completeProviderAuthorizationCodeRequestSchema,
+  startProviderAuthorizationCodeRequestSchema,
+  startProviderAuthorizationCodeResponseSchema,
   startProviderDeviceAuthorizationRequestSchema,
   startProviderDeviceAuthorizationResponseSchema,
   type ConnectModelProviderAccountRequest,
   type ModelProviderAccount,
   type ModelProviderAccountDefault,
+  type ProviderAuthorizationCodeStatusResponse,
   type ReconnectModelProviderAccountRequest,
+  type StartProviderAuthorizationCodeRequest,
+  type StartProviderAuthorizationCodeResponse,
   type StartProviderDeviceAuthorizationRequest,
   type StartProviderDeviceAuthorizationResponse,
   type LegacyProviderCredentialsResponse,
@@ -30,6 +37,10 @@ import {
 const ACCOUNTS_KEY = "/api/model-provider-accounts";
 const DEFAULTS_KEY = "/api/model-provider-account-defaults";
 const LEGACY_CREDENTIALS_KEY = "/api/model-provider-accounts/legacy-credentials";
+const providerErrorResponseSchema = z.object({
+  error: z.string(),
+  retryable: z.boolean().optional(),
+});
 
 export type { LegacyProviderKeyLocation };
 
@@ -55,14 +66,11 @@ async function requestProviderResponse(
     signal: init?.signal,
   });
   if (!response.ok) {
-    const payload = (await response.json().catch(() => ({}))) as {
-      error?: string;
-      retryable?: boolean;
-    };
+    const parsed = providerErrorResponseSchema.safeParse(await response.json().catch(() => null));
     throw new ProviderResourceError(
-      payload.error || "Provider account request failed",
+      (parsed.success && parsed.data.error) || "Provider account request failed",
       response.status,
-      typeof payload.retryable === "boolean" ? payload.retryable : undefined
+      parsed.success ? parsed.data.retryable : undefined
     );
   }
   return response;
@@ -88,11 +96,12 @@ async function requestProviderResourceWithoutContent(
 }
 
 export function useProviderAccounts() {
-  const { data: session } = useAuthSession();
-  const accounts = useSWR(session ? ACCOUNTS_KEY : null, async (path) => {
+  const { hasPermission } = useCurrentUserAuthorization();
+  const canRead = hasPermission("provider_accounts.read");
+  const accounts = useSWR(canRead ? ACCOUNTS_KEY : null, async (path) => {
     return (await requestProviderResource(path, modelProviderAccountsResponseSchema)).accounts;
   });
-  const defaults = useSWR(session ? DEFAULTS_KEY : null, async (path) => {
+  const defaults = useSWR(canRead ? DEFAULTS_KEY : null, async (path) => {
     return (await requestProviderResource(path, modelProviderAccountDefaultsResponseSchema))
       .defaults;
   });
@@ -111,9 +120,10 @@ export function useProviderAccounts() {
 }
 
 export function useLegacyProviderCredentials() {
-  const { data: session } = useAuthSession();
+  const { hasPermission } = useCurrentUserAuthorization();
+  const canRead = hasPermission("provider_accounts.read");
   const result = useSWR<LegacyProviderCredentialsResponse>(
-    session ? LEGACY_CREDENTIALS_KEY : null,
+    canRead ? LEGACY_CREDENTIALS_KEY : null,
     async (path: BrowserApiPath) => {
       return requestProviderResource(path, legacyProviderCredentialsResponseSchema);
     }
@@ -174,6 +184,61 @@ export async function cancelProviderDeviceAuthorization(
   );
 }
 
+export async function startProviderAuthorizationCode(
+  provider: SubscriptionProviderId,
+  input: StartProviderAuthorizationCodeRequest
+): Promise<StartProviderAuthorizationCodeResponse> {
+  const parsedProvider = subscriptionProviderIdSchema.parse(provider);
+  const request = startProviderAuthorizationCodeRequestSchema.parse(input);
+  return requestProviderResource(
+    `${ACCOUNTS_KEY}/authorization-codes/${parsedProvider}`,
+    startProviderAuthorizationCodeResponseSchema,
+    { method: "POST", body: request }
+  );
+}
+
+export async function readProviderAuthorizationCodeStatus(
+  provider: SubscriptionProviderId,
+  transactionId: string,
+  signal?: AbortSignal
+): Promise<ProviderAuthorizationCodeStatusResponse> {
+  const parsedProvider = subscriptionProviderIdSchema.parse(provider);
+  const id = providerDeviceAuthorizationIdSchema.parse(transactionId);
+  return requestProviderResource(
+    `${ACCOUNTS_KEY}/authorization-codes/${parsedProvider}/${id}`,
+    providerAuthorizationCodeStatusResponseSchema,
+    { signal }
+  );
+}
+
+export async function completeProviderAuthorizationCode(
+  provider: SubscriptionProviderId,
+  transactionId: string,
+  code: string,
+  signal?: AbortSignal
+): Promise<ProviderAuthorizationCodeStatusResponse> {
+  const parsedProvider = subscriptionProviderIdSchema.parse(provider);
+  const id = providerDeviceAuthorizationIdSchema.parse(transactionId);
+  const request = completeProviderAuthorizationCodeRequestSchema.parse({ code });
+  return requestProviderResource(
+    `${ACCOUNTS_KEY}/authorization-codes/${parsedProvider}/${id}/complete`,
+    providerAuthorizationCodeStatusResponseSchema,
+    { method: "POST", body: request, signal }
+  );
+}
+
+export async function cancelProviderAuthorizationCode(
+  provider: SubscriptionProviderId,
+  transactionId: string
+) {
+  const parsedProvider = subscriptionProviderIdSchema.parse(provider);
+  const id = providerDeviceAuthorizationIdSchema.parse(transactionId);
+  await requestProviderResourceWithoutContent(
+    `${ACCOUNTS_KEY}/authorization-codes/${parsedProvider}/${id}`,
+    { method: "DELETE" }
+  );
+}
+
 export async function renameProviderAccount(id: string, displayName: string) {
   return (
     await requestProviderResource(`${ACCOUNTS_KEY}/${id}`, modelProviderAccountResponseSchema, {
@@ -228,10 +293,4 @@ export async function setProviderAccountDefault(
       }
     )
   ).default;
-}
-
-export async function clearProviderAccountDefault(provider: SubscriptionProviderId) {
-  return requestProviderResourceWithoutContent(`${DEFAULTS_KEY}/${provider}`, {
-    method: "DELETE",
-  });
 }

@@ -15,12 +15,24 @@ variable "worker_name" {
 }
 
 variable "worker_subdomain" {
-  description = "Cloudflare account workers.dev subdomain label, e.g. 'myaccount' (without '.workers.dev'). worker_url resolves to <worker_name>.<worker_subdomain>.workers.dev."
+  description = "Cloudflare account workers.dev subdomain label, e.g. 'myaccount' (without '.workers.dev'). worker_url resolves to <worker_name>.<worker_subdomain>.workers.dev. Leave null when workers_dev_enabled is false."
   type        = string
+  default     = null
 
   validation {
-    condition     = can(regex("^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$", var.worker_subdomain))
+    condition     = var.worker_subdomain == null || can(regex("^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$", var.worker_subdomain))
     error_message = "worker_subdomain must be a single workers.dev subdomain label (e.g. 'myaccount'): lowercase alphanumeric and hyphens only, no dots — do not include '.workers.dev'."
+  }
+}
+
+variable "workers_dev_enabled" {
+  description = "Serve the Worker on its workers.dev hostname. False also turns preview URLs off, so a custom domain is the Worker's only ingress."
+  type        = bool
+  default     = true
+
+  validation {
+    condition     = !var.workers_dev_enabled || var.worker_subdomain != null
+    error_message = "worker_subdomain is required while workers_dev_enabled is true."
   }
 }
 
@@ -30,76 +42,76 @@ variable "script_path" {
 }
 
 variable "kv_namespaces" {
-  description = "List of KV namespace bindings"
-  type = list(object({
-    binding_name = string
+  description = "Map of KV namespace bindings keyed by binding name"
+  type = map(object({
     namespace_id = string
   }))
-  default = []
+  default = {}
 }
 
 variable "service_bindings" {
-  description = "List of service bindings for worker-to-worker communication"
-  type = list(object({
-    binding_name = string
+  description = "Map of service bindings keyed by binding name for worker-to-worker communication"
+  type = map(object({
     service_name = string
   }))
-  default = []
+  default = {}
 }
 
 variable "d1_databases" {
-  description = "List of D1 database bindings"
-  type = list(object({
-    binding_name = string
-    database_id  = string
+  description = "Map of D1 database bindings keyed by binding name"
+  type = map(object({
+    database_id = string
   }))
-  default = []
+  default = {}
 }
 
 variable "r2_buckets" {
-  description = "List of R2 bucket bindings"
-  type = list(object({
-    binding_name = string
-    bucket_name  = string
+  description = "Map of R2 bucket bindings keyed by binding name"
+  type = map(object({
+    bucket_name = string
   }))
-  default = []
+  default = {}
 }
 
 variable "queue_bindings" {
-  description = "List of Queue producer bindings"
-  type = list(object({
-    binding_name = string
-    queue_name   = string
+  description = "Map of Queue producer bindings keyed by binding name"
+  type = map(object({
+    queue_name = string
   }))
-  default = []
+  default = {}
 }
 
 variable "plain_text_bindings" {
-  description = "List of plain text environment variable bindings"
-  type = list(object({
-    name  = string
+  description = "Map of plain text environment variable bindings keyed by binding name"
+  type = map(object({
     value = string
   }))
-  default = []
+  default = {}
 }
 
 variable "secrets" {
-  description = "List of secret bindings"
-  type = list(object({
-    name  = string
+  description = "Map of secret bindings keyed by binding name"
+  type = map(object({
     value = string
   }))
-  default   = []
+  default   = {}
   sensitive = true
 }
 
-variable "durable_objects" {
-  description = "List of Durable Object bindings"
-  type = list(object({
-    binding_name = string
-    class_name   = string
+variable "dispatch_namespaces" {
+  description = "Map of Workers for Platforms dispatch namespace bindings keyed by binding name"
+  type = map(object({
+    namespace = string
   }))
-  default = []
+  default = {}
+}
+
+variable "durable_objects" {
+  description = "Map of Durable Object bindings keyed by binding name"
+  type = map(object({
+    class_name = string
+  }))
+  default = {}
 }
 
 variable "enable_durable_object_bindings" {

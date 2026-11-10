@@ -1,11 +1,17 @@
+import { DEFAULT_HARNESS, harnessIdSchema } from "../harnesses";
 import { z } from "zod";
 import { sessionArtifactSchema } from "./artifacts";
 import { sessionRepositoryStateSchema } from "./repositories";
-import { sandboxEventSchema } from "./sandbox-events";
-import { sandboxStatusSchema, sessionStatusSchema } from "./sessions";
+import { sandboxBootPhaseSchema, sandboxEventSchema } from "./sandbox-events";
+import {
+  sandboxStatusSchema,
+  sessionCapabilitiesSchema,
+  sessionStatusSchema,
+  timelineSequenceSchema,
+} from "./sessions";
+import { sandboxShutdownSchema, shutdownRecoveryActionSchema } from "./sandbox-shutdown";
 import { clientRequestIdSchema } from "./prompts";
-
-const timelineSequenceSchema = z.number().int().nonnegative().safe();
+import { sessionVisibilitySchema } from "./teams";
 
 export const promptQueueItemSchema = z.object({
   messageId: z.string(),
@@ -16,6 +22,11 @@ export type PromptQueueItem = z.infer<typeof promptQueueItemSchema>;
 
 const sessionStateSchema = z.object({
   id: z.string(),
+  ownerUserId: z.string().nullable().optional(),
+  ownerTeamId: z.string().nullable().optional(),
+  visibility: sessionVisibilitySchema.optional(),
+  collaborators: z.array(z.string()).optional(),
+  capabilities: sessionCapabilitiesSchema.optional(),
   title: z.string().nullable(),
   repoOwner: z.string().nullable(),
   repoName: z.string().nullable(),
@@ -23,13 +34,22 @@ const sessionStateSchema = z.object({
   branchName: z.string().nullable(),
   status: sessionStatusSchema,
   sandboxStatus: sandboxStatusSchema,
+  sandboxPreservation: sandboxShutdownSchema.nullable().optional(),
   messageCount: z.number(),
   createdAt: z.number(),
+  /**
+   * Agent harness the session runs on; fixed at create. A producer that
+   * predates the field reports the built-in harness, so readers never see
+   * an absent value.
+   */
+  harness: harnessIdSchema.default(DEFAULT_HARNESS),
   model: z.string().optional(),
   reasoningEffort: z.string().optional(),
   isProcessing: z.boolean().optional(),
   parentSessionId: z.string().nullable().optional(),
   totalCost: z.number().optional(),
+  maxSessionCostUsd: z.number().nullable().optional(),
+  budgetExhausted: z.boolean().optional(),
   codeServerUrl: z.string().nullable().optional(),
   codeServerPassword: z.string().nullable().optional(),
   vncUrl: z.string().nullable().optional(),
@@ -114,9 +134,22 @@ export const sessionSnapshotSchema = z.object({
   artifacts: z.array(sessionArtifactSchema),
   timeline: sessionTimelineSchema,
   spawnError: z.string().nullable().optional(),
+  /** The boot phase a spawning/connecting sandbox last reported; null otherwise. */
+  bootPhase: sandboxBootPhaseSchema.nullable().optional(),
   promptQueue: z.array(promptQueueItemSchema),
 });
 export type SessionSnapshot = z.infer<typeof sessionSnapshotSchema>;
+
+/** Removes sandbox location data before a snapshot crosses a read-only boundary. */
+export function redactSessionSnapshotSandboxAccess(snapshot: SessionSnapshot): SessionSnapshot {
+  const session = { ...snapshot.session };
+  delete session.codeServerUrl;
+  delete session.vncUrl;
+  delete session.ttydUrl;
+  delete session.tunnelUrls;
+  delete session.sandboxDashboardUrl;
+  return { ...snapshot, session };
+}
 
 const serverMessageUnionSchema = z.discriminatedUnion("type", [
   z.object({ type: z.literal("pong"), timestamp: z.number() }),
@@ -124,6 +157,7 @@ const serverMessageUnionSchema = z.discriminatedUnion("type", [
     type: z.literal("subscribed"),
     participantId: z.string(),
     participant: participantSummarySchema.optional(),
+    canManageBudget: z.boolean().optional(),
   }),
   z.object({
     type: z.literal("prompt_queued"),
@@ -150,7 +184,6 @@ const serverMessageUnionSchema = z.discriminatedUnion("type", [
   z.object({ type: z.literal("sandbox_warming") }),
   z.object({ type: z.literal("sandbox_spawning") }),
   z.object({ type: z.literal("sandbox_status"), status: sandboxStatusSchema }),
-  z.object({ type: z.literal("sandbox_ready") }),
   z.object({ type: z.literal("sandbox_error"), error: z.string() }),
   z.object({ type: z.literal("artifact_created"), artifact: sessionArtifactSchema }),
   // Existing artifact changed (e.g. PR lifecycle update). Consumers upsert by
@@ -166,9 +199,21 @@ const serverMessageUnionSchema = z.discriminatedUnion("type", [
     repoName: z.string().optional(),
   }),
   z.object({ type: z.literal("snapshot_saved"), imageId: z.string(), reason: z.string() }),
+  z.object({ type: z.literal("sandbox_preservation"), preservation: sandboxShutdownSchema }),
+  z.object({
+    type: z.literal("shutdown_recovery_accepted"),
+    clientRequestId: clientRequestIdSchema,
+    action: shutdownRecoveryActionSchema,
+  }),
   z.object({ type: z.literal("sandbox_restored"), message: z.string() }),
   z.object({ type: z.literal("sandbox_warning"), message: z.string() }),
   z.object({ type: z.literal("processing_status"), isProcessing: z.boolean() }),
+  z.object({
+    type: z.literal("budget_status"),
+    totalCost: z.number(),
+    maxSessionCostUsd: z.number().nullable(),
+    budgetExhausted: z.boolean(),
+  }),
   z.object({
     type: z.literal("diff_state_changed"),
     revisionId: z.string().nullable(),

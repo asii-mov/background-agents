@@ -1,6 +1,6 @@
 locals {
   name_suffix              = var.deployment_name
-  use_modal_backend        = var.sandbox_provider == "modal"
+  use_modal_backend        = contains(["modal", "modal-vm"], var.sandbox_provider)
   use_daytona_backend      = var.sandbox_provider == "daytona"
   use_vercel_backend       = var.sandbox_provider == "vercel"
   use_opencomputer_backend = var.sandbox_provider == "opencomputer"
@@ -34,6 +34,7 @@ locals {
   # the default for both variables.
   web_custom_domain         = var.cloudflare_custom_domain == null ? "" : trimspace(var.cloudflare_custom_domain)
   web_custom_domain_zone_id = var.cloudflare_zone_id == null ? "" : trimspace(var.cloudflare_zone_id)
+  vercel_custom_domain      = var.vercel_custom_domain == null ? "" : trimspace(var.vercel_custom_domain)
 
   # Whether a custom domain is configured for the Cloudflare web Worker
   web_custom_domain_enabled = (
@@ -41,6 +42,51 @@ locals {
     local.web_custom_domain != "" &&
     local.web_custom_domain_zone_id != ""
   )
+  vercel_custom_domain_enabled = (
+    var.web_platform == "vercel" &&
+    local.vercel_custom_domain != ""
+  )
+
+  # The bots derive their classifier's provider from the model id, so the
+  # deployment binds exactly one provider credential to them: an Anthropic model
+  # gets ANTHROPIC_API_KEY, an OpenAI model gets OPENAI_API_KEY. This is scoped
+  # to the classifier — var.anthropic_api_key is still what Claude coding
+  # sessions and the opencomputer control-plane path use.
+  classifier_uses_openai = (
+    startswith(var.classification_model, "openai/") ||
+    startswith(var.classification_model, "gpt-")
+  )
+
+  # The dedicated classifier key keeps the bots' credential out of sandboxes;
+  # existing deployments that only set anthropic_api_key keep using it.
+  classifier_anthropic_api_key = (trimspace(var.classification_anthropic_api_key) != ""
+    ? var.classification_anthropic_api_key
+    : var.anthropic_api_key
+  )
+
+  # Exactly one provider binding for the classifier bots.
+  classifier_secret_bindings = (local.classifier_uses_openai
+    ? { OPENAI_API_KEY = { value = var.classification_openai_api_key } }
+    : { ANTHROPIC_API_KEY = { value = local.classifier_anthropic_api_key } }
+  )
+
+  # Bound only when set, so an unconfigured classifier keeps the model default.
+  classifier_reasoning_effort_bindings = var.classification_reasoning_effort != "" ? {
+    CLASSIFICATION_REASONING_EFFORT = { value = var.classification_reasoning_effort }
+  } : {}
+
+  # Deployment-wide LLM keys injected into Modal session sandboxes. Every key stays
+  # present with an empty value when unconfigured, so clearing one reconciles the
+  # old credential away on the next apply; Modal rejects a secret with no keys at
+  # all. An empty value means sandboxes take that provider's credential from the
+  # per-repository secret store, which overrides this secret either way.
+  modal_llm_secret_values = {
+    ANTHROPIC_API_KEY = trimspace(var.anthropic_api_key)
+  }
+
+  # OpenComputer reads its sandbox credentials from the control plane rather than
+  # from a provider-side secret, so its bindings are set together.
+  opencomputer_enabled = trimspace(var.opencomputer_api_key) != "" && trimspace(var.opencomputer_api_url) != ""
 
   # Host the Cloudflare web Worker is served from: custom domain when configured,
   # otherwise its default workers.dev hostname.
@@ -52,15 +98,36 @@ locals {
   # Web app URL depends on deployment platform
   web_app_url = (var.web_platform == "cloudflare"
     ? "https://${local.web_cloudflare_host}"
-    : "https://open-inspect-${local.name_suffix}.vercel.app"
+    : (local.vercel_custom_domain_enabled
+      ? "https://${local.vercel_custom_domain}"
+      : "https://open-inspect-${local.name_suffix}.vercel.app"
+    )
   )
-  effective_web_app_url = (
-    var.web_platform == "vercel" ? module.web_app[0].production_url : local.web_app_url
+  effective_web_app_url = local.web_app_url
+
+  # Documentation site hostname, null when unset. The Terraform workflow passes
+  # an unset repository variable as "", which must not attach an empty domain.
+  docs_custom_domain = (
+    var.docs_custom_domain == null ? null :
+    trimspace(var.docs_custom_domain) == "" ? null : trimspace(var.docs_custom_domain)
   )
+
+  # Documentation site URL, when it serves a hostname of its own
+  docs_custom_domain_url = local.docs_custom_domain != null ? "https://${local.docs_custom_domain}" : null
 
   # Worker script paths (deterministic output locations)
   control_plane_script_path = "${var.project_root}/packages/control-plane/dist/index.js"
   slack_bot_script_path     = "${var.project_root}/packages/slack-bot/dist/index.js"
   linear_bot_script_path    = "${var.project_root}/packages/linear-bot/dist/index.js"
   github_bot_script_path    = "${var.project_root}/packages/github-bot/dist/index.js"
+
+  # Internal app hosting (apps-account.tf, apps.tf)
+  apps_wfp = var.apps_enabled && var.apps_hosting_backend == "dispatch-namespace"
+  # APP_RESOURCE_PREFIX and APP_BROKER_HOST_LABEL in packages/shared/src/app-broker.ts
+  apps_script_prefix = "app-"
+  apps_broker_host   = "deployer.${var.apps_domain}"
+  # APP_SCRIPT_COMPATIBILITY_DATE in packages/app-broker/src/backends.ts
+  apps_compatibility_date    = "2026-06-01"
+  app_broker_script_path     = "${var.project_root}/packages/app-broker/dist/index.js"
+  app_dispatcher_script_path = "${var.project_root}/packages/app-broker/dist/dispatcher.js"
 }

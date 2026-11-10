@@ -1,7 +1,78 @@
 /**
- * Contract constants for Session Durable Object internal endpoints.
+ * Contract constants and schemas for Session Durable Object internal endpoints.
  * Router and SessionDO must both import these to prevent path drift.
  */
+
+import { z } from "zod";
+import { stepUsageSchema } from "@open-inspect/shared";
+import { sessionEventSchema, sessionMessageSchema } from "@open-inspect/shared/types/sessions";
+
+/** SCM display fields forwarded from the authenticated route to the Session runtime. */
+export const sessionScmDisplayFieldsSchema = z.object({
+  scmLogin: z.string().nullable().optional(),
+  scmName: z.string().nullable().optional(),
+  scmEmail: z.string().nullable().optional(),
+});
+
+export const sessionMessagePageSchema = z.discriminatedUnion("hasMore", [
+  z.object({
+    messages: z.array(sessionMessageSchema),
+    hasMore: z.literal(true),
+    cursor: z.string().min(1),
+  }),
+  z.object({
+    messages: z.array(sessionMessageSchema),
+    hasMore: z.literal(false),
+    cursor: z.string().min(1).optional(),
+  }),
+]);
+export type SessionMessagePage = z.infer<typeof sessionMessagePageSchema>;
+
+const SESSION_TRACE_COLLECTIONS = ["messages", "events", "usage"] as const;
+export type SessionTraceCollection = (typeof SESSION_TRACE_COLLECTIONS)[number];
+
+/** A comma-separated set of trace collections, deduplicated into canonical order. */
+export const sessionTraceIncludeSchema = z
+  .string()
+  .transform((raw) => raw.split(","))
+  .pipe(
+    z.array(
+      z.enum(SESSION_TRACE_COLLECTIONS, {
+        error: `include must be a comma-separated list of ${SESSION_TRACE_COLLECTIONS.join(", ")}`,
+      })
+    )
+  )
+  .transform((requested) =>
+    SESSION_TRACE_COLLECTIONS.filter((collection) => requested.includes(collection))
+  );
+
+export const sessionTraceFormatSchema = z.enum(["full", "compact"], {
+  error: "format must be full or compact",
+});
+export type SessionTraceFormat = z.infer<typeof sessionTraceFormatSchema>;
+
+/** Upper bound on one session's serialized trace-export response. */
+export const MAX_INCLUDED_BYTES_PER_SESSION = 4 * 1024 * 1024;
+
+/**
+ * One session's trace, read in a single storage snapshot. A collection is
+ * present only when requested. All collections are in timeline order.
+ */
+const sessionTraceSchema = z.object({
+  messages: z.array(sessionMessageSchema).optional(),
+  events: z.array(sessionEventSchema).optional(),
+  usage: z.array(stepUsageSchema).optional(),
+});
+export type SessionTrace = z.infer<typeof sessionTraceSchema>;
+
+export const sessionTraceExportSchema = z.discriminatedUnion("ok", [
+  z.object({ ok: z.literal(true), trace: sessionTraceSchema }),
+  z.object({
+    ok: z.literal(false),
+    reason: z.enum(["page_cap_reached", "trace_budget_exceeded"]),
+  }),
+]);
+export type SessionTraceExport = z.infer<typeof sessionTraceExportSchema>;
 
 export const SessionInternalPaths = {
   init: "/internal/init",
@@ -12,12 +83,14 @@ export const SessionInternalPaths = {
   autofix: "/internal/autofix",
   stop: "/internal/stop",
   sandboxEvent: "/internal/sandbox-event",
+  sandboxError: "/internal/sandbox-error",
   createMediaArtifact: "/internal/create-media-artifact",
   attachments: "/internal/attachments",
   participants: "/internal/participants",
   events: "/internal/events",
   artifacts: "/internal/artifacts",
   messages: "/internal/messages",
+  traceExport: "/internal/trace-export",
   createPr: "/internal/create-pr",
   // Static path + artifactId query param: the router matches paths as exact
   // strings, so the artifact id cannot ride in the path.
@@ -37,6 +110,7 @@ export const SessionInternalPaths = {
   childSummary: "/internal/child-summary",
   parentPrompt: "/internal/parent-prompt",
   updateTitle: "/internal/update-title",
+  budget: "/internal/budget",
   cancel: "/internal/cancel",
   childSessionUpdate: "/internal/child-session-update",
   diffState: "/internal/diff-state",
@@ -50,6 +124,19 @@ export type SessionInternalPath = (typeof SessionInternalPaths)[keyof typeof Ses
 
 const INTERNAL_ORIGIN = "http://internal";
 
-export function buildSessionInternalUrl(path: SessionInternalPath, search?: string): string {
+function buildSessionInternalUrl(path: SessionInternalPath, search?: string): string {
   return `${INTERNAL_ORIGIN}${path}${search ?? ""}`;
+}
+
+/**
+ * The request a session runtime receives for `path`: whichever host's
+ * client addresses the runtime builds this and hands it to the runtime's
+ * server, so the two halves agree on the URL and the caller's `init`.
+ */
+export function buildSessionInternalRequest(
+  path: SessionInternalPath,
+  init?: RequestInit,
+  search?: string
+): Request {
+  return new Request(buildSessionInternalUrl(path, search), init);
 }

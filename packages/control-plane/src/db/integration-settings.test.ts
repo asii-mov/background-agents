@@ -317,6 +317,26 @@ describe("IntegrationSettingsStore", () => {
       });
     });
 
+    it.each([75, null])("accepts an Autofix attempt limit of %s", async (attemptLimit) => {
+      await store.setGlobal("github", {
+        defaults: { autofix: { maxAttemptsPerPrPer24Hours: attemptLimit } },
+      });
+
+      const result = await store.getGlobal("github");
+      expect(result?.defaults?.autofix?.maxAttemptsPerPrPer24Hours).toBe(attemptLimit);
+    });
+
+    it.each([0, 1.5, Number.MAX_SAFE_INTEGER + 1])(
+      "rejects an invalid Autofix attempt limit of %s",
+      async (attemptLimit) => {
+        await expect(
+          store.setGlobal("github", {
+            defaults: { autofix: { maxAttemptsPerPrPer24Hours: attemptLimit } },
+          })
+        ).rejects.toThrow(IntegrationSettingsValidationError);
+      }
+    );
+
     it("rejects non-array defaults.allowedTriggerUsers", async () => {
       await expect(
         store.setGlobal("github", {
@@ -363,6 +383,27 @@ describe("IntegrationSettingsStore", () => {
           defaults: { model: "anthropic/claude-opus-4-6", reasoningEffort: "high" },
         })
       ).resolves.not.toThrow();
+    });
+
+    it("rejects malformed stored global settings", async () => {
+      (db as unknown as { globalRows: Map<string, GlobalRow> }).globalRows.set("github", {
+        integration_id: "github",
+        settings: JSON.stringify({ enabledRepos: [42] }),
+        created_at: 1,
+        updated_at: 1,
+      });
+
+      await expect(store.getGlobal("github")).rejects.toThrow(IntegrationSettingsValidationError);
+    });
+
+    it("does not persist structurally invalid global settings", async () => {
+      await expect(
+        store.setGlobal("github", {
+          defaults: { autoReviewOnOpen: "false" as unknown as boolean },
+        })
+      ).rejects.toThrow(IntegrationSettingsValidationError);
+
+      await expect(store.getGlobal("github")).resolves.toBeNull();
     });
   });
 
@@ -482,6 +523,44 @@ describe("IntegrationSettingsStore", () => {
           commentActionInstructions: true as unknown as string,
         })
       ).rejects.toThrow(IntegrationSettingsValidationError);
+    });
+
+    it("rejects malformed stored repo settings", async () => {
+      (db as unknown as { repoRows: Map<string, RepoRow> }).repoRows.set("github:acme/widgets", {
+        integration_id: "github",
+        repo: "acme/widgets",
+        settings: JSON.stringify({ autoReviewOnOpen: "false" }),
+        created_at: 1,
+        updated_at: 1,
+      });
+
+      await expect(store.getRepoSettings("github", "acme/widgets")).rejects.toThrow(
+        IntegrationSettingsValidationError
+      );
+    });
+
+    it("rejects malformed stored repo settings from list reads", async () => {
+      (db as unknown as { repoRows: Map<string, RepoRow> }).repoRows.set("github:acme/widgets", {
+        integration_id: "github",
+        repo: "acme/widgets",
+        settings: JSON.stringify({ autoReviewOnOpen: "false" }),
+        created_at: 1,
+        updated_at: 1,
+      });
+
+      await expect(store.listRepoSettings("github")).rejects.toThrow(
+        IntegrationSettingsValidationError
+      );
+    });
+
+    it("does not persist structurally invalid repo settings", async () => {
+      await expect(
+        store.setRepoSettings("github", "acme/widgets", {
+          autoReviewOnOpen: "false" as unknown as boolean,
+        })
+      ).rejects.toThrow(IntegrationSettingsValidationError);
+
+      await expect(store.getRepoSettings("github", "acme/widgets")).resolves.toBeNull();
     });
   });
 
@@ -708,6 +787,33 @@ describe("IntegrationSettingsStore", () => {
           tunnelPorts: [70000],
         })
       ).rejects.toThrow(IntegrationSettingsValidationError);
+    });
+
+    it("does not persist structurally invalid environment settings", async () => {
+      await expect(
+        store.setEnvironmentSettings("sandbox", "env_1", {
+          buildTimeoutSeconds: "3600" as unknown as number,
+        })
+      ).rejects.toThrow(IntegrationSettingsValidationError);
+
+      await expect(store.getEnvironmentSettings("sandbox", "env_1")).resolves.toBeNull();
+    });
+
+    it("rejects malformed stored environment settings", async () => {
+      (db as unknown as { environmentRows: Map<string, EnvironmentRow> }).environmentRows.set(
+        "sandbox:env_1",
+        {
+          integration_id: "sandbox",
+          environment_id: "env_1",
+          settings: JSON.stringify({ buildTimeoutSeconds: "3600" }),
+          created_at: 1,
+          updated_at: 1,
+        }
+      );
+
+      await expect(store.getEnvironmentSettings("sandbox", "env_1")).rejects.toThrow(
+        IntegrationSettingsValidationError
+      );
     });
 
     it("layers environment overrides on top of repo overrides and global defaults", async () => {
@@ -953,6 +1059,31 @@ describe("IntegrationSettingsStore", () => {
       ).rejects.toThrow(IntegrationSettingsValidationError);
     });
 
+    it("rejects global timeouts that do not leave room for the effective final buffer", async () => {
+      await expect(
+        store.setGlobal("sandbox", { defaults: { sandboxTimeoutMs: 300_000 } })
+      ).rejects.toThrow(IntegrationSettingsValidationError);
+    });
+
+    it("does not grandfather an unchanged stored invalid global timeout", async () => {
+      await db
+        .prepare(
+          `INSERT INTO integration_settings (integration_id, settings, created_at, updated_at)
+           VALUES (?, ?, ?, ?)`
+        )
+        .bind("sandbox", JSON.stringify({ defaults: { sandboxTimeoutMs: 300_000 } }), 1, 1)
+        .run();
+
+      const stored = await store.getGlobal("sandbox");
+      expect(stored).toEqual({ defaults: {} });
+
+      await expect(
+        store.setGlobal("sandbox", {
+          defaults: { sandboxTimeoutMs: 300_000, terminalEnabled: true },
+        })
+      ).rejects.toThrow(IntegrationSettingsValidationError);
+    });
+
     it("normalizes cross-field violations that only appear after merge", async () => {
       // Each blob is individually valid — neither write throws — because the
       // invariant (concurrent <= total) spans two fields set in different scopes.
@@ -965,6 +1096,30 @@ describe("IntegrationSettingsStore", () => {
       // Merge would be { maxConcurrentChildSessions: 3, maxTotalChildSessions: 2 };
       // the resolve-time normalize drops the inverted concurrent limit.
       expect(config.settings).toEqual({ maxTotalChildSessions: 2 });
+    });
+
+    it("defers timeout-buffer validation until global and repo settings are merged", async () => {
+      await store.setGlobal("sandbox", { defaults: { finalSnapshotBufferMs: 300_000 } });
+      await store.setRepoSettings("sandbox", "acme/app", { sandboxTimeoutMs: 360_000 });
+
+      expect(await store.getRepoSettings("sandbox", "acme/app")).toEqual({
+        sandboxTimeoutMs: 360_000,
+      });
+      const config = await store.getResolvedConfig("sandbox", "acme/app");
+      expect(config.settings).toMatchObject({
+        sandboxTimeoutMs: 360_000,
+        finalSnapshotBufferMs: 300_000,
+      });
+    });
+
+    it("omits an invalid relationship introduced by an environment override", async () => {
+      await store.setGlobal("sandbox", {
+        defaults: { finalSnapshotBufferMs: 300_000, terminalEnabled: true },
+      });
+      await store.setEnvironmentSettings("sandbox", "env_1", { sandboxTimeoutMs: 300_000 });
+
+      const config = await store.getResolvedConfig("sandbox", "acme/app", "env_1");
+      expect(config.settings).toEqual({ terminalEnabled: true });
     });
 
     it("round-trips fractional cpuCores and small memoryMib", async () => {
@@ -1032,14 +1187,14 @@ describe("IntegrationSettingsStore", () => {
 
     it("round-trips linear repo settings", async () => {
       await store.setRepoSettings("linear", "acme/platform", {
-        model: "openai/gpt-5.3-codex",
+        model: "openai/gpt-6-sol",
         reasoningEffort: "high",
         allowLabelModelOverride: false,
       });
 
       const result = await store.getRepoSettings("linear", "acme/platform");
       expect(result).toEqual({
-        model: "openai/gpt-5.3-codex",
+        model: "openai/gpt-6-sol",
         reasoningEffort: "high",
         allowLabelModelOverride: false,
       });
@@ -1283,6 +1438,14 @@ describe("IntegrationSettingsStore", () => {
       await expect(
         store.setGlobal("slack", {
           defaults: { routingRules: "frontend" as unknown as [] },
+        })
+      ).rejects.toThrow(IntegrationSettingsValidationError);
+    });
+
+    it("rejects partial routing rule payloads", async () => {
+      await expect(
+        store.setGlobal("slack", {
+          defaults: { routingRules: [{ keyword: "frontend" }] as unknown as [] },
         })
       ).rejects.toThrow(IntegrationSettingsValidationError);
     });

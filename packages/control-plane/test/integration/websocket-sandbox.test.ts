@@ -1,7 +1,8 @@
 import { describe, it, expect, vi } from "vitest";
 import { env } from "cloudflare:test";
-import type { SessionDO } from "../../src/session/durable-object";
+import type { SessionDO } from "../../src/cloudflare/durable-object";
 import { componentsOf, runInSessionDO } from "./session-do-access";
+import { hostContract } from "../conformance/session-core-conformance";
 import { encryptToken } from "../../src/auth/crypto";
 import {
   collectMessages,
@@ -9,12 +10,17 @@ import {
   openClientWs,
   openSandboxWs,
   seedSandboxAuth,
+  seedMessage,
   queryDO,
   waitForSandboxStatus,
 } from "./helpers";
 
 const SANDBOX_TOKEN = "test-sandbox-auth-token-abc123";
 const SANDBOX_ID = "sb-integration-test";
+
+function openSandboxSockets(state: DurableObjectState): WebSocket[] {
+  return state.getWebSockets("sandbox").filter((socket) => socket.readyState === WebSocket.OPEN);
+}
 
 describe("Sandbox WebSocket (via SELF.fetch)", () => {
   it("upgrade with valid auth returns 101", async () => {
@@ -61,14 +67,14 @@ describe("Sandbox WebSocket (via SELF.fetch)", () => {
     expect(ws).toBeNull();
   });
 
-  it("upgrade for stopped sandbox returns 410", async () => {
-    const name = `ws-sandbox-stopped-${Date.now()}`;
+  it.each(["stopped", "stale"] as const)("upgrade for %s sandbox returns 410", async (status) => {
+    const name = `ws-sandbox-${status}-${Date.now()}`;
     const { stub } = await initNamedSession(name);
 
     await seedSandboxAuth(stub, {
       authToken: SANDBOX_TOKEN,
       sandboxId: SANDBOX_ID,
-      status: "stopped",
+      status,
     });
 
     const { ws, response } = await openSandboxWs(name, {
@@ -126,6 +132,9 @@ describe("Sandbox WebSocket (via SELF.fetch)", () => {
       expect(response.status).toBe(101);
       expect(ws).not.toBeNull();
       ws!.accept();
+      ws!.send(
+        JSON.stringify({ type: "ready", sandboxId: SANDBOX_ID, timestamp: Date.now() / 1000 })
+      );
       await waitForSandboxStatus(stub, "ready");
       ws!.close();
     }
@@ -157,7 +166,7 @@ describe("Sandbox WebSocket (via SELF.fetch)", () => {
     });
   }
 
-  it("revalidates terminal state after asynchronous authentication", async () => {
+  hostContract("host.socket-terminal-upgrade", async () => {
     const name = `ws-session-auth-race-${Date.now()}`;
     const { stub } = await initNamedSession(name);
     await seedSandboxAuth(stub, {
@@ -268,11 +277,173 @@ describe("Sandbox WebSocket (via SELF.fetch)", () => {
     expect(ws).toBeNull();
   });
 
-  it("sandbox connect sets status to ready", async () => {
+  hostContract("host.socket-single-sandbox", async () => {
+    const name = `ws-sandbox-replacement-${Date.now()}`;
+    const { stub } = await initNamedSession(name);
+    await seedSandboxAuth(stub, {
+      authToken: SANDBOX_TOKEN,
+      sandboxId: SANDBOX_ID,
+      status: "ready",
+    });
+
+    const rejected = await openSandboxWs(name, {
+      authToken: SANDBOX_TOKEN,
+      sandboxId: "stale-sandbox-id",
+    });
+    expect(rejected.response.status).toBe(403);
+    expect(rejected.ws).toBeNull();
+
+    // A bridge that connected before the runtime was rebuilt: after
+    // hibernation only its tagged socket survives, accepted at the platform
+    // level and unknown to the manager's in-memory pointer. Replacement must
+    // find it through the host's sockets, not through that pointer.
+    await runInSessionDO(stub, (instance: SessionDO, state) => {
+      const pair = new WebSocketPair();
+      state.acceptWebSocket(pair[1], ["sandbox", `sid:${SANDBOX_ID}`]);
+      pair[0].accept();
+      expect(openSandboxSockets(state)).toHaveLength(1);
+    });
+
+    const { ws: replacementWs } = await openSandboxWs(name, {
+      authToken: SANDBOX_TOKEN,
+      sandboxId: SANDBOX_ID,
+    });
+    expect(replacementWs).not.toBeNull();
+    replacementWs!.accept();
+
+    await runInSessionDO(stub, (instance: SessionDO, state) => {
+      const liveSandboxSockets = openSandboxSockets(state);
+      expect(liveSandboxSockets).toHaveLength(1);
+      expect(state.getTags(liveSandboxSockets[0])).toContain(`sid:${SANDBOX_ID}`);
+    });
+
+    replacementWs!.close();
+  });
+
+  it("dispatches only from the sandbox socket whose identity the session persisted", async () => {
+    const name = `ws-sandbox-authority-${Date.now()}`;
+    const { stub } = await initNamedSession(name);
+    await seedSandboxAuth(stub, { authToken: SANDBOX_TOKEN, sandboxId: SANDBOX_ID });
+
+    const { ws: activeWs } = await openSandboxWs(name, {
+      authToken: SANDBOX_TOKEN,
+      sandboxId: SANDBOX_ID,
+    });
+    expect(activeWs).not.toBeNull();
+    activeWs!.accept();
+
+    const [{ active_socket_id: activeSocketId }] = await queryDO<{
+      active_socket_id: string | null;
+    }>(stub, "SELECT active_socket_id FROM sandbox");
+    expect(activeSocketId).toMatch(/^sbws-/);
+
+    const toolCall = (callId: string) =>
+      JSON.stringify({
+        type: "tool_call",
+        tool: "read_file",
+        args: { path: "/src/main.ts" },
+        callId,
+        messageId: "msg-authority",
+        sandboxId: SANDBOX_ID,
+        timestamp: Date.now() / 1000,
+      });
+
+    // A bridge the active one replaced, in the shape a restart leaves it:
+    // still accepted at the platform level under the same sandbox id, still
+    // open, carrying an identity the row no longer names.
+    await runInSessionDO(stub, async (instance: SessionDO, state) => {
+      const pair = new WebSocketPair();
+      state.acceptWebSocket(pair[1], ["sandbox", `sid:${SANDBOX_ID}`, "socket:sbws-replaced"]);
+      pair[0].accept();
+      expect(openSandboxSockets(state)).toHaveLength(2);
+
+      await instance.webSocketMessage(pair[1], toolCall("call-replaced"));
+
+      // Refused, and closed again rather than left open.
+      const live = openSandboxSockets(state);
+      expect(live).toHaveLength(1);
+      expect(state.getTags(live[0])).toContain(`socket:${activeSocketId}`);
+    });
+
+    activeWs!.send(toolCall("call-active"));
+    await new Promise((r) => setTimeout(r, 200));
+
+    const events = await queryDO<{ data: string }>(
+      stub,
+      "SELECT data FROM events WHERE type = ?",
+      "tool_call"
+    );
+    const callIds = events.map((event) => (JSON.parse(event.data) as { callId: string }).callId);
+    expect(callIds).toContain("call-active");
+    expect(callIds).not.toContain("call-replaced");
+
+    activeWs!.close();
+  });
+
+  it("revokes dispatch authority on detach before the close completes", async () => {
+    const name = `ws-sandbox-detach-${Date.now()}`;
+    const { stub } = await initNamedSession(name);
+    await seedSandboxAuth(stub, { authToken: SANDBOX_TOKEN, sandboxId: SANDBOX_ID });
+
+    const { ws } = await openSandboxWs(name, { authToken: SANDBOX_TOKEN, sandboxId: SANDBOX_ID });
+    expect(ws).not.toBeNull();
+    ws!.accept();
+    const [{ active_socket_id: activeSocketId }] = await queryDO<{
+      active_socket_id: string | null;
+    }>(stub, "SELECT active_socket_id FROM sandbox");
+    expect(activeSocketId).toMatch(/^sbws-/);
+
+    const toolCall = (callId: string) =>
+      JSON.stringify({
+        type: "tool_call",
+        tool: "read_file",
+        args: { path: "/src/main.ts" },
+        callId,
+        messageId: "msg-detach",
+        sandboxId: SANDBOX_ID,
+        timestamp: Date.now() / 1000,
+      });
+
+    await runInSessionDO(stub, async (instance: SessionDO, state) => {
+      const [serverWs] = openSandboxSockets(state);
+      expect(serverWs).toBeDefined();
+      const { wsManager } = componentsOf(instance);
+
+      wsManager.detachSandboxSocket(1000, "Heartbeat stale");
+
+      // The row was revoked, so a frame that was already in flight from the
+      // detached socket is refused even though the socket is still tagged.
+      await instance.webSocketMessage(serverWs, toolCall("call-detached"));
+      expect(wsManager.getSandboxSocket()).toBeNull();
+
+      // A restart that still finds the detached socket open, tagged with the
+      // identity the row named before, must not re-adopt it.
+      const pair = new WebSocketPair();
+      state.acceptWebSocket(pair[1], ["sandbox", `sid:${SANDBOX_ID}`, `socket:${activeSocketId}`]);
+      pair[0].accept();
+      expect(wsManager.getSandboxSocket()).toBeNull();
+      await instance.webSocketMessage(pair[1], toolCall("call-restored-detached"));
+    });
+
+    const [{ active_socket_id: revoked }] = await queryDO<{ active_socket_id: string | null }>(
+      stub,
+      "SELECT active_socket_id FROM sandbox"
+    );
+    expect(revoked).toBe("");
+    const events = await queryDO<{ data: string }>(
+      stub,
+      "SELECT data FROM events WHERE type = ?",
+      "tool_call"
+    );
+    expect(events).toHaveLength(0);
+  });
+
+  it("the runtime's ready event, not the connect, sets status to ready", async () => {
     const name = `ws-sandbox-ready-${Date.now()}`;
     const { stub } = await initNamedSession(name);
-    // Model the production boot sequence: the sandbox connects while the
-    // lifecycle is still in "connecting", and the WS accept flips it to ready.
+    // Model the production boot sequence: the bridge connects while the
+    // lifecycle is still in "connecting", ahead of the repository boot, and
+    // its ready event is what flips the row.
     await seedSandboxAuth(stub, {
       authToken: SANDBOX_TOKEN,
       sandboxId: SANDBOX_ID,
@@ -285,6 +456,9 @@ describe("Sandbox WebSocket (via SELF.fetch)", () => {
     });
     expect(ws).not.toBeNull();
     ws!.accept();
+    ws!.send(
+      JSON.stringify({ type: "ready", sandboxId: SANDBOX_ID, timestamp: Date.now() / 1000 })
+    );
     await waitForSandboxStatus(stub, "ready");
 
     const stateRes = await stub.fetch("http://internal/internal/state");
@@ -333,16 +507,30 @@ describe("Sandbox WebSocket (via SELF.fetch)", () => {
     sandboxWs!.accept();
 
     const messages = await collector;
-    expect(messages.slice(-2).map((message) => message.type)).toEqual([
-      "sandbox_status",
-      "sandbox_access_changed",
-    ]);
+    // The row was already `connecting`, so attach publishes access alone;
+    // `sandbox_status: ready` waits for the runtime's ready event, and so
+    // does the access endpoint.
+    expect(messages.slice(-1).map((message) => message.type)).toEqual(["sandbox_access_changed"]);
+    expect(messages.map((message) => message.type)).not.toContain("sandbox_status");
+    const booting = await stub.fetch("http://internal/internal/sandbox-access");
+    expect(booting.status).toBe(409);
+
+    const readyBroadcast = collectMessages(clientWs, {
+      until: (message) => message.type === "sandbox_status" && message.status === "ready",
+    });
+    sandboxWs!.send(
+      JSON.stringify({ type: "ready", sandboxId: SANDBOX_ID, timestamp: Date.now() / 1000 })
+    );
+    await waitForSandboxStatus(stub, "ready");
+    expect((await readyBroadcast).at(-1)).toEqual({ type: "sandbox_status", status: "ready" });
     const accessResponse = await stub.fetch("http://internal/internal/sandbox-access");
     expect(accessResponse.status).toBe(200);
     await expect(accessResponse.json()).resolves.toEqual({
       codeServer: { url: "https://code.test", password: "code-secret" },
       vnc: { url: "https://vnc.test", password: "vnc-secret" },
       ttyd: { url: "https://terminal.test", token: "terminal-token" },
+      tunnelUrls: null,
+      sandboxDashboardUrl: null,
     });
 
     sandboxWs!.close();
@@ -381,9 +569,12 @@ describe("Sandbox WebSocket (via SELF.fetch)", () => {
     replacementSandboxWs!.accept();
 
     const messages = await collector;
-    expect(
-      messages.filter((message) => message.type === "sandbox_status" && message.status === "ready")
-    ).toHaveLength(2);
+    // The first attach moves the reservation to `connecting`; the replacement
+    // finds it there already. Neither publishes ready, and neither publishes
+    // access while provider startup is still persisting it.
+    expect(messages.filter((message) => message.type === "sandbox_status")).toEqual([
+      { type: "sandbox_status", status: "connecting" },
+    ]);
     expect(messages).not.toContainEqual({ type: "sandbox_access_changed" });
 
     replacementSandboxWs!.close();
@@ -496,8 +687,53 @@ describe("Sandbox WebSocket (via SELF.fetch)", () => {
     });
     expect(ws).not.toBeNull();
     ws!.accept();
+    // Attach must not cut the admitted bridge off: the row leaves `failed`
+    // for `connecting` at attach, so the registry does not close its socket.
+    await waitForSandboxStatus(stub, "connecting");
+    const promptDelivery = collectMessages(ws!, {
+      until: (message) => message.type === "prompt",
+    });
+    ws!.send(
+      JSON.stringify({ type: "ready", sandboxId: SANDBOX_ID, timestamp: Date.now() / 1000 })
+    );
     await waitForSandboxStatus(stub, "ready");
+
+    // The healed sandbox, not a replacement, serves the next prompt.
+    const enqueue = await stub.fetch("http://internal/internal/prompt", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ content: "Still here?", authorId: "user-1", source: "web" }),
+    });
+    expect(enqueue.status).toBe(200);
+    const delivered = await promptDelivery;
+    expect(delivered.find((message) => message.type === "prompt")).toEqual(
+      expect.objectContaining({ content: "Still here?" })
+    );
+    expect(ws!.readyState).toBe(WebSocket.OPEN);
     ws!.close();
+  });
+
+  it("refuses a fenced generation's bridge at the door", async () => {
+    const name = `ws-sandbox-fenced-${Date.now()}`;
+    const { stub } = await initNamedSession(name);
+    await seedSandboxAuth(stub, {
+      authToken: SANDBOX_TOKEN,
+      sandboxId: SANDBOX_ID,
+      status: "failed",
+    });
+    // The boot budget fences by revoking the hash; the runtime's token no
+    // longer matches anything, so admission fails before any state check.
+    await runInSessionDO(stub, (instance: SessionDO) => {
+      componentsOf(instance).sandboxRepository.fenceSandboxGeneration();
+    });
+
+    const { ws, response } = await openSandboxWs(name, {
+      authToken: SANDBOX_TOKEN,
+      sandboxId: SANDBOX_ID,
+    });
+
+    expect(response.status).toBe(401);
+    expect(ws).toBeNull();
   });
 
   it("sandbox WS message is stored as event", async () => {
@@ -539,6 +775,64 @@ describe("Sandbox WebSocket (via SELF.fetch)", () => {
       return data.callId === "call-ws-1";
     });
     expect(matching.length).toBeGreaterThanOrEqual(1);
+
+    ws!.close();
+  });
+
+  hostContract("host.socket-ack-redelivery", async () => {
+    const name = `ws-sandbox-ack-redelivery-${Date.now()}`;
+    const { stub } = await initNamedSession(name);
+    await seedSandboxAuth(stub, { authToken: SANDBOX_TOKEN, sandboxId: SANDBOX_ID });
+    const [{ id: authorId }] = await queryDO<{ id: string }>(
+      stub,
+      "SELECT id FROM participants LIMIT 1"
+    );
+    await seedMessage(stub, {
+      id: "message-ack-redelivery",
+      authorId,
+      content: "Finish once",
+      source: "web",
+      status: "processing",
+      createdAt: 100,
+      startedAt: 200,
+    });
+    const { ws } = await openSandboxWs(name, {
+      authToken: SANDBOX_TOKEN,
+      sandboxId: SANDBOX_ID,
+    });
+    expect(ws).not.toBeNull();
+    ws!.accept();
+
+    const event = {
+      type: "execution_complete",
+      messageId: "message-ack-redelivery",
+      success: true,
+      sandboxId: SANDBOX_ID,
+      timestamp: Date.now() / 1000,
+      ackId: "ack-redelivery-1",
+    };
+    for (let delivery = 0; delivery < 2; delivery += 1) {
+      const ack = collectMessages(ws!, {
+        until: (message) => message.type === "ack" && message.ackId === event.ackId,
+      });
+      ws!.send(JSON.stringify(event));
+      expect(await ack).toContainEqual({ type: "ack", ackId: event.ackId });
+    }
+
+    expect(
+      await queryDO<{ status: string; completed_at: number }>(
+        stub,
+        "SELECT status, completed_at FROM messages WHERE id = ?",
+        event.messageId
+      )
+    ).toMatchObject([{ status: "completed" }]);
+    expect(
+      await queryDO<{ count: number }>(
+        stub,
+        "SELECT COUNT(*) AS count FROM events WHERE id = ?",
+        `execution_complete:${event.messageId}`
+      )
+    ).toEqual([{ count: 1 }]);
 
     ws!.close();
   });
@@ -611,8 +905,7 @@ describe("Sandbox WebSocket (via SELF.fetch)", () => {
       userId: "user-replay",
     });
     const subscribed = replayMessages.find((message) => message.type === "subscribed") as
-      | { timeline: { events: Array<{ event: unknown }> } }
-      | undefined;
+      { timeline: { events: Array<{ event: unknown }> } } | undefined;
     expect(subscribed?.timeline.events.map(({ event }) => event)).toEqual([
       before,
       compacted,

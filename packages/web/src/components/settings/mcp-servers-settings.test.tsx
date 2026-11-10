@@ -12,6 +12,7 @@ expect.extend(matchers);
 
 const mocks = vi.hoisted(() => ({
   mutate: vi.fn(),
+  permissions: new Set<string>(["mcp_servers.read", "mcp_servers.manage"]),
   updateMcpServer: vi.fn(),
   updateMcpServerCredentials: vi.fn(),
   governanceStatus: undefined as
@@ -23,15 +24,18 @@ const mocks = vi.hoisted(() => ({
       },
 }));
 
+vi.mock("@/hooks/use-current-user-authorization", () => ({
+  useCurrentUserAuthorization: () => ({
+    hasPermission: (permission: string) => mocks.permissions.has(permission),
+  }),
+}));
+
 vi.mock("sonner", () => ({ toast: { success: vi.fn(), error: vi.fn() } }));
 vi.mock("@/hooks/use-repos", () => ({
   useRepos: () => ({ repos: [], loading: false }),
 }));
 vi.mock("@/hooks/use-environments", () => ({
   useEnvironments: () => ({ environments: [], loading: false }),
-}));
-vi.mock("@/hooks/use-platform-role", () => ({
-  usePlatformRole: () => ({ canWriteCatalog: true }),
 }));
 vi.mock("@/hooks/use-mcp-servers", () => ({
   useMcpServers: () => ({ servers, loading: false, mutate: mocks.mutate }),
@@ -82,10 +86,29 @@ afterEach(() => {
   cleanup();
   vi.clearAllMocks();
   mocks.governanceStatus = undefined;
+  mocks.permissions = new Set(["mcp_servers.read", "mcp_servers.manage"]);
   delete servers[0].sourceKind;
 });
 
 describe("McpServersSettings", () => {
+  it("shows mutation controls to a user granted mcp_servers.manage", () => {
+    render(<McpServersSettings />);
+    expect(screen.getByRole("button", { name: "Add Server" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /Server A/ })).toBeEnabled();
+    expect(screen.getAllByRole("button", { name: "Delete" })).not.toHaveLength(0);
+    for (const control of screen.getAllByRole("switch")) expect(control).toBeEnabled();
+  });
+
+  it("withholds mutation controls without mcp_servers.manage", () => {
+    mocks.permissions = new Set(["mcp_servers.read"]);
+    render(<McpServersSettings />);
+    expect(screen.getByText("Server A")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Add Server" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /Server A/ })).toBeDisabled();
+    expect(screen.queryByRole("button", { name: "Delete" })).not.toBeInTheDocument();
+    for (const control of screen.getAllByRole("switch")) expect(control).toBeDisabled();
+  });
+
   it("renders environment-only scope instead of calling the server global", () => {
     render(<McpServersSettings />);
 

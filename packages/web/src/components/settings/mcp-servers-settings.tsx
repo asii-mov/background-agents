@@ -1,5 +1,12 @@
 "use client";
 
+import {
+  Select,
+  SelectTrigger,
+  SelectValue,
+  SelectContent,
+  SelectItem,
+} from "@/components/ui/select";
 import { useState, useCallback, type ClipboardEvent } from "react";
 import { toast } from "sonner";
 import type {
@@ -20,7 +27,6 @@ import {
 } from "@/hooks/use-mcp-servers";
 import { useRepos } from "@/hooks/use-repos";
 import { useEnvironments } from "@/hooks/use-environments";
-import { usePlatformRole } from "@/hooks/use-platform-role";
 import { syncGovernanceCatalog, useGovernanceCatalog } from "@/hooks/use-governance-catalog";
 import { parseMaybeEnvContent } from "@/lib/env-paste";
 import { PlusIcon, TerminalIcon, GlobeIcon, ChevronRightIcon } from "@/components/ui/icons";
@@ -40,6 +46,7 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
+import { useCurrentUserAuthorization } from "@/hooks/use-current-user-authorization";
 
 type ScopeMode = "global" | "selected";
 type Editor =
@@ -400,18 +407,23 @@ function McpServerForm({
         <Label className="mb-1.5" htmlFor={`mcp-lifecycle-${radioPrefix}`}>
           Lifecycle
         </Label>
-        <select
-          id={`mcp-lifecycle-${radioPrefix}`}
+        <Select
           value={form.lifecycle}
-          onChange={(event) =>
-            setForm({ ...form, lifecycle: event.target.value as McpServerLifecycle })
-          }
-          className="h-9 w-full rounded-sm border border-border bg-background px-3 text-sm text-foreground"
+          onValueChange={(value) => setForm({ ...form, lifecycle: value as McpServerLifecycle })}
         >
-          <option value="development">Development — catalogued but not installed</option>
-          <option value="approved">Approved — installed in matching sessions</option>
-          <option value="deprecated">Deprecated — retained but not installed</option>
-        </select>
+          <SelectTrigger
+            id={`mcp-lifecycle-${radioPrefix}`}
+            className="h-9 w-full rounded-sm border border-border bg-background px-3 text-sm text-foreground"
+          >
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            {" "}
+            <SelectItem value="development">Development — catalogued but not installed</SelectItem>
+            <SelectItem value="approved">Approved — installed in matching sessions</SelectItem>
+            <SelectItem value="deprecated">Deprecated — retained but not installed</SelectItem>
+          </SelectContent>
+        </Select>
         {form.lifecycle === "approved" && form.type === "local" && (
           <p className="mt-1 text-xs text-muted-foreground">
             npx package names must use an exact version such as @scope/server@1.2.3.
@@ -529,8 +541,12 @@ function McpServerForm({
   );
 }
 
+/**
+ * Lists workspace MCP servers and exposes create, edit, and delete controls only to authorized users.
+ */
 export function McpServersSettings() {
-  const { canWriteCatalog } = usePlatformRole();
+  const { hasPermission } = useCurrentUserAuthorization();
+  const canManage = hasPermission("mcp_servers.manage");
   const { servers, loading, mutate } = useMcpServers();
   const { repos, loading: loadingRepos } = useRepos();
   const { environments, loading: loadingEnvironments } = useEnvironments();
@@ -692,7 +708,7 @@ export function McpServersSettings() {
     <div>
       <div className="flex items-center justify-between mb-1">
         <h2 className="text-xl font-semibold text-foreground">MCP Servers</h2>
-        {canWriteCatalog && !gitManaged && (
+        {canManage && !gitManaged && (
           <Button onClick={startNew} variant="outline" size="sm">
             <span className="inline-flex items-center gap-1">
               <PlusIcon className="w-3.5 h-3.5" />
@@ -714,7 +730,7 @@ export function McpServersSettings() {
               ? ` The latest sync failed; the last good catalog remains active: ${governance.lastError}`
               : ""}
           </p>
-          {canWriteCatalog && (
+          {canManage && (
             <Button variant="outline" size="sm" onClick={syncGitCatalog}>
               Sync now
             </Button>
@@ -784,8 +800,9 @@ export function McpServersSettings() {
                   <button
                     type="button"
                     className="flex items-center gap-3 min-w-0 cursor-pointer text-left"
+                    disabled={!canManage}
                     onClick={() => {
-                      if (canWriteCatalog) startEdit(server);
+                      if (canManage) startEdit(server);
                     }}
                   >
                     <ChevronRightIcon
@@ -827,10 +844,10 @@ export function McpServersSettings() {
                     <Switch
                       checked={server.enabled}
                       onCheckedChange={() => handleToggle(server)}
-                      disabled={!canWriteCatalog || gitManaged}
+                      disabled={!canManage || gitManaged}
                       aria-label={server.enabled ? "Disable" : "Enable"}
                     />
-                    {canWriteCatalog && !gitManaged && (
+                    {canManage && !gitManaged && (
                       <button
                         type="button"
                         onClick={() => setDeleteTarget(server.id)}
@@ -893,7 +910,7 @@ export function McpServersSettings() {
       )}
 
       {/* Delete confirmation dialog */}
-      <AlertDialog open={!!deleteTarget} onOpenChange={() => setDeleteTarget(null)}>
+      <AlertDialog open={canManage && !!deleteTarget} onOpenChange={() => setDeleteTarget(null)}>
         <AlertDialogContent>
           <AlertDialogHeader>
             <AlertDialogTitle>Delete MCP server</AlertDialogTitle>

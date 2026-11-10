@@ -1,0 +1,11 @@
+{
+  // Tests and the live smoke run under Node.
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "types": ["node"],
+    // The guard tests bundle the guard with build.mjs, exactly as the broker build does.
+    "allowJs": true
+  },
+  "include": ["test/**/*.ts", "scripts/**/*.ts", "vitest.config.ts"],
+  "exclude": ["node_modules", "dist"]
+}

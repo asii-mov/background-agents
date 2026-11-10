@@ -19,8 +19,13 @@ output "deployment_id" {
 }
 
 output "worker_url" {
-  description = "The workers.dev URL for the worker: https://<worker_name>.<worker_subdomain>.workers.dev"
-  value       = "https://${cloudflare_worker.this.name}.${var.worker_subdomain}.workers.dev"
+  description = "The workers.dev URL for the worker: https://<worker_name>.<worker_subdomain>.workers.dev, or null when workers.dev is off"
+  value       = var.workers_dev_enabled ? "https://${cloudflare_worker.this.name}.${var.worker_subdomain}.workers.dev" : null
+}
+
+output "subdomain" {
+  description = "The Worker's workers.dev and preview URL settings as sent to Cloudflare."
+  value       = cloudflare_worker.this.subdomain
 }
 
 output "custom_domain" {
@@ -30,10 +35,20 @@ output "custom_domain" {
 
 output "plain_text_binding_names" {
   description = "Names of configured plain-text bindings."
-  value       = [for binding in var.plain_text_bindings : binding.name]
+  value       = keys(var.plain_text_bindings)
+}
+
+output "plain_text_bindings" {
+  description = "Configured plain-text bindings as a name => value map, so a configuration test can assert the value a binding actually carries."
+  value       = { for name, binding in var.plain_text_bindings : name => binding.value }
 }
 
 output "secret_binding_names" {
   description = "Names of configured secret bindings; secret values are not exposed."
-  value       = nonsensitive([for binding in var.secrets : binding.name])
+  value       = nonsensitive(keys(var.secrets))
+}
+
+output "dispatch_namespace_bindings" {
+  description = "Configured dispatch namespace bindings as a name => namespace map."
+  value       = { for name, binding in var.dispatch_namespaces : name => binding.namespace }
 }

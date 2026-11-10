@@ -1,3 +1,4 @@
+import type { ObjectStorage } from "../storage/object-storage";
 import type { ResolvedMcpServer } from "./npm-resolver";
 
 const MAX_MCP_ARTIFACT_BYTES = 100 * 1024 * 1024;
@@ -14,16 +15,7 @@ export interface BuiltMcpArtifact {
   executable: string;
 }
 
-interface McpArtifactStorage {
-  put(
-    key: string,
-    value: ArrayBuffer,
-    options: {
-      httpMetadata: { contentType: string };
-      customMetadata: Record<string, string>;
-    }
-  ): Promise<unknown>;
-}
+type McpArtifactStorage = Pick<ObjectStorage, "put">;
 
 function toHex(bytes: ArrayBuffer): string {
   return Array.from(new Uint8Array(bytes), (byte) => byte.toString(16).padStart(2, "0")).join("");
@@ -101,12 +93,7 @@ export async function buildAndStoreMcpArtifact(
   const sha256 = toHex(await crypto.subtle.digest("SHA-256", artifact));
   const key = `mcp-artifacts/${sha256}.tar.gz`;
   await bucket.put(key, artifact, {
-    httpMetadata: { contentType: "application/gzip" },
-    customMetadata: {
-      package: server.packageName,
-      version: server.resolvedVersion,
-      executable: server.executable,
-    },
+    contentType: "application/gzip",
   });
   return { key, sha256, executable: server.executable };
 }

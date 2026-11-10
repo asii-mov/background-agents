@@ -33,15 +33,36 @@ export const openInspectFeatureDirectory = {
   schemaVersion: 1,
   features: [
     {
+      id: "upstream-workspace",
+      title: "Workspace discovery and administration",
+      aliases: ["teams", "roles", "memories", "audit"],
+      userRoutes: ["/sessions", "/teams", "/teams/:slug", "/settings/teams/:id"],
+      owners: { ui: ["packages/web/src/components/settings/settings-registry.ts"] },
+      subfeatures: [
+        ...["audit-log", "memories", "shared-memories", "teams", "workspace"].map(
+          (settingsTab) => ({
+            id: `upstream-workspace.${settingsTab}`,
+            title: settingsTab,
+            settingsTab,
+            coverage: {
+              kind: "uncovered",
+              reason:
+                "New upstream surface. The retained fork browser suite does not exercise it yet.",
+            },
+          })
+        ),
+      ],
+    },
+    {
       id: "sessions",
       title: "Core sessions",
       aliases: ["home", "prompt", "agent", "websocket", "terminal", "diff", "pull request", "pr"],
       userRoutes: ["/", "/session/:id"],
       owners: {
         ui: [
-          "packages/web/src/app/(app)/page.tsx",
-          "packages/web/src/app/(app)/session/[id]/layout.tsx",
-          "packages/web/src/app/(app)/session/[id]/page.tsx",
+          "packages/web/src/app/(app)/(sidebar)/page.tsx",
+          "packages/web/src/app/(app)/(sidebar)/session/[id]/layout.tsx",
+          "packages/web/src/app/(app)/(sidebar)/session/[id]/page.tsx",
           "packages/web/src/components/session-desktop-layout.tsx",
           "packages/web/src/components/session-timeline.tsx",
         ],
@@ -53,7 +74,7 @@ export const openInspectFeatureDirectory = {
         backend: [
           "packages/control-plane/src/routes/sessions.ts",
           "packages/control-plane/src/routes/session-prompt.ts",
-          "packages/control-plane/src/session/durable-object.ts",
+          "packages/control-plane/src/session/components.ts",
         ],
       },
       subfeatures: [
@@ -188,7 +209,7 @@ export const openInspectFeatureDirectory = {
       ],
       owners: {
         ui: [
-          "packages/web/src/app/(app)/automations/page.tsx",
+          "packages/web/src/app/(app)/(sidebar)/automations/page.tsx",
           "packages/web/src/components/automations/automations-list.tsx",
         ],
         bff: ["packages/web/src/app/api/automations/route.ts"],
@@ -200,7 +221,7 @@ export const openInspectFeatureDirectory = {
           title: "Trigger an automation and show its completed run",
           sources: {
             ui: [
-              "packages/web/src/app/(app)/automations/page.tsx",
+              "packages/web/src/app/(app)/(sidebar)/automations/page.tsx",
               "packages/web/src/components/automations/automations-list.tsx",
               "packages/web/src/components/automations/execution-activity.tsx",
             ],
@@ -220,8 +241,8 @@ export const openInspectFeatureDirectory = {
           title: "Create and edit an automation",
           sources: {
             ui: [
-              "packages/web/src/app/(app)/automations/new/page.tsx",
-              "packages/web/src/app/(app)/automations/[id]/edit/page.tsx",
+              "packages/web/src/app/(app)/(sidebar)/automations/new/page.tsx",
+              "packages/web/src/app/(app)/(sidebar)/automations/[id]/edit/page.tsx",
               "packages/web/src/components/automations/automation-form.tsx",
             ],
           },
@@ -230,7 +251,7 @@ export const openInspectFeatureDirectory = {
             reason: "The form has component and control-plane tests but no Playwright test.",
             proofs: [
               "packages/web/src/components/automations/automation-form.test.tsx",
-              "packages/control-plane/src/routes/automations.test.ts",
+              "packages/control-plane/test/integration/automation-authorization.test.ts",
             ],
           },
         },
@@ -239,7 +260,7 @@ export const openInspectFeatureDirectory = {
           title: "Choose an automation template",
           sources: {
             ui: [
-              "packages/web/src/app/(app)/automations/templates/page.tsx",
+              "packages/web/src/app/(app)/(sidebar)/automations/templates/page.tsx",
               "packages/web/src/components/automations/template-gallery.tsx",
             ],
           },
@@ -254,7 +275,7 @@ export const openInspectFeatureDirectory = {
           title: "Search, paginate, pause, resume, and delete automations",
           sources: {
             ui: [
-              "packages/web/src/app/(app)/automations/page.tsx",
+              "packages/web/src/app/(app)/(sidebar)/automations/page.tsx",
               "packages/web/src/components/automations/automations-list.tsx",
             ],
           },
@@ -262,7 +283,7 @@ export const openInspectFeatureDirectory = {
             kind: "backend-only",
             reason: "Component tests cover list management, but Playwright does not.",
             proofs: [
-              "packages/web/src/app/(app)/automations/page.test.tsx",
+              "packages/web/src/app/(app)/(sidebar)/automations/page.test.tsx",
               "packages/web/src/components/automations/automations-list.test.tsx",
             ],
           },
@@ -272,7 +293,7 @@ export const openInspectFeatureDirectory = {
           title: "Inspect automation detail and invocation history",
           sources: {
             ui: [
-              "packages/web/src/app/(app)/automations/[id]/page.tsx",
+              "packages/web/src/app/(app)/(sidebar)/automations/[id]/page.tsx",
               "packages/web/src/components/automations/run-history.tsx",
             ],
             bff: ["packages/web/src/app/api/automations/[id]/invocations/route.ts"],
@@ -316,12 +337,13 @@ export const openInspectFeatureDirectory = {
       userRoutes: ["/analytics"],
       owners: {
         ui: [
-          "packages/web/src/app/(app)/analytics/page.tsx",
+          "packages/web/src/app/(app)/(sidebar)/analytics/page.tsx",
           "packages/web/src/components/session-sidebar.tsx",
           "packages/web/src/hooks/use-analytics.ts",
           "packages/web/src/components/analytics",
         ],
         bff: [
+          "packages/web/src/app/api/analytics/dashboard/route.ts",
           "packages/web/src/app/api/analytics/summary/route.ts",
           "packages/web/src/app/api/analytics/timeseries/route.ts",
           "packages/web/src/app/api/analytics/breakdown/route.ts",
@@ -351,7 +373,7 @@ export const openInspectFeatureDirectory = {
           coverage: {
             kind: "backend-only",
             reason: "The page component proves sorting, but Playwright does not click a header.",
-            proofs: ["packages/web/src/app/(app)/analytics/page.test.tsx"],
+            proofs: ["packages/web/src/app/(app)/(sidebar)/analytics/page.test.tsx"],
           },
         },
         {
@@ -361,7 +383,7 @@ export const openInspectFeatureDirectory = {
             kind: "backend-only",
             reason:
               "The page component proves the error state; Playwright uses successful fixtures.",
-            proofs: ["packages/web/src/app/(app)/analytics/page.test.tsx"],
+            proofs: ["packages/web/src/app/(app)/(sidebar)/analytics/page.test.tsx"],
           },
         },
       ],
@@ -754,7 +776,7 @@ export const openInspectFeatureDirectory = {
         },
         {
           id: "settings.sandbox-member-denial",
-          title: "Show the server denial when a member changes the egress policy",
+          title: "Withhold network controls from members without integration permission",
           sources: {
             ui: ["packages/web/src/components/settings/sandbox-settings.tsx"],
             backend: ["packages/control-plane/src/routes/integration-settings.ts"],
@@ -763,7 +785,7 @@ export const openInspectFeatureDirectory = {
             kind: "browser-covered",
             test: {
               file: "packages/web/e2e/settings-governance.spec.ts",
-              title: "shows the server denial when a member changes sandbox network policy",
+              title: "withholds sandbox management from a member without integration permission",
             },
             proofs: ["packages/control-plane/test/integration/integration-settings.test.ts"],
           },
@@ -786,9 +808,9 @@ export const openInspectFeatureDirectory = {
           title: "Resolve network policy and reject unsupported providers at sandbox launch",
           sources: {
             backend: [
-              "packages/control-plane/src/sandbox/lifecycle/manager.ts",
+              "packages/control-plane/src/sandbox/lifecycle/launch-context.ts",
               "packages/control-plane/src/sandbox/providers/modal-provider.ts",
-              "packages/modal-infra/src/sandbox/manager.py",
+              "packages/modal-infra/src/sandbox/launch_policy.py",
             ],
           },
           coverage: {
@@ -796,9 +818,9 @@ export const openInspectFeatureDirectory = {
             reason:
               "The loopback verifier never launches Modal or another external sandbox provider.",
             proofs: [
-              "packages/control-plane/src/sandbox/lifecycle/manager.test.ts",
-              "packages/control-plane/src/sandbox/providers/modal-provider.test.ts",
-              "packages/modal-infra/tests/test_sandbox_resources.py",
+              "packages/control-plane/src/sandbox/lifecycle/governance.test.ts",
+              "packages/modal-infra/tests/test_launch_policy.py",
+              "packages/modal-infra/tests/test_sandbox_launch.py",
             ],
           },
         },
@@ -1082,6 +1104,72 @@ export const openInspectFeatureDirectory = {
           },
         },
         {
+          id: "settings.apps",
+          title: "Browse the apps directory and manage only your own apps as a member",
+          settingsTab: "apps",
+          sources: {
+            ui: [
+              "packages/web/src/components/settings/apps-settings.tsx",
+              "packages/web/src/components/settings/settings-registry.ts",
+            ],
+            bff: [
+              "packages/web/src/app/api/apps/route.ts",
+              "packages/web/src/app/api/apps/[name]/route.ts",
+              "packages/web/src/app/api/apps/[name]/takedown/route.ts",
+              "packages/web/src/app/api/apps/[name]/release-hold/route.ts",
+            ],
+            backend: ["packages/control-plane/src/routes/apps.ts"],
+          },
+          coverage: {
+            kind: "browser-covered",
+            test: {
+              file: "packages/web/e2e/settings-apps.spec.ts",
+              title: "shows a member their own apps with actions and colleagues' apps read-only",
+            },
+            proofs: [
+              "packages/web/src/components/settings/apps-settings.test.tsx",
+              "packages/web/src/components/settings/settings-registry.test.ts",
+              "packages/web/src/app/api/apps/routes.test.ts",
+              "packages/control-plane/test/integration/apps.test.ts",
+            ],
+          },
+        },
+        {
+          id: "settings.apps-admin-data",
+          title:
+            "Take down and release apps, approve schema changes, set secrets and restore app data",
+          sources: {
+            ui: ["packages/web/src/components/settings/apps-settings.tsx"],
+            bff: [
+              "packages/web/src/app/api/apps/[name]/data/route.ts",
+              "packages/web/src/app/api/apps/[name]/data/operations/route.ts",
+              "packages/web/src/app/api/apps/[name]/data/secrets/route.ts",
+              "packages/web/src/app/api/apps/[name]/data/secrets/[key]/route.ts",
+              "packages/web/src/app/api/apps/[name]/data/migrations/approve/route.ts",
+              "packages/web/src/app/api/apps/[name]/data/restore/route.ts",
+              "packages/web/src/app/api/apps/[name]/data/classification/route.ts",
+            ],
+            backend: [
+              "packages/control-plane/src/routes/app-data.ts",
+              "packages/control-plane/src/app-data/service.ts",
+            ],
+          },
+          coverage: {
+            kind: "browser-covered",
+            test: {
+              file: "packages/web/e2e/settings-apps.spec.ts",
+              title:
+                "lets an administrator take down, release, approve, set a secret and restore app data",
+            },
+            proofs: [
+              "packages/web/src/components/settings/apps-settings.test.tsx",
+              "packages/web/src/app/api/apps/routes.test.ts",
+              "packages/control-plane/test/integration/app-data.test.ts",
+              "packages/control-plane/src/app-data/service.test.ts",
+            ],
+          },
+        },
+        {
           id: "settings.appsec",
           title:
             "Role assignment, pipeline creation, and repository criticality for administrators",
@@ -1090,7 +1178,7 @@ export const openInspectFeatureDirectory = {
             ui: [
               "packages/web/src/components/settings/appsec-governance-settings.tsx",
               "packages/web/src/components/settings/approved-components-settings.tsx",
-              "packages/web/src/hooks/use-platform-role.ts",
+              "packages/web/src/components/settings/governance-api.ts",
             ],
             bff: [
               "packages/web/src/app/api/security-pipelines/route.ts",
@@ -1126,16 +1214,102 @@ export const openInspectFeatureDirectory = {
         },
         {
           id: "settings.appsec-member-visibility",
-          title: "Hide AppSec catalog writes and platform ownership from members",
+          title: "Hide the AppSec tab and every governance read from members",
+          sources: {
+            ui: ["packages/web/src/components/settings/settings-registry.ts"],
+          },
           coverage: {
             kind: "browser-covered",
             test: {
               file: "packages/web/e2e/settings-governance.spec.ts",
-              title: "hides AppSec catalogue writes from members",
+              title: "gives members no AppSec entry and no governance data from a direct link",
             },
             proofs: [
-              "packages/control-plane/src/router.policy.test.ts",
-              "packages/control-plane/src/db/platform-roles.test.ts",
+              "packages/web/src/components/settings/settings-registry.test.ts",
+              "packages/control-plane/test/integration/governance-routes.test.ts",
+            ],
+          },
+        },
+        {
+          id: "settings.appsec-stack-policy",
+          title:
+            "Grade technologies per category, switch advise or block, and preview what agents are told",
+          sources: {
+            ui: [
+              "packages/web/src/components/settings/approved-components-settings.tsx",
+              "packages/web/src/components/settings/approved-components-model.ts",
+            ],
+            bff: [
+              "packages/web/src/app/api/component-categories/route.ts",
+              "packages/web/src/app/api/component-categories/[id]/route.ts",
+              "packages/web/src/app/api/stack-policy/preview/route.ts",
+              "packages/web/src/app/api/stack-policy/export/route.ts",
+            ],
+            backend: [
+              "packages/control-plane/src/routes/approved-components.ts",
+              "packages/control-plane/src/routes/stack-policy.ts",
+              "packages/control-plane/src/stack-policy/compile.ts",
+            ],
+          },
+          coverage: {
+            kind: "browser-covered",
+            test: {
+              file: "packages/web/e2e/settings-stack-policy.spec.ts",
+              title:
+                "lets an administrator flip web frontend to block and see what agents are told change",
+            },
+            proofs: [
+              "packages/web/src/components/settings/approved-components-settings.test.tsx",
+              "packages/web/src/components/settings/approved-components-model.test.ts",
+              "packages/web/src/app/api/stack-policy/routes.test.ts",
+              "packages/control-plane/test/integration/governance-routes.test.ts",
+            ],
+          },
+        },
+        {
+          id: "settings.appsec-stack-adoption",
+          title: "Track stack adoption per category and repository, and inventory app data",
+          sources: {
+            ui: ["packages/web/src/components/settings/stack-adoption-settings.tsx"],
+            bff: [
+              "packages/web/src/app/api/stack-inventory/route.ts",
+              "packages/web/src/app/api/stack-inventory/rollup/route.ts",
+              "packages/web/src/app/api/app-data/inventory/route.ts",
+            ],
+            backend: [
+              "packages/control-plane/src/routes/stack-policy.ts",
+              "packages/control-plane/src/routes/app-data.ts",
+            ],
+          },
+          coverage: {
+            kind: "browser-covered",
+            test: {
+              file: "packages/web/e2e/settings-stack-policy.spec.ts",
+              title: "shows an administrator how repositories follow the standards",
+            },
+            proofs: ["packages/web/src/components/settings/stack-adoption-settings.test.tsx"],
+          },
+        },
+        {
+          id: "sessions.required-skills-hidden",
+          title: "Keep required governance skills out of the composer, selector and sidebar",
+          sources: {
+            ui: [
+              "packages/web/src/components/prompt-skill-autocomplete.tsx",
+              "packages/web/src/components/session-skill-selector.tsx",
+              "packages/web/src/components/sidebar/managed-skills-section.tsx",
+            ],
+          },
+          coverage: {
+            kind: "browser-covered",
+            test: {
+              file: "packages/web/e2e/settings-stack-policy.spec.ts",
+              title: "keeps required governance skills out of a member's composer and sidebar",
+            },
+            proofs: [
+              "packages/web/src/components/prompt-skill-autocomplete.test.tsx",
+              "packages/web/src/components/session-skill-selector.test.tsx",
+              "packages/web/src/components/sidebar/managed-skills-section.test.tsx",
             ],
           },
         },
@@ -1177,10 +1351,10 @@ export const openInspectFeatureDirectory = {
             reason:
               "The browser fixture records pipeline definitions but never executes a sandbox.",
             proofs: [
-              "packages/control-plane/src/sandbox/lifecycle/manager.test.ts",
+              "packages/control-plane/src/sandbox/lifecycle/governance.test.ts",
               "packages/sandbox-runtime/tests/test_security_pipeline.py",
               "packages/sandbox-runtime/tests/test_bridge_sse.py",
-              "packages/sandbox-runtime/tests/test_bridge_push.py",
+              "packages/sandbox-runtime/tests/test_push_operation.py",
             ],
           },
         },
@@ -1197,7 +1371,7 @@ export const openInspectFeatureDirectory = {
           coverage: {
             kind: "backend-only",
             reason:
-              "Component, control-plane, and agent-tool tests exist, but Playwright receives an empty approved-component catalog.",
+              "Playwright renders the seeded catalogue, but creating and editing components is covered only by component and control-plane tests.",
             proofs: [
               "packages/web/src/components/settings/approved-components-settings.test.tsx",
               "packages/control-plane/test/integration/approved-components.test.ts",

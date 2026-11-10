@@ -3,12 +3,11 @@ import { ImageBuildStore, type ImageBuildRegistration } from "../db/image-builds
 import { createLogger } from "../logger";
 import type { Env } from "../types";
 import type { SqlDatabase } from "../db/sql-database";
-import { hashImageBuildCallbackToken, ImageBuildCallbackAuthError } from "./callback-auth";
+import { hashImageBuildCallbackToken, type ImageBuildCallbackAuthFailure } from "./callback-auth";
+import { createImageBuildFinalizationJob } from "./finalization-job";
 import {
-  createImageBuildFinalizationJob,
-  type ImageBuildFinalizationQueue,
-} from "./finalization-job";
-import {
+  errorMessage,
+  ImageBuildAdmissionClosedError,
   ImageBuildCallbackAuthRejectedError,
   ImageBuildCallbackAuthUnavailableError,
   ImageBuildCompletionNotAcceptedError,
@@ -23,27 +22,23 @@ import { DEFAULT_STALE_BUILD_MAX_AGE_MS } from "./maintenance";
 import type { ImageBuildProvider, ImageBuildScope } from "./model";
 import {
   ImageBuildPlanner,
+  type ImageBuildPlannerPort,
   type PlannedCallbackAuth,
   type ResolvedImageBuildTarget,
 } from "./planner";
-import { ImageBuildReaper } from "./reaper";
-import { resolveImageBuildProvider } from "./provider-policy";
+import { resolveImageBuildAdmission, resolveImageBuildProvider } from "./provider-policy";
 import { createImageBuildAdapterFactory, type ImageBuildAdapterFactory } from "./provider-factory";
 import type {
   ImageBuildAdapter,
   CompleteImageBuildCallback,
   FailImageBuildCallback,
   ImageBuildWorkflowContext,
-  ImageBuildWorkflowResult,
   TriggerImageBuildResult,
 } from "./types";
 
 const logger = createLogger("image-builds:workflow");
-
-type ImageBuildPlannerLike = Pick<
-  ImageBuildPlanner,
-  "resolveTarget" | "createCallbackAuth" | "planBuild"
->;
+/** Request-path compensation is best-effort; maintenance owns slow deletes. */
+const TRIGGER_CLEANUP_TIMEOUT_MS = 5_000;
 
 export interface AcceptBuildCompleteCommand {
   completion: CompleteImageBuildCallback;
@@ -65,7 +60,7 @@ export interface AcceptBuildFailedCommand {
  */
 export type ImageBuildProviderDeps = {
   provider: ImageBuildProvider;
-  planner: ImageBuildPlannerLike;
+  planner: ImageBuildPlannerPort;
 } | null;
 
 /**
@@ -80,17 +75,12 @@ export type ImageBuildProviderDeps = {
  * subclasses for route-level error mapping.
  */
 export class ImageBuildWorkflow {
-  private readonly reaper: ImageBuildReaper;
-
   constructor(
     private readonly env: Env,
     private readonly store: ImageBuildStore,
     private readonly adapterFactory: ImageBuildAdapterFactory,
-    private readonly providerDeps: ImageBuildProviderDeps,
-    private readonly finalizationQueue: ImageBuildFinalizationQueue | null = null
-  ) {
-    this.reaper = new ImageBuildReaper(store, adapterFactory);
-  }
+    private readonly providerDeps: ImageBuildProviderDeps
+  ) {}
 
   /**
    * Trigger a build for a scope. All trigger sources — the cron pass,
@@ -178,6 +168,15 @@ export class ImageBuildWorkflow {
     if (!this.env.WORKER_URL) {
       throw new ImageBuildWorkflowUnavailableError("WORKER_URL not configured");
     }
+    // Every trigger source converges here, so the deployment's admission
+    // control is enforced here too — manual rebuild, save hook and cron alike.
+    const admission = resolveImageBuildAdmission(this.env);
+    if (!admission.admitted) {
+      throw new ImageBuildAdmissionClosedError(
+        "Image builds are paused for this deployment",
+        admission.reason
+      );
+    }
     const { provider, planner } = this.providerDeps;
 
     // Validate provider configuration before any database work. This keeps a
@@ -196,10 +195,6 @@ export class ImageBuildWorkflow {
       });
       throw new ImageBuildProviderUnconfiguredError("Image build provider is not configured", e);
     }
-    if (!this.finalizationQueue) {
-      throw new ImageBuildWorkflowUnavailableError("Image build finalization Queue not configured");
-    }
-
     await this.failStaleScopeBuild(scope, provider, ctx);
 
     const active = await this.store.getActiveBuild(scope, provider);
@@ -251,7 +246,6 @@ export class ImageBuildWorkflow {
     }
 
     let providerSessionIdForCleanup: string | null = null;
-    let startAdapter: ImageBuildAdapter | null = null;
     try {
       const registered = await this.store.registerBuild({
         id: buildId,
@@ -281,7 +275,18 @@ export class ImageBuildWorkflow {
         callbackAuth,
       });
 
-      startAdapter = adapter;
+      // Record the cleanup obligation BEFORE the provider can create
+      // anything, for adapters that can find a source again by its reserved
+      // name. A create whose response is lost leaves a sandbox no row names,
+      // and an unrecorded source is an untracked one — so a failed intent
+      // write aborts the trigger rather than creating regardless.
+      if (adapter.recoverUnboundSource) {
+        const intentRecorded = await this.store.markSourceCreateIntent(buildId, provider);
+        if (!intentRecorded) {
+          throw new Error(`Failed to record ${provider} build source cleanup intent`);
+        }
+      }
+
       await adapter.startBuild(plan, {
         bindProviderSession: async (providerSessionId) => {
           providerSessionIdForCleanup = providerSessionId;
@@ -303,13 +308,42 @@ export class ImageBuildWorkflow {
 
       return { type: "triggered", buildId };
     } catch (e) {
-      if (providerSessionIdForCleanup && startAdapter) {
-        await startAdapter
+      // Failure and callback acceptance compete on the same building row.
+      // Only the winner may tear down the source: a launch response/probe can
+      // fail after a fast build has already handed it to the finalizer.
+      let cleanupAllowed = false;
+      try {
+        cleanupAllowed = await this.store.markBuildFailed(buildId, provider, errorMessage(e));
+        if (!cleanupAllowed) {
+          const current = await this.store.finalization.getBuild(buildId);
+          if (current && current.callback_token_used_at !== null) {
+            return { type: "triggered", buildId };
+          }
+          // A concurrent supersede/failure also fences out late callbacks.
+          // In particular, a rejected bind may leave an id only this request knows.
+          cleanupAllowed = current?.status === "failed" || current?.status === "superseded";
+        }
+      } catch (markFailedError) {
+        // Without a confirmed fence, leave the durable cleanup obligation to
+        // maintenance rather than risk deleting an accepted build's source.
+        logger.warn("image_build.trigger_mark_failed_error", {
+          error: errorMessage(markFailedError),
+          build_id: buildId,
+          request_id: ctx.request_id,
+          trace_id: ctx.trace_id,
+        });
+      }
+
+      if (cleanupAllowed && providerSessionIdForCleanup) {
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), TRIGGER_CLEANUP_TIMEOUT_MS);
+        await adapter
           .cleanupFailedBuild({
             buildId,
             providerSessionId: providerSessionIdForCleanup,
             errorMessage: errorMessage(e),
             correlation: ctx,
+            signal: controller.signal,
           })
           .catch((cleanupError) => {
             logger.warn(`image_build.${provider}_trigger_cleanup_failed`, {
@@ -319,18 +353,8 @@ export class ImageBuildWorkflow {
               request_id: ctx.request_id,
               trace_id: ctx.trace_id,
             });
-          });
-      }
-
-      try {
-        await this.store.markBuildFailed(buildId, provider, errorMessage(e));
-      } catch (markFailedError) {
-        logger.warn("image_build.trigger_mark_failed_error", {
-          error: errorMessage(markFailedError),
-          build_id: buildId,
-          request_id: ctx.request_id,
-          trace_id: ctx.trace_id,
-        });
+          })
+          .finally(() => clearTimeout(timeoutId));
       }
 
       logger.error("image_build.trigger_error", {
@@ -348,9 +372,7 @@ export class ImageBuildWorkflow {
    * Authenticates and durably accepts runtime success before publishing the
    * secret-free Queue command. Exact retries republish safely.
    */
-  async acceptBuildComplete(
-    command: AcceptBuildCompleteCommand
-  ): Promise<ImageBuildWorkflowResult> {
+  async acceptBuildComplete(command: AcceptBuildCompleteCommand): Promise<void> {
     const { completion, context: ctx } = command;
     const authenticated = await this.authorizeCompletionCallback(
       completion.buildId,
@@ -378,7 +400,7 @@ export class ImageBuildWorkflow {
       throw new ImageBuildCompletionNotAcceptedError("Build is not accepting completion");
     }
     if (authenticated.build.status === "building") {
-      await this.requireFinalizationQueue().send(job);
+      await this.env.JOBS.send({ kind: "image_build.finalize", payload: job });
     }
 
     logger.info("image_build.build_complete_received", {
@@ -392,14 +414,13 @@ export class ImageBuildWorkflow {
       request_id: ctx.request_id,
       trace_id: ctx.trace_id,
     });
-    return { type: "completion_accepted" };
   }
 
   /**
    * Persists runtime failure and its cleanup obligation before publishing the
    * Queue command that tears down the bound provider session.
    */
-  async acceptBuildFailed(command: AcceptBuildFailedCommand): Promise<ImageBuildWorkflowResult> {
+  async acceptBuildFailed(command: AcceptBuildFailedCommand): Promise<void> {
     const { failure, context: ctx } = command;
     const authenticated = await this.authorizeCompletionCallback(
       failure.buildId,
@@ -423,7 +444,7 @@ export class ImageBuildWorkflow {
     if (acceptance === "rejected") {
       throw new ImageBuildFailureNotAcceptedError("Build is not accepting failure");
     }
-    await this.requireFinalizationQueue().send(job);
+    await this.env.JOBS.send({ kind: "image_build.finalize", payload: job });
 
     logger.info("image_build.build_failed", {
       build_id: failure.buildId,
@@ -436,15 +457,6 @@ export class ImageBuildWorkflow {
       request_id: ctx.request_id,
       trace_id: ctx.trace_id,
     });
-    return { type: "failure_accepted" };
-  }
-
-  /** Cleanup pass over failed and superseded rows (reaper.ts). */
-  async cleanupImages(
-    failedMaxAgeMs: number,
-    ctx: ImageBuildWorkflowContext
-  ): Promise<{ deletedFailed: number; reapedFailed: number; reapedSuperseded: number }> {
-    return this.reaper.cleanupImages(failedMaxAgeMs, ctx);
   }
 
   private async authorizeCompletionCallback(
@@ -454,57 +466,46 @@ export class ImageBuildWorkflow {
     ctx: ImageBuildWorkflowContext
   ) {
     if (!token) {
-      throw this.loggedCallbackAuthError(
-        new ImageBuildCallbackAuthError("rejected", "Unauthorized"),
-        { buildId, providerSessionId, ctx }
-      );
+      throw this.loggedCallbackAuthError("rejected", { buildId, providerSessionId, ctx });
     }
 
     let tokenHash: string;
     try {
       tokenHash = await hashImageBuildCallbackToken(token, this.env);
     } catch (error) {
-      throw this.loggedCallbackAuthError(
-        new ImageBuildCallbackAuthError("misconfigured", "Callback auth unavailable", error),
-        { buildId, providerSessionId, ctx }
-      );
+      throw this.loggedCallbackAuthError("misconfigured", {
+        buildId,
+        providerSessionId,
+        cause: error,
+        ctx,
+      });
     }
 
-    const authenticated = await this.store.finalization.authorizeCompletionCallback({
+    const build = await this.store.finalization.authorizeCompletionCallback({
       buildId,
       providerSessionId,
       tokenHash,
       now: Date.now(),
     });
-    if (!authenticated) {
-      throw this.loggedCallbackAuthError(
-        new ImageBuildCallbackAuthError("rejected", "Unauthorized"),
-        { buildId, providerSessionId, ctx }
-      );
+    if (!build) {
+      throw this.loggedCallbackAuthError("rejected", { buildId, providerSessionId, ctx });
     }
-    return { ...authenticated, tokenHash };
-  }
-
-  private requireFinalizationQueue(): ImageBuildFinalizationQueue {
-    if (!this.finalizationQueue) {
-      throw new ImageBuildWorkflowUnavailableError("Image build finalization Queue not configured");
-    }
-    return this.finalizationQueue;
+    return { build, tokenHash };
   }
 
   private loggedCallbackAuthError(
-    error: ImageBuildCallbackAuthError,
+    failure: ImageBuildCallbackAuthFailure,
     params: {
       buildId: string;
-      provider?: ImageBuildProvider;
       providerSessionId?: string | null;
+      cause?: unknown;
       ctx: ImageBuildWorkflowContext;
     }
   ): Error {
-    if (error.failure === "misconfigured") {
+    if (failure === "misconfigured") {
       logger.error("image_build.callback_auth_misconfigured", {
         build_id: params.buildId,
-        error: error.cause instanceof Error ? error.cause.message : undefined,
+        error: params.cause instanceof Error ? params.cause.message : undefined,
         request_id: params.ctx.request_id,
         trace_id: params.ctx.trace_id,
       });
@@ -513,7 +514,6 @@ export class ImageBuildWorkflow {
 
     logger.warn("image_build.callback_auth_failed", {
       build_id: params.buildId,
-      provider: params.provider,
       provider_session_id: params.providerSessionId,
       request_id: params.ctx.request_id,
       trace_id: params.ctx.trace_id,
@@ -524,21 +524,11 @@ export class ImageBuildWorkflow {
 
 export function createImageBuildWorkflowFromEnv(env: Env, db: SqlDatabase): ImageBuildWorkflow {
   const provider = resolveImageBuildProvider(env.SANDBOX_PROVIDER);
-  const finalizationQueue = env.IMAGE_BUILD_FINALIZATION_QUEUE
-    ? {
-        async send(
-          job: Parameters<NonNullable<Env["IMAGE_BUILD_FINALIZATION_QUEUE"]>["send"]>[0]
-        ): Promise<void> {
-          await env.IMAGE_BUILD_FINALIZATION_QUEUE!.send(job);
-        },
-      }
-    : null;
   return new ImageBuildWorkflow(
     env,
     new ImageBuildStore(db),
     createImageBuildAdapterFactory(env),
-    provider ? { provider, planner: new ImageBuildPlanner(env, db) } : null,
-    finalizationQueue
+    provider ? { provider, planner: new ImageBuildPlanner(env, db) } : null
   );
 }
 
@@ -558,8 +548,4 @@ function callbackAuthRegistration(
     callbackTokenHash: callbackAuth.tokenHash,
     callbackTokenExpiresAt: callbackAuth.expiresAt,
   };
-}
-
-function errorMessage(errorValue: unknown): string {
-  return errorValue instanceof Error ? errorValue.message : String(errorValue);
 }

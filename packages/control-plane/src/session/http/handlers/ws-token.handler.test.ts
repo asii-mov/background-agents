@@ -56,7 +56,20 @@ function createHandler() {
   // Bind the request-scoped log so call sites exercise the threading without
   // repeating it at every invocation.
   const handler = {
-    generateWsToken: (request: Request) => wsTokenHandler.generateWsToken(request, log),
+    generateWsToken: async (request: Request) => {
+      const body = (await request.json()) as Record<string, unknown>;
+      return wsTokenHandler.generateWsToken(
+        new Request(request.url, {
+          method: request.method,
+          headers: request.headers,
+          body: JSON.stringify({
+            canonicalUserId: "user-1",
+            ...body,
+          }),
+        }),
+        log
+      );
+    },
   };
 
   return {
@@ -71,6 +84,34 @@ function createHandler() {
 }
 
 describe("WsTokenHandler", () => {
+  it.each([false, true])(
+    "ignores legacy OAuth secrets when minting tokens (existing=%s)",
+    async (existing) => {
+      const { handler, repository, getParticipantByUserId } = createHandler();
+      getParticipantByUserId
+        .mockReturnValueOnce(existing ? createParticipant() : null)
+        .mockReturnValue(createParticipant());
+      const response = await handler.generateWsToken(
+        new Request("http://internal/internal/ws-token", {
+          method: "POST",
+          body: JSON.stringify({
+            userId: "user-1",
+            scmTokenEncrypted: "secret",
+            scmRefreshTokenEncrypted: "refresh",
+            scmTokenExpiresAt: 9999,
+          }),
+        })
+      );
+      expect(response.status).toBe(200);
+      const written = existing
+        ? repository.updateParticipantCoalesce.mock.calls[0][1]
+        : repository.createParticipant.mock.calls[0][0];
+      expect(written).not.toHaveProperty("scmAccessTokenEncrypted");
+      expect(written).not.toHaveProperty("scmRefreshTokenEncrypted");
+      expect(written).not.toHaveProperty("scmTokenExpiresAt");
+    }
+  );
+
   it("returns 400 when userId is missing", async () => {
     const { handler } = createHandler();
 
@@ -84,23 +125,6 @@ describe("WsTokenHandler", () => {
 
     expect(response.status).toBe(400);
     expect(await response.json()).toEqual({ error: "userId is required" });
-  });
-
-  it("returns 400 for malformed token metadata", async () => {
-    const { handler, repository } = createHandler();
-
-    const response = await handler.generateWsToken(
-      new Request("http://internal/internal/ws-token", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ userId: "user-1", scmTokenExpiresAt: "tomorrow" }),
-      })
-    );
-
-    expect(response.status).toBe(400);
-    expect(await response.json()).toEqual({ error: "Invalid request body" });
-    expect(repository.createParticipant).not.toHaveBeenCalled();
-    expect(repository.updateParticipantCoalesce).not.toHaveBeenCalled();
   });
 
   it("updates an existing participant and issues a new token", async () => {
@@ -118,9 +142,6 @@ describe("WsTokenHandler", () => {
           scmLogin: "octocat-updated",
           scmName: "Updated Octocat",
           scmEmail: "updated@example.com",
-          scmTokenEncrypted: "enc-access-new",
-          scmRefreshTokenEncrypted: "enc-refresh-new",
-          scmTokenExpiresAt: 2000,
         }),
       })
     );
@@ -131,13 +152,11 @@ describe("WsTokenHandler", () => {
       participantId: "participant-1",
     });
     expect(repository.updateParticipantCoalesce).toHaveBeenCalledWith("participant-1", {
+      canonicalUserId: "user-1",
       scmUserId: "scm-user-1",
       scmLogin: "octocat-updated",
       scmName: "Updated Octocat",
       scmEmail: "updated@example.com",
-      scmAccessTokenEncrypted: "enc-access-new",
-      scmRefreshTokenEncrypted: "enc-refresh-new",
-      scmTokenExpiresAt: 2000,
     });
     expect(hashToken).toHaveBeenCalledWith("plain-token");
     expect(repository.updateParticipantWsToken).toHaveBeenCalledWith(
@@ -148,39 +167,6 @@ describe("WsTokenHandler", () => {
     expect(log.info).toHaveBeenCalledWith("Generated WS token", {
       participant_id: "participant-1",
       user_id: "user-1",
-    });
-  });
-
-  it("does not overwrite newer existing tokens with stale client values", async () => {
-    const { handler, repository, getParticipantByUserId } = createHandler();
-    const participant = createParticipant({
-      scm_token_expires_at: 5000,
-      scm_refresh_token_encrypted: "server-refresh",
-    });
-    getParticipantByUserId.mockReturnValue(participant);
-
-    const response = await handler.generateWsToken(
-      new Request("http://internal/internal/ws-token", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({
-          userId: "user-1",
-          scmTokenEncrypted: "stale-access",
-          scmRefreshTokenEncrypted: "stale-refresh",
-          scmTokenExpiresAt: 4000,
-        }),
-      })
-    );
-
-    expect(response.status).toBe(200);
-    expect(repository.updateParticipantCoalesce).toHaveBeenCalledWith("participant-1", {
-      scmUserId: null,
-      scmLogin: null,
-      scmName: null,
-      scmEmail: null,
-      scmAccessTokenEncrypted: null,
-      scmRefreshTokenEncrypted: null,
-      scmTokenExpiresAt: null,
     });
   });
 
@@ -200,9 +186,6 @@ describe("WsTokenHandler", () => {
           scmLogin: "octocat",
           scmName: "The Octocat",
           scmEmail: "octocat@example.com",
-          scmTokenEncrypted: "enc-access",
-          scmRefreshTokenEncrypted: "enc-refresh",
-          scmTokenExpiresAt: 2000,
         }),
       })
     );
@@ -215,13 +198,11 @@ describe("WsTokenHandler", () => {
     expect(repository.createParticipant).toHaveBeenCalledWith({
       id: "participant-new",
       userId: "user-1",
+      canonicalUserId: "user-1",
       scmUserId: "scm-user-1",
       scmLogin: "octocat",
       scmName: "The Octocat",
       scmEmail: "octocat@example.com",
-      scmAccessTokenEncrypted: "enc-access",
-      scmRefreshTokenEncrypted: "enc-refresh",
-      scmTokenExpiresAt: 2000,
       role: "member",
       joinedAt: 1234,
     });
@@ -233,7 +214,7 @@ describe("WsTokenHandler", () => {
     expect(getParticipantByUserId).toHaveBeenCalledTimes(2);
   });
 
-  it("accepts nullable optional token fields", async () => {
+  it("accepts nullable optional SCM display fields", async () => {
     const { handler, repository, getParticipantByUserId } = createHandler();
     const createdParticipant = createParticipant({ id: "participant-new" });
     getParticipantByUserId.mockReturnValueOnce(null).mockReturnValueOnce(createdParticipant);
@@ -248,9 +229,6 @@ describe("WsTokenHandler", () => {
           scmLogin: null,
           scmName: null,
           scmEmail: null,
-          scmTokenEncrypted: null,
-          scmRefreshTokenEncrypted: null,
-          scmTokenExpiresAt: null,
         }),
       })
     );
@@ -259,13 +237,11 @@ describe("WsTokenHandler", () => {
     expect(repository.createParticipant).toHaveBeenCalledWith({
       id: "participant-1",
       userId: "user-1",
+      canonicalUserId: "user-1",
       scmUserId: null,
       scmLogin: null,
       scmName: null,
       scmEmail: null,
-      scmAccessTokenEncrypted: null,
-      scmRefreshTokenEncrypted: null,
-      scmTokenExpiresAt: null,
       role: "member",
       joinedAt: 1234,
     });

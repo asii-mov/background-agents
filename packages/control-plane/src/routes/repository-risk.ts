@@ -1,17 +1,13 @@
+import { parseJsonBody } from "./body";
+import { Hono } from "hono";
+import { admit, dispatch } from "../routing/admit";
+import type { ControlPlaneHonoEnv } from "../routing/hono-env";
+import { requirePermission } from "./shared";
 import { z } from "zod";
 import { RepositoryRiskStore } from "../db/repository-risk";
 import { assessChangeRisk, RISK_LEVELS } from "../risk/change-risk";
 import type { Env } from "../types";
-import {
-  defineRoutes,
-  error,
-  json,
-  parseJsonBody,
-  parsePattern,
-  SCM_AGNOSTIC_USER_OR_SERVICE_ROUTE,
-  type RequestContext,
-  type Route,
-} from "./shared";
+import { error, json, SCM_AGNOSTIC_USER_OR_SERVICE_ROUTE, type RequestContext } from "./shared";
 
 const repositoryProfileSchema = z.strictObject({
   repoOwner: z.string().trim().min(1),
@@ -36,7 +32,7 @@ function actorUserId(ctx: RequestContext): string {
 async function listProfiles(
   _request: Request,
   _env: Env,
-  _match: RegExpMatchArray,
+  _params: object,
   ctx: RequestContext
 ): Promise<Response> {
   return json(await new RepositoryRiskStore(ctx.db).list());
@@ -45,10 +41,10 @@ async function listProfiles(
 async function upsertProfile(
   request: Request,
   _env: Env,
-  _match: RegExpMatchArray,
+  _params: object,
   ctx: RequestContext
 ): Promise<Response> {
-  const body = await parseJsonBody<unknown>(request);
+  const body = await parseJsonBody(request);
   if (body instanceof Response) return body;
   const parsed = repositoryProfileSchema.safeParse(body);
   if (!parsed.success) return error("Invalid repository risk profile", 400);
@@ -63,10 +59,10 @@ async function upsertProfile(
 async function assessRisk(
   request: Request,
   _env: Env,
-  _match: RegExpMatchArray,
+  _params: object,
   ctx: RequestContext
 ): Promise<Response> {
-  const body = await parseJsonBody<unknown>(request);
+  const body = await parseJsonBody(request);
   if (body instanceof Response) return body;
   const parsed = assessmentSchema.safeParse(body);
   if (!parsed.success) return error("Invalid risk assessment input", 400);
@@ -77,13 +73,16 @@ async function assessRisk(
   return json(assessChangeRisk(criticality, parsed.data.paths));
 }
 
-export const repositoryRiskRoutes: Route[] = defineRoutes(SCM_AGNOSTIC_USER_OR_SERVICE_ROUTE, [
-  { method: "GET", pattern: parsePattern("/repository-risk"), handler: listProfiles },
-  {
-    method: "PUT",
-    pattern: parsePattern("/repository-risk"),
-    requiredPermission: "catalog.write",
-    handler: upsertProfile,
-  },
-  { method: "POST", pattern: parsePattern("/risk/assess"), handler: assessRisk },
-]);
+const GOVERNANCE_READ = admit({
+  ...SCM_AGNOSTIC_USER_OR_SERVICE_ROUTE,
+  authorization: requirePermission("governance.read"),
+});
+const GOVERNANCE_MANAGE = admit({
+  ...SCM_AGNOSTIC_USER_OR_SERVICE_ROUTE,
+  authorization: requirePermission("governance.manage"),
+});
+
+export const repositoryRiskRoutes = new Hono<ControlPlaneHonoEnv>();
+repositoryRiskRoutes.get("/repository-risk", GOVERNANCE_READ, (c) => dispatch(c, listProfiles));
+repositoryRiskRoutes.put("/repository-risk", GOVERNANCE_MANAGE, (c) => dispatch(c, upsertProfile));
+repositoryRiskRoutes.post("/risk/assess", GOVERNANCE_READ, (c) => dispatch(c, assessRisk));

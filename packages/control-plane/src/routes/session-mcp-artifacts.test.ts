@@ -1,10 +1,14 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { generateEncryptionKey } from "../auth/crypto";
-import type { SqlDatabase } from "../db/sql-database";
-import { TEST_BACKGROUND_TASK_CONTEXT } from "../router.test-support";
+import {
+  createTestEnv,
+  createTestRequestHandler,
+  fakeSessionRuntimeDispatch,
+  TEST_BACKGROUND_TASK_CONTEXT,
+} from "../router.test-support";
+import { SessionInternalPaths } from "../session/contracts";
 import type { Env } from "../types";
 import { sessionMcpArtifactRoutes } from "./session-mcp-artifacts";
-import type { SandboxRouteContext } from "./shared";
 
 const { getPinnedArtifact } = vi.hoisted(() => ({ getPinnedArtifact: vi.fn() }));
 
@@ -14,37 +18,28 @@ vi.mock("../db/mcp-servers", () => ({
   },
 }));
 
-function createContext(): SandboxRouteContext {
-  return {
-    trace_id: "trace-1",
-    request_id: "request-1",
-    db: {} as SqlDatabase,
-    executionCtx: TEST_BACKGROUND_TASK_CONTEXT,
-    principal: { kind: "sandbox", sessionId: "session-1" },
-    metrics: {
-      d1Queries: [],
-      spans: {},
-      time: async <T>(_name: string, fn: () => Promise<T>) => fn(),
-      summarize: () => ({}),
-    },
-  };
-}
+const handleRequest = createTestRequestHandler([sessionMcpArtifactRoutes]);
 
-function getArtifactRoute(path: string) {
-  const route = sessionMcpArtifactRoutes.find(
-    (candidate) => candidate.method === "GET" && path.match(candidate.pattern)
-  );
-  if (!route) throw new Error("MCP artifact route not found");
-  const match = path.match(route.pattern);
-  if (!match) throw new Error("MCP artifact route did not match");
-  return { route, match };
-}
-
-function createEnv(get: ReturnType<typeof vi.fn>): Env {
-  return {
+function createEnv(get: ReturnType<typeof vi.fn>, sandboxTokenValid = true): Env {
+  return createTestEnv({
     REPO_SECRETS_ENCRYPTION_KEY: generateEncryptionKey(),
-    MEDIA_BUCKET: { get },
-  } as unknown as Env;
+    MEDIA_BUCKET: { get } as unknown as Env["MEDIA_BUCKET"],
+    SESSION: fakeSessionRuntimeDispatch(async (request) =>
+      new URL(request.url).pathname === SessionInternalPaths.verifySandboxToken && sandboxTokenValid
+        ? Response.json({ sandboxId: "sandbox-1" })
+        : new Response("Unauthorized", { status: 401 })
+    ),
+  });
+}
+
+function requestArtifact(path: string, env: Env): Promise<Response> {
+  return handleRequest(
+    new Request(`https://test.local${path}`, {
+      headers: { Authorization: "Bearer sandbox-token" },
+    }),
+    env,
+    TEST_BACKGROUND_TASK_CONTEXT
+  );
 }
 
 describe("session MCP artifact route", () => {
@@ -58,14 +53,10 @@ describe("session MCP artifact route", () => {
       sha256: "abc123",
     });
     const get = vi.fn(async () => ({ body: new Blob(["artifact"]).stream() }));
-    const path = "/sessions/session-1/mcp-artifacts/server-1/7";
-    const { route, match } = getArtifactRoute(path);
 
-    const response = await route.handler(
-      new Request(`https://test.local${path}`),
-      createEnv(get),
-      match,
-      createContext()
+    const response = await requestArtifact(
+      "/sessions/session-1/mcp-artifacts/server-1/7",
+      createEnv(get)
     );
 
     expect(getPinnedArtifact).toHaveBeenCalledWith("session-1", "server-1", 7);
@@ -76,17 +67,26 @@ describe("session MCP artifact route", () => {
     await expect(response.text()).resolves.toBe("artifact");
   });
 
+  it("rejects a sandbox token the session does not recognize", async () => {
+    const get = vi.fn();
+
+    const response = await requestArtifact(
+      "/sessions/session-1/mcp-artifacts/server-1/7",
+      createEnv(get, false)
+    );
+
+    expect(response.status).toBe(401);
+    expect(getPinnedArtifact).not.toHaveBeenCalled();
+    expect(get).not.toHaveBeenCalled();
+  });
+
   it("does not touch object storage when the session has no matching pin", async () => {
     getPinnedArtifact.mockResolvedValueOnce(null);
     const get = vi.fn();
-    const path = "/sessions/session-1/mcp-artifacts/server-2/8";
-    const { route, match } = getArtifactRoute(path);
 
-    const response = await route.handler(
-      new Request(`https://test.local${path}`),
-      createEnv(get),
-      match,
-      createContext()
+    const response = await requestArtifact(
+      "/sessions/session-1/mcp-artifacts/server-2/8",
+      createEnv(get)
     );
 
     expect(response.status).toBe(404);
@@ -94,14 +94,9 @@ describe("session MCP artifact route", () => {
   });
 
   it("rejects malformed revisions before database access", async () => {
-    const path = "/sessions/session-1/mcp-artifacts/server-1/0";
-    const { route, match } = getArtifactRoute(path);
-
-    const response = await route.handler(
-      new Request(`https://test.local${path}`),
-      createEnv(vi.fn()),
-      match,
-      createContext()
+    const response = await requestArtifact(
+      "/sessions/session-1/mcp-artifacts/server-1/0",
+      createEnv(vi.fn())
     );
 
     expect(response.status).toBe(400);

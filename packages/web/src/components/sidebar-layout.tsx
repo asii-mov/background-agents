@@ -8,11 +8,18 @@ import { GlobalCommandMenu } from "./global-command-menu";
 import { useSidebar } from "@/hooks/use-sidebar";
 import { useIsMobile } from "@/hooks/use-media-query";
 import { useGlobalShortcuts } from "@/hooks/use-global-shortcuts";
-import { COMMAND_MENU_SESSIONS_KEY, type SessionListResponse } from "@/lib/session-list";
+import {
+  COMMAND_MENU_SESSIONS_KEY,
+  fetchSessionListPage,
+  type SessionListResponse,
+} from "@/lib/session-list";
 import { Button } from "@/components/ui/button";
 import { SidebarIcon } from "@/components/ui/icons";
 import { useKeyboardShortcuts } from "@/hooks/use-keyboard-shortcuts";
 import { useMobileSidebarPull } from "@/hooks/use-mobile-sidebar-pull";
+import { useCurrentUserAuthorization } from "@/hooks/use-current-user-authorization";
+import { useActiveTeam } from "@/hooks/use-active-team";
+import { serializeSessionListQuery } from "@open-inspect/shared/session-list-query";
 
 interface SidebarContextValue {
   isOpen: boolean;
@@ -41,7 +48,7 @@ interface SidebarLayoutProps {
   children: React.ReactNode;
 }
 
-export function SidebarToggleButton({ label = "Open sidebar" }: { label?: string }) {
+function SidebarToggleButton({ label = "Open sidebar" }: { label?: string }) {
   const { toggle } = useSidebarContext();
   const { labels } = useKeyboardShortcuts();
 
@@ -60,6 +67,7 @@ export function SidebarToggleButton({ label = "Open sidebar" }: { label?: string
 
 export function CollapsedSidebarControls() {
   const actions = useContext(AppShellActionsContext);
+  const { hasPermission } = useCurrentUserAuthorization();
   if (!actions) {
     throw new Error("CollapsedSidebarControls must be used within a SidebarLayout");
   }
@@ -67,14 +75,20 @@ export function CollapsedSidebarControls() {
   return (
     <div className="flex items-center gap-2">
       <SidebarToggleButton />
-      <SearchSessionsButton onClick={actions.searchSessions} />
-      <NewSessionButton onClick={actions.newSession} />
+      {/* Search and new session are in the drawer this toggle opens, so on a
+          phone they only crowd the title out of the header. */}
+      <span className="hidden md:contents">
+        <SearchSessionsButton onClick={actions.searchSessions} />
+        {hasPermission("sessions.create") && <NewSessionButton onClick={actions.newSession} />}
+      </span>
     </div>
   );
 }
 
 export function SidebarLayout({ children }: SidebarLayoutProps) {
   const router = useRouter();
+  const { hasPermission } = useCurrentUserAuthorization();
+  const canCreateSession = hasPermission("sessions.create");
   const sidebar = useSidebar();
   const isMobile = useIsMobile();
   const [isCommandMenuOpen, setIsCommandMenuOpen] = useState(false);
@@ -90,17 +104,24 @@ export function SidebarLayout({ children }: SidebarLayoutProps) {
     onOpen: sidebar.open,
   });
 
+  const { activeTeamId, scope, loading: teamLoading, error: teamError } = useActiveTeam();
+  const teamContext = { teamIds: activeTeamId ? [activeTeamId] : undefined, scope };
+  const teamParams = serializeSessionListQuery(teamContext).toString();
+  const recentSessionsKey = `${COMMAND_MENU_SESSIONS_KEY}${teamParams ? `&${teamParams}` : ""}`;
+
   const { data: sessionsResponse } = useSWR<SessionListResponse>(
-    isCommandMenuOpen ? COMMAND_MENU_SESSIONS_KEY : null
+    isCommandMenuOpen && !teamLoading && !teamError ? recentSessionsKey : null,
+    fetchSessionListPage
   );
 
   const handleNewSession = useCallback(() => {
+    if (!canCreateSession) return;
     setIsCommandMenuOpen(false);
     if (isMobile) {
       sidebar.close();
     }
     router.push("/");
-  }, [isMobile, router, sidebar]);
+  }, [canCreateSession, isMobile, router, sidebar]);
 
   const handleNavigate = useCallback(
     (href: string) => {
@@ -196,6 +217,7 @@ export function SidebarLayout({ children }: SidebarLayoutProps) {
           onNavigate={handleNavigate}
           onNewSession={handleNewSession}
           sessions={sessionsResponse?.sessions ?? []}
+          teamContext={teamContext}
         />
       </AppShellActionsContext.Provider>
     </SidebarContext.Provider>

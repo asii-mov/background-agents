@@ -38,6 +38,17 @@ provider "cloudflare" {
   api_token = var.cloudflare_api_token
 }
 
+# The dedicated apps account (apps-account.tf). Its token never configures the
+# platform provider, and the platform token never configures this one. The
+# provider rejects a short or empty token even when it manages nothing, and a
+# null one would fall back to CLOUDFLARE_API_TOKEN from the environment, so a
+# deployment without app hosting configures it with a well-formed placeholder
+# that authenticates nowhere.
+provider "cloudflare" {
+  alias     = "apps"
+  api_token = var.apps_enabled ? var.apps_cloudflare_api_token : "apps-hosting-disabled-000000000000000000"
+}
+
 # NOTE: The Vercel provider validates api_token on init even when web_platform = "cloudflare"
 # and no Vercel resources are created. The default value is a dummy 24-character lowercase hex
 # token that satisfies provider format validation. Do not set vercel_api_token to "" in tfvars

@@ -1,3 +1,6 @@
+import { governanceCatalogConfigFromEnv } from "../governance/reconciler";
+import { parseJsonBody } from "./body";
+import { parseBody } from "./body";
 import {
   createMcpServerInputSchema,
   updateMcpServerCredentialsInputSchema,
@@ -8,19 +11,18 @@ import {
   McpServerStore,
   McpServerValidationError,
 } from "../db/mcp-servers";
+import { Hono } from "hono";
 import type { Env } from "../types";
 import { createLogger } from "../logger";
 import { requireRepoSecretsEncryptionKey } from "../env-validation";
-import { governanceCatalogConfigFromEnv } from "../governance/reconciler";
+import { admit, dispatch } from "../routing/admit";
+import type { ControlPlaneHonoEnv } from "../routing/hono-env";
 import {
-  type Route,
-  SCM_AGNOSTIC_USER_OR_SERVICE_ROUTE,
-  defineRoutes,
+  GITHUB_USER_OR_SERVICE_ROUTE,
   type RequestContext,
-  parsePattern,
   json,
   error,
-  parseJsonBody,
+  requirePermission,
 } from "./shared";
 
 const logger = createLogger("router:mcp-servers");
@@ -49,7 +51,7 @@ function canonicalUserId(ctx: RequestContext): string {
 async function handleListMcpServers(
   request: Request,
   env: Env,
-  _match: RegExpMatchArray,
+  _params: object,
   ctx: RequestContext
 ): Promise<Response> {
   if (!ctx.db) return error("Database not configured", 503);
@@ -72,11 +74,10 @@ async function handleListMcpServers(
 async function handleGetMcpServer(
   _request: Request,
   env: Env,
-  match: RegExpMatchArray,
+  params: { id: string },
   ctx: RequestContext
 ): Promise<Response> {
-  const id = match.groups?.id;
-  if (!id) return error("Missing server ID", 400);
+  const { id } = params;
   if (!ctx.db) return error("Database not configured", 503);
 
   const store = new McpServerStore(ctx.db, requireRepoSecretsEncryptionKey(env));
@@ -94,22 +95,24 @@ async function handleGetMcpServer(
 async function handleCreateMcpServer(
   request: Request,
   env: Env,
-  _match: RegExpMatchArray,
+  _params: object,
   ctx: RequestContext
 ): Promise<Response> {
   if (!ctx.db) return error("Database not configured", 503);
   const managed = gitManaged(env);
   if (managed) return managed;
 
-  const body = await parseJsonBody<unknown>(request);
-  if (body instanceof Response) return body;
-  const parsed = createMcpServerInputSchema.safeParse(body);
-  if (!parsed.success) return error("Invalid MCP server configuration", 400);
+  const parsed = await parseBody(
+    request,
+    createMcpServerInputSchema,
+    "Invalid MCP server configuration"
+  );
+  if (parsed instanceof Response) return parsed;
 
   const encryptionKey = requireRepoSecretsEncryptionKey(env);
   try {
     const store = new McpServerStore(ctx.db, encryptionKey);
-    const server = await store.create(parsed.data, canonicalUserId(ctx));
+    const server = await store.create(parsed, canonicalUserId(ctx));
     logger.info("MCP server created", {
       event: "mcp_server.created",
       request_id: ctx.request_id,
@@ -129,24 +132,25 @@ async function handleCreateMcpServer(
 async function handleUpdateMcpServer(
   request: Request,
   env: Env,
-  match: RegExpMatchArray,
+  params: { id: string },
   ctx: RequestContext
 ): Promise<Response> {
-  const id = match.groups?.id;
-  if (!id) return error("Missing server ID", 400);
+  const { id } = params;
   if (!ctx.db) return error("Database not configured", 503);
   const managed = gitManaged(env);
   if (managed) return managed;
 
-  const body = await parseJsonBody<unknown>(request);
-  if (body instanceof Response) return body;
-  const parsed = updateMcpServerInputSchema.safeParse(body);
-  if (!parsed.success) return error("Invalid MCP server configuration", 400);
+  const parsed = await parseBody(
+    request,
+    updateMcpServerInputSchema,
+    "Invalid MCP server configuration"
+  );
+  if (parsed instanceof Response) return parsed;
 
   const encryptionKey = requireRepoSecretsEncryptionKey(env);
   try {
     const store = new McpServerStore(ctx.db, encryptionKey);
-    const { revision, ...patch } = parsed.data;
+    const { revision, ...patch } = parsed;
     const updated = await store.update(id, patch, revision, canonicalUserId(ctx));
     if (!updated) return error("MCP server not found", 404);
 
@@ -171,11 +175,10 @@ async function handleUpdateMcpServer(
 async function handleDeleteMcpServer(
   _request: Request,
   env: Env,
-  match: RegExpMatchArray,
+  params: { id: string },
   ctx: RequestContext
 ): Promise<Response> {
-  const id = match.groups?.id;
-  if (!id) return error("Missing server ID", 400);
+  const { id } = params;
   if (!ctx.db) return error("Database not configured", 503);
   const managed = gitManaged(env);
   if (managed) return managed;
@@ -202,13 +205,13 @@ async function handleDeleteMcpServer(
 async function handleUpdateMcpCredentials(
   request: Request,
   env: Env,
-  match: RegExpMatchArray,
+  params: { id: string },
   ctx: RequestContext
 ): Promise<Response> {
-  const id = match.groups?.id;
+  const id = params.id;
   if (!id) return error("Missing server ID", 400);
   if (!ctx.db) return error("Database not configured", 503);
-  const body = await parseJsonBody<unknown>(request);
+  const body = await parseJsonBody(request);
   if (body instanceof Response) return body;
   const parsed = updateMcpServerCredentialsInputSchema.safeParse(body);
   if (!parsed.success) return error("Invalid MCP server credentials", 400);
@@ -226,39 +229,23 @@ async function handleUpdateMcpCredentials(
   }
 }
 
-export const mcpServerRoutes: Route[] = defineRoutes(SCM_AGNOSTIC_USER_OR_SERVICE_ROUTE, [
-  {
-    method: "GET",
-    pattern: parsePattern("/mcp-servers"),
-    handler: handleListMcpServers,
-  },
-  {
-    method: "POST",
-    pattern: parsePattern("/mcp-servers"),
-    requiredPermission: "catalog.write",
-    handler: handleCreateMcpServer,
-  },
-  {
-    method: "GET",
-    pattern: parsePattern("/mcp-servers/:id"),
-    handler: handleGetMcpServer,
-  },
-  {
-    method: "PUT",
-    pattern: parsePattern("/mcp-servers/:id"),
-    requiredPermission: "catalog.write",
-    handler: handleUpdateMcpServer,
-  },
-  {
-    method: "PUT",
-    pattern: parsePattern("/mcp-servers/:id/credentials"),
-    requiredPermission: "catalog.write",
-    handler: handleUpdateMcpCredentials,
-  },
-  {
-    method: "DELETE",
-    pattern: parsePattern("/mcp-servers/:id"),
-    requiredPermission: "catalog.write",
-    handler: handleDeleteMcpServer,
-  },
-]);
+const MCP_READ = admit({
+  ...GITHUB_USER_OR_SERVICE_ROUTE,
+  authorization: requirePermission("mcp_servers.read"),
+});
+const MCP_MANAGE = admit({
+  ...GITHUB_USER_OR_SERVICE_ROUTE,
+  authorization: requirePermission("mcp_servers.manage"),
+});
+
+export const mcpServerRoutes = new Hono<ControlPlaneHonoEnv>();
+
+mcpServerRoutes.get("/mcp-servers", MCP_READ, (c) => dispatch(c, handleListMcpServers));
+mcpServerRoutes.post("/mcp-servers", MCP_MANAGE, (c) => dispatch(c, handleCreateMcpServer));
+mcpServerRoutes.get("/mcp-servers/:id", MCP_READ, (c) => dispatch(c, handleGetMcpServer));
+mcpServerRoutes.put("/mcp-servers/:id", MCP_MANAGE, (c) => dispatch(c, handleUpdateMcpServer));
+mcpServerRoutes.delete("/mcp-servers/:id", MCP_MANAGE, (c) => dispatch(c, handleDeleteMcpServer));
+
+mcpServerRoutes.put("/mcp-servers/:id/credentials", MCP_MANAGE, (c) =>
+  dispatch(c, handleUpdateMcpCredentials)
+);

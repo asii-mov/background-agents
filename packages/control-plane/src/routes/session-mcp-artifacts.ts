@@ -1,24 +1,21 @@
+import { Hono } from "hono";
+import { admit, dispatch } from "../routing/admit";
+import type { ControlPlaneHonoEnv } from "../routing/hono-env";
+import { NO_AUTHORIZATION } from "./shared";
 import { McpServerStore } from "../db/mcp-servers";
 import { requireRepoSecretsEncryptionKey } from "../env-validation";
 import type { Env } from "../types";
-import {
-  defineRoute,
-  error,
-  parsePattern,
-  SCM_AGNOSTIC_SANDBOX_ROUTE,
-  type Route,
-  type SandboxRouteContext,
-} from "./shared";
+import { error, SCM_AGNOSTIC_SANDBOX_ROUTE, type SandboxRouteContext } from "./shared";
 
 async function handleMcpArtifact(
   _request: Request,
   env: Env,
-  match: RegExpMatchArray,
+  match: Record<string, string>,
   ctx: SandboxRouteContext
 ): Promise<Response> {
-  const sessionId = match.groups?.id;
-  const serverId = match.groups?.serverId;
-  const revision = Number(match.groups?.revision);
+  const sessionId = match.id;
+  const serverId = match.serverId;
+  const revision = Number(match.revision);
   if (!sessionId || !serverId || !Number.isSafeInteger(revision) || revision < 1) {
     return error("Invalid MCP artifact target", 400);
   }
@@ -37,10 +34,9 @@ async function handleMcpArtifact(
   return new Response(object.body, { headers });
 }
 
-export const sessionMcpArtifactRoutes: Route[] = [
-  defineRoute(SCM_AGNOSTIC_SANDBOX_ROUTE, {
-    method: "GET",
-    pattern: parsePattern("/sessions/:id/mcp-artifacts/:serverId/:revision"),
-    handler: handleMcpArtifact,
-  }),
-];
+export const sessionMcpArtifactRoutes = new Hono<ControlPlaneHonoEnv>();
+sessionMcpArtifactRoutes.get(
+  "/sessions/:id/mcp-artifacts/:serverId/:revision",
+  admit({ ...SCM_AGNOSTIC_SANDBOX_ROUTE, authorization: NO_AUTHORIZATION }),
+  (c) => dispatch(c, handleMcpArtifact)
+);

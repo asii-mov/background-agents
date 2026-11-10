@@ -1,4 +1,9 @@
+import { z } from "zod";
 import { getSignInProviderIssuer } from "@open-inspect/shared/sign-in-provider";
+import {
+  sessionCollaboratorCandidatesResponseSchema,
+  type SessionCollaboratorCandidate,
+} from "@open-inspect/shared/types/sessions";
 import { generateId } from "../auth/crypto";
 import { normalizeEmail } from "./email";
 import { isUniqueConstraintError } from "./errors";
@@ -16,26 +21,49 @@ export interface ProviderIdentity {
 }
 
 /**
- * Ingress providers whose attributed emails are platform-verified mailboxes
- * fetched server-side by first-party bots: Slack confirms every address at
- * signup and on change, and Linear's email is its login credential. Emails
- * written from these providers carry verification (`email_verified = 1`) —
- * the same weight as a completed OAuth sign-in proof, and what admits the
- * user through Better Auth's implicit-linking gate at their first web
- * sign-in. Every other provider's attribution stays unproven until the
- * sign-in claim mints proof; a new ingress provider must be added here
- * deliberately, never by default.
+ * Which provider-reported emails may link an identity to an existing user.
+ * A reported email is never mailbox proof. It links only inside an allowed
+ * domain and only to a user whose email a completed OAuth sign-in verified.
+ * It stays on the identity and never lands on `users.email`, where a later
+ * sign-in proving it would verify that row and link into it.
  */
-const EMAIL_ATTESTING_PROVIDERS: ReadonlySet<ProviderIdentity["provider"]> = new Set([
-  "slack",
-  "linear",
-]);
+export interface EmailLinkPolicy {
+  /** Exact lowercase domains, such as `corp.example`. Empty never links. */
+  readonly allowedEmailDomains: ReadonlySet<string>;
+}
+
+/** Parses the comma-separated `IDENTITY_LINK_EMAIL_DOMAINS` setting. */
+export function parseEmailLinkPolicy(domains: string | undefined): EmailLinkPolicy {
+  return {
+    allowedEmailDomains: new Set(
+      (domains ?? "")
+        .split(",")
+        .map((domain) => domain.trim().toLowerCase())
+        .filter(Boolean)
+    ),
+  };
+}
+
+const NO_EMAIL_LINKS = parseEmailLinkPolicy(undefined);
+
+interface LinkableEmail {
+  address: string;
+  domain: string;
+}
+
+function linkableEmail(email: string | null, policy: EmailLinkPolicy): LinkableEmail | null {
+  const [local, domain, ...rest] = email?.split("@") ?? [];
+  if (!email || !local || !domain || rest.length > 0) return null;
+  return policy.allowedEmailDomains.has(domain) ? { address: email, domain } : null;
+}
 
 export interface ResolvedUser {
   id: string;
   displayName: string | null;
   email: string | null;
   isNew: boolean;
+  /** The allowed domain whose email linked this identity to an existing user, if one did. */
+  linkedByEmailDomain: string | null;
 }
 
 export interface User {
@@ -62,7 +90,7 @@ export interface UserIdentity {
 export interface NewUser {
   displayName?: string;
   email?: string;
-  /** Whether `email` comes with mailbox-ownership proof (attesting provider). */
+  /** Whether `email` comes with mailbox-ownership proof. */
   emailVerified?: boolean;
   avatarUrl?: string;
 }
@@ -78,9 +106,6 @@ export interface NewUserIdentity {
 export interface UserUpdate {
   displayName?: string;
   avatarUrl?: string;
-  email?: string;
-  /** Only meaningful alongside `email`: its mailbox-ownership proof. */
-  emailVerified?: boolean;
 }
 
 // ── Row types (D1 snake_case) ───────────────────────────────────────
@@ -133,10 +158,65 @@ function toUserIdentity(row: UserIdentityRow): UserIdentity {
   };
 }
 
+export type CollaboratorEligibility = "eligible" | "not_found" | "inactive" | "not_team_member";
+
+const collaboratorEligibilityRowSchema = z.object({
+  suspended_at: z.number().nullable(),
+  role_id: z.string().nullable(),
+  team_member: z.number(),
+});
+
 // ── UserStore ───────────────────────────────────────────────────────
 
 export class UserStore {
   constructor(private readonly db: SqlDatabase) {}
+
+  /** Lists active users; a team ID restricts candidates to that team's members. */
+  async listCollaboratorCandidates({
+    includeEmail,
+    teamId = null,
+  }: {
+    includeEmail: boolean;
+    teamId?: string | null;
+  }): Promise<SessionCollaboratorCandidate[]> {
+    const { results } = await this.db
+      .prepare(
+        `SELECT users.id AS userId, users.display_name AS displayName,
+                ${includeEmail ? "users.email" : "NULL AS email"}, users.avatar_url AS avatarUrl
+         FROM users
+         JOIN user_role_assignments assignment ON assignment.user_id = users.id
+         ${teamId === null ? "" : "JOIN team_memberships m ON m.user_id = users.id AND m.team_id = ?"}
+         WHERE users.suspended_at IS NULL AND assignment.role_id IS NOT NULL
+         ORDER BY LOWER(COALESCE(users.display_name, ${includeEmail ? "users.email" : "NULL"}, users.id)), users.id`
+      )
+      .bind(...(teamId === null ? [] : [teamId]))
+      .all();
+    return sessionCollaboratorCandidatesResponseSchema.parse(results);
+  }
+
+  /** Applies the candidate-list rules to one user; a team ID also requires membership in that team. */
+  async getCollaboratorEligibility(
+    userId: string,
+    teamId: string | null
+  ): Promise<CollaboratorEligibility> {
+    const row = collaboratorEligibilityRowSchema.nullable().parse(
+      await this.db
+        .prepare(
+          `SELECT users.suspended_at, assignment.role_id,
+                  EXISTS (SELECT 1 FROM team_memberships m
+                          WHERE m.team_id = ? AND m.user_id = users.id) AS team_member
+           FROM users
+           LEFT JOIN user_role_assignments assignment ON assignment.user_id = users.id
+           WHERE users.id = ?`
+        )
+        .bind(teamId, userId)
+        .first()
+    );
+    if (!row) return "not_found";
+    if (row.suspended_at !== null || row.role_id === null) return "inactive";
+    if (teamId !== null && !row.team_member) return "not_team_member";
+    return "eligible";
+  }
 
   async getUsersByIds(userIds: readonly string[]): Promise<User[]> {
     const uniqueIds = [...new Set(userIds)];
@@ -157,16 +237,19 @@ export class UserStore {
 
   /**
    * Core resolution entry point. Finds or creates a canonical user for the
-   * given provider identity, with automatic email-based cross-provider linking.
+   * given provider identity, linking by email only as `linkPolicy` allows.
    *
    * On UNIQUE constraint violation (concurrent race), retries the lookup once.
    */
-  async resolveOrCreateUser(identity: ProviderIdentity): Promise<ResolvedUser> {
+  async resolveOrCreateUser(
+    identity: ProviderIdentity,
+    linkPolicy: EmailLinkPolicy = NO_EMAIL_LINKS
+  ): Promise<ResolvedUser> {
     try {
-      return await this.doResolveOrCreate(identity);
+      return await this.doResolveOrCreate(identity, linkPolicy);
     } catch (err) {
       if (isUniqueConstraintError(err)) {
-        return await this.doResolveOrCreate(identity);
+        return await this.doResolveOrCreate(identity, linkPolicy);
       }
       throw err;
     }
@@ -286,16 +369,6 @@ export class UserStore {
       sets.push("avatar_url = ?");
       values.push(updates.avatarUrl);
     }
-    if (updates.email !== undefined) {
-      // A blank email normalizes to null — treated as absent, never stored.
-      // Verification travels with the email: it reflects the new address's
-      // proof (attesting provider or not), never the old address's state.
-      const email = normalizeEmail(updates.email);
-      sets.push("email = ?");
-      values.push(email);
-      sets.push("email_verified = ?");
-      values.push(email !== null && updates.emailVerified === true ? 1 : 0);
-    }
 
     if (sets.length === 0) return;
 
@@ -311,8 +384,12 @@ export class UserStore {
 
   // ── Private ─────────────────────────────────────────────────────
 
-  private async doResolveOrCreate(identity: ProviderIdentity): Promise<ResolvedUser> {
+  private async doResolveOrCreate(
+    identity: ProviderIdentity,
+    linkPolicy: EmailLinkPolicy
+  ): Promise<ResolvedUser> {
     const normalizedEmail = normalizeEmail(identity.providerEmail);
+    const linkable = linkableEmail(normalizedEmail, linkPolicy);
 
     // Step 1: Look up by provider identity
     const existing = await this.getIdentity(identity.provider, identity.providerUserId);
@@ -337,21 +414,13 @@ export class UserStore {
         updates.avatarUrl = identity.avatarUrl;
       }
 
-      // Step 2c: Backfill email if user has none and provider now has one.
-      // The check-then-update is racy (a concurrent writer could claim the email
-      // between the SELECT and UPDATE), but the outer retry in resolveOrCreateUser
-      // handles this: on retry, emailOwner is non-null and we re-link instead.
-      if (!user.email && normalizedEmail) {
-        const emailOwner = await this.getUserByEmail(normalizedEmail);
-        if (!emailOwner) {
-          updates.email = normalizedEmail;
-          updates.emailVerified = EMAIL_ATTESTING_PROVIDERS.has(identity.provider);
-        } else if (emailOwner.id !== user.id) {
-          // Another user owns this email — re-link this identity to that user.
-          // This prevents permanent identity splits when e.g. a Slack identity
-          // (created without email) later discovers the same email that a GitHub
-          // identity already registered. Same principle as step 3 (email-based
-          // cross-provider linking) but for existing identities.
+      // Step 2c: Re-link to the verified owner of an allowed-domain email.
+      if (!user.email && linkable) {
+        const emailOwner = await this.getUserByEmail(linkable.address);
+        if (emailOwner?.emailVerified) {
+          // Re-link this identity to the verified owner of its email. This
+          // heals the split left when e.g. a Slack identity created without an
+          // email later reports the email a GitHub sign-in already proved.
           await this.db
             .prepare("UPDATE user_identities SET user_id = ? WHERE id = ?")
             .bind(emailOwner.id, existing.id)
@@ -361,6 +430,7 @@ export class UserStore {
             displayName: emailOwner.displayName,
             email: emailOwner.email,
             isNew: false,
+            linkedByEmailDomain: linkable.domain,
           };
         }
       }
@@ -372,29 +442,30 @@ export class UserStore {
       return {
         id: user.id,
         displayName: updates.displayName ?? user.displayName,
-        email: updates.email ?? user.email,
+        email: user.email,
         isNew: false,
+        linkedByEmailDomain: null,
       };
     }
 
-    // Step 3: No identity found — try email-based cross-provider linking
-    if (normalizedEmail) {
-      const emailUser = await this.getUserByEmail(normalizedEmail);
-      if (emailUser) {
-        await this.createIdentity({
-          userId: emailUser.id,
-          provider: identity.provider,
-          providerUserId: identity.providerUserId,
-          providerLogin: identity.providerLogin,
-          providerEmail: normalizedEmail,
-        });
-        return {
-          id: emailUser.id,
-          displayName: emailUser.displayName,
-          email: emailUser.email,
-          isNew: false,
-        };
-      }
+    // Step 3: No identity found — link to the verified owner of an
+    // allowed-domain email
+    const emailOwner = linkable ? await this.getUserByEmail(linkable.address) : null;
+    if (linkable && emailOwner?.emailVerified) {
+      await this.createIdentity({
+        userId: emailOwner.id,
+        provider: identity.provider,
+        providerUserId: identity.providerUserId,
+        providerLogin: identity.providerLogin,
+        providerEmail: linkable.address,
+      });
+      return {
+        id: emailOwner.id,
+        displayName: emailOwner.displayName,
+        email: emailOwner.email,
+        isNew: false,
+        linkedByEmailDomain: linkable.domain,
+      };
     }
 
     // Step 4: Brand new user — batch user + identity creation so a UNIQUE
@@ -407,15 +478,12 @@ export class UserStore {
     const avatarUrl = identity.avatarUrl ?? null;
     const issuer = getSignInProviderIssuer(identity.provider);
 
-    const emailVerified =
-      normalizedEmail !== null && EMAIL_ATTESTING_PROVIDERS.has(identity.provider);
-
     await this.db.batch([
       this.db
         .prepare(
-          "INSERT INTO users (id, display_name, email, email_verified, avatar_url, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)"
+          "INSERT INTO users (id, display_name, email, email_verified, avatar_url, created_at, updated_at) VALUES (?, ?, NULL, 0, ?, ?, ?)"
         )
-        .bind(userId, displayName, normalizedEmail, emailVerified ? 1 : 0, avatarUrl, now, now),
+        .bind(userId, displayName, avatarUrl, now, now),
       this.db
         .prepare(
           "INSERT INTO user_identities (id, user_id, provider, provider_user_id, provider_login, provider_email, provider_issuer, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
@@ -435,8 +503,9 @@ export class UserStore {
     return {
       id: userId,
       displayName,
-      email: normalizedEmail,
+      email: null,
       isNew: true,
+      linkedByEmailDomain: null,
     };
   }
 

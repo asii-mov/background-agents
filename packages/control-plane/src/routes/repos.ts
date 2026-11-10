@@ -2,45 +2,43 @@
  * Repository listing and metadata routes and handlers.
  */
 
+import { Hono } from "hono";
+import { admit, dispatch } from "../routing/admit";
+import type { ControlPlaneHonoEnv } from "../routing/hono-env";
+import { repositoryParams } from "./repository-params";
 import { RepoMetadataStore } from "../db/repo-metadata";
 import type { Env } from "../types";
+import { resolveCatalogScope } from "./team-ownership";
 import type { SqlDatabase } from "../db/sql-database";
-import { createKvCacheStore } from "@open-inspect/shared/cache-store";
 import {
   repoMetadataSchema,
   type EnrichedRepository,
   type InstallationRepository,
   type RepoMetadata,
 } from "@open-inspect/shared/types/repository-catalog";
+import {
+  REPOS_CACHE_KEY,
+  cachedReposListSchema,
+  reposCacheIdentity,
+  type CachedReposList,
+} from "../repos/cache";
 import { SourceControlProviderError } from "../source-control";
 import { createLogger } from "../logger";
 import {
-  type Route,
   GITHUB_USER_OR_SERVICE_ROUTE,
-  defineRoutes,
   type RequestContext,
-  parsePattern,
   json,
   error,
-  extractRepoParams,
   createRouteSourceControlProvider,
+  requirePermission,
 } from "./shared";
+
+export { REPOS_CACHE_KEY, reposCacheIdentity } from "../repos/cache";
 
 const logger = createLogger("router:repos");
 
-const REPOS_CACHE_KEY = "repos:list:v2";
-const REPOS_CACHE_FRESH_MS = 5 * 60 * 1000; // Serve without revalidation for 5 minutes
-const REPOS_CACHE_KV_TTL_SECONDS = 3600; // Keep stale data in KV for 1 hour
-
-/**
- * Cached repos list structure stored in KV.
- */
-interface CachedReposList {
-  repos: EnrichedRepository[];
-  cachedAt: string;
-  /** Epoch ms — cache is considered fresh until this time. Missing in entries cached before this field was added. */
-  freshUntil?: number;
-}
+const REPOS_CACHE_FRESH_MS = 5 * 60 * 1000;
+const REPOS_CACHE_KV_TTL_SECONDS = 3600;
 
 type ReposRefreshResult =
   | { ok: true; repos: EnrichedRepository[]; cachedAt: string }
@@ -56,11 +54,12 @@ type ScmApiTimer = <T>(fn: () => Promise<T>) => Promise<T>;
 async function refreshReposCache(
   env: Env,
   db: SqlDatabase,
+  scmIdentity: string,
   traceId?: string,
   timeScmApi: ScmApiTimer = (fn) => fn()
 ): Promise<ReposRefreshResult> {
   const provider = createRouteSourceControlProvider(env);
-  const cacheStore = createKvCacheStore(env.REPOS_CACHE);
+  const cacheStore = env.REPOS_CACHE;
 
   let repos: InstallationRepository[];
   try {
@@ -109,7 +108,7 @@ async function refreshReposCache(
   try {
     await cacheStore.put(
       REPOS_CACHE_KEY,
-      JSON.stringify({ repos: enrichedRepos, cachedAt, freshUntil }),
+      JSON.stringify({ repos: enrichedRepos, cachedAt, scmIdentity, freshUntil }),
       { expirationTtl: REPOS_CACHE_KV_TTL_SECONDS }
     );
     logger.info("Repos cache refreshed", {
@@ -140,22 +139,34 @@ async function refreshReposCache(
 async function handleListRepos(
   request: Request,
   env: Env,
-  _match: RegExpMatchArray,
+  _params: object,
   ctx: RequestContext
 ): Promise<Response> {
-  const cacheStore = createKvCacheStore(env.REPOS_CACHE);
+  const teamId = new URL(request.url).searchParams.get("teamId");
+  const scope = await resolveCatalogScope(request, ctx, teamId, "/repos");
+  if (scope instanceof Response) return scope;
+  const grants = scope?.grants;
+  const filterRepos = (repos: EnrichedRepository[]) => {
+    if (!grants || grants.some((grant) => grant.grant_kind === "installation")) return repos;
+    const ids = new Set(grants.map((grant) => grant.repo_external_id));
+    return repos.filter((repo) => ids.has(repo.id));
+  };
+  const teamScope = grants ? { teamHasRepositoryGrants: grants.length > 0 } : {};
+  const cacheStore = env.REPOS_CACHE;
+  const scmIdentity = await reposCacheIdentity(env);
 
   // Read from KV cache
   let cached: CachedReposList | null = null;
   try {
-    cached = await ctx.metrics.time("kv_read", () =>
-      cacheStore.get<CachedReposList>(REPOS_CACHE_KEY, "json")
+    const result = cachedReposListSchema.safeParse(
+      await ctx.metrics.time("kv_read", () => cacheStore.get(REPOS_CACHE_KEY, "json"))
     );
+    cached = result.success ? result.data : null;
   } catch (e) {
     logger.warn("Failed to read repos cache", { error: e instanceof Error ? e : String(e) });
   }
 
-  if (cached) {
+  if (cached?.scmIdentity === scmIdentity) {
     const isFresh = cached.freshUntil && Date.now() < cached.freshUntil;
 
     if (!isFresh) {
@@ -164,14 +175,15 @@ async function handleListRepos(
         trace_id: ctx.trace_id,
         cached_at: cached.cachedAt,
       });
-      ctx.executionCtx.submit(() => refreshReposCache(env, ctx.db, ctx.trace_id), {
+      ctx.executionCtx.submit(() => refreshReposCache(env, ctx.db, scmIdentity, ctx.trace_id), {
         name: "repos_cache.refresh",
         context: { trace_id: ctx.trace_id },
       });
     }
 
     return json({
-      repos: cached.repos,
+      repos: filterRepos(cached.repos),
+      ...teamScope,
       cached: true,
       cachedAt: cached.cachedAt,
     });
@@ -185,7 +197,7 @@ async function handleListRepos(
   // because the stale-while-revalidate branch above needs an entry to exist.
   // The refresh promise is created once and shared: the factory hands it to
   // waitUntil while the response below awaits the same run.
-  const refresh = refreshReposCache(env, ctx.db, ctx.trace_id, (fn) =>
+  const refresh = refreshReposCache(env, ctx.db, scmIdentity, ctx.trace_id, (fn) =>
     ctx.metrics.time("scm_api", fn)
   );
   ctx.executionCtx.submit(() => refresh, {
@@ -202,7 +214,8 @@ async function handleListRepos(
   }
 
   return json({
-    repos: result.repos,
+    repos: filterRepos(result.repos),
+    ...teamScope,
     cached: false,
     cachedAt: result.cachedAt,
   });
@@ -215,12 +228,12 @@ async function handleListRepos(
 async function handleUpdateRepoMetadata(
   request: Request,
   env: Env,
-  match: RegExpMatchArray,
+  params: { owner: string; name: string },
   ctx: RequestContext
 ): Promise<Response> {
-  const params = extractRepoParams(match);
-  if (params instanceof Response) return params;
-  const { owner, name } = params;
+  const repository = repositoryParams(params);
+  if (repository instanceof Response) return repository;
+  const { owner, name } = repository;
 
   // Parse and validate at the trust boundary: malformed JSON and structurally
   // invalid metadata both take the same 400 path, before any persistence.
@@ -247,7 +260,7 @@ async function handleUpdateRepoMetadata(
   }
 
   try {
-    await createKvCacheStore(env.REPOS_CACHE).delete(REPOS_CACHE_KEY);
+    await env.REPOS_CACHE.delete(REPOS_CACHE_KEY);
   } catch (e) {
     logger.warn("Failed to invalidate repos cache", {
       trace_id: ctx.trace_id,
@@ -272,12 +285,12 @@ async function handleUpdateRepoMetadata(
 async function handleGetRepoMetadata(
   request: Request,
   env: Env,
-  match: RegExpMatchArray,
+  params: { owner: string; name: string },
   ctx: RequestContext
 ): Promise<Response> {
-  const params = extractRepoParams(match);
-  if (params instanceof Response) return params;
-  const { owner, name } = params;
+  const repository = repositoryParams(params);
+  if (repository instanceof Response) return repository;
+  const { owner, name } = repository;
 
   const normalizedRepo = `${owner.toLowerCase()}/${name.toLowerCase()}`;
   const metadataStore = new RepoMetadataStore(ctx.db);
@@ -301,12 +314,12 @@ async function handleGetRepoMetadata(
 async function handleListBranches(
   _request: Request,
   env: Env,
-  match: RegExpMatchArray,
+  params: { owner: string; name: string },
   _ctx: RequestContext
 ): Promise<Response> {
-  const params = extractRepoParams(match);
-  if (params instanceof Response) return params;
-  const { owner, name } = params;
+  const repository = repositoryParams(params);
+  if (repository instanceof Response) return repository;
+  const { owner, name } = repository;
 
   try {
     const provider = createRouteSourceControlProvider(env);
@@ -325,25 +338,41 @@ async function handleListBranches(
   }
 }
 
-export const reposRoutes: Route[] = defineRoutes(GITHUB_USER_OR_SERVICE_ROUTE, [
-  {
-    method: "GET",
-    pattern: parsePattern("/repos"),
-    handler: handleListRepos,
-  },
-  {
-    method: "PUT",
-    pattern: parsePattern("/repos/:owner/:name/metadata"),
-    handler: handleUpdateRepoMetadata,
-  },
-  {
-    method: "GET",
-    pattern: parsePattern("/repos/:owner/:name/metadata"),
-    handler: handleGetRepoMetadata,
-  },
-  {
-    method: "GET",
-    pattern: parsePattern("/repos/:owner/:name/branches"),
-    handler: handleListBranches,
-  },
-]);
+const REPOSITORIES_READ = admit({
+  ...GITHUB_USER_OR_SERVICE_ROUTE,
+  authorization: requirePermission("repositories.read"),
+});
+
+export const reposRoutes = new Hono<ControlPlaneHonoEnv>();
+
+reposRoutes.get(
+  "/repos",
+  admit({
+    ...GITHUB_USER_OR_SERVICE_ROUTE,
+    authorization: requirePermission("repositories.read", {
+      actorlessGrants: [{ service: "slack-bot" }, { service: "linear-bot" }],
+    }),
+  }),
+  (c) => dispatch(c, handleListRepos)
+);
+reposRoutes.put(
+  "/repos/:owner/:name/metadata",
+  admit({
+    ...GITHUB_USER_OR_SERVICE_ROUTE,
+    authorization: requirePermission("repositories.settings.manage"),
+  }),
+  (c) => dispatch(c, handleUpdateRepoMetadata)
+);
+reposRoutes.get(
+  "/repos/:owner/:name/metadata",
+  admit({
+    ...GITHUB_USER_OR_SERVICE_ROUTE,
+    authorization: requirePermission("repositories.read", {
+      actorlessGrants: [{ service: "github-bot" }],
+    }),
+  }),
+  (c) => dispatch(c, handleGetRepoMetadata)
+);
+reposRoutes.get("/repos/:owner/:name/branches", REPOSITORIES_READ, (c) =>
+  dispatch(c, handleListBranches)
+);

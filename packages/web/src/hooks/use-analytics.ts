@@ -1,55 +1,30 @@
 import { useAuthSession } from "@/lib/auth-session";
 import useSWR from "swr";
 import type {
-  AnalyticsBreakdownResponse,
+  AnalyticsDashboardResponse,
   AnalyticsDays,
-  AnalyticsPullRequestsResponse,
-  AnalyticsSummaryResponse,
-  AnalyticsTimeseriesResponse,
+  AnalyticsScope,
 } from "@open-inspect/shared/types/analytics";
 import { ANALYTICS_REFRESH_INTERVAL_MS } from "@/lib/analytics";
 
-export function useAnalyticsDashboard(days: AnalyticsDays) {
+export function useAnalyticsDashboard(days: AnalyticsDays, scope: AnalyticsScope) {
   const { data: session } = useAuthSession();
-  const refreshInterval = ANALYTICS_REFRESH_INTERVAL_MS;
-
-  const summary = useSWR<AnalyticsSummaryResponse>(
-    session ? `/api/analytics/summary?days=${days}` : null,
-    { refreshInterval }
-  );
-
-  const timeseries = useSWR<AnalyticsTimeseriesResponse>(
-    session ? `/api/analytics/timeseries?days=${days}` : null,
-    { refreshInterval }
-  );
-
-  const repos = useSWR<AnalyticsBreakdownResponse>(
-    session ? `/api/analytics/breakdown?days=${days}&by=repo` : null,
-    { refreshInterval }
-  );
-
-  const users = useSWR<AnalyticsBreakdownResponse>(
-    session ? `/api/analytics/breakdown?days=${days}&by=user` : null,
-    { refreshInterval }
-  );
-
-  const pullRequests = useSWR<AnalyticsPullRequestsResponse>(
-    session ? `/api/analytics/pull-requests?days=${days}` : null,
-    { refreshInterval }
+  const { data, error, isLoading, isValidating } = useSWR<AnalyticsDashboardResponse>(
+    session ? `/api/analytics/dashboard?days=${days}&scope=${scope}` : null,
+    // Keep the last snapshot on screen while another range or scope loads.
+    { refreshInterval: ANALYTICS_REFRESH_INTERVAL_MS, keepPreviousData: true }
   );
 
   return {
-    summary: summary.data,
-    timeseries: timeseries.data,
-    repoBreakdown: repos.data,
-    userBreakdown: users.data,
-    pullRequests: pullRequests.data,
-    loading:
-      (!summary.data && summary.isLoading) ||
-      (!timeseries.data && timeseries.isLoading) ||
-      (!repos.data && repos.isLoading) ||
-      (!users.data && users.isLoading) ||
-      (!pullRequests.data && pullRequests.isLoading),
-    error: summary.error ?? timeseries.error ?? repos.error ?? users.error ?? pullRequests.error,
+    dashboard: data,
+    loading: !data && isLoading,
+    /**
+     * The snapshot belongs to another range or scope: kept on screen while the
+     * requested one loads, and still there if that request failed.
+     */
+    stale: Boolean(data && (data.window.days !== days || data.window.scope !== scope)),
+    /** A request is in flight, whether a first load, a key change, a retry, or a refresh. */
+    validating: isValidating,
+    error,
   };
 }

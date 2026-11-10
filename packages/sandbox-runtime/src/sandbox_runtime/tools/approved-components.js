@@ -29,10 +29,25 @@ export function resolveAdoptionRepository(requested, members) {
   return members.length === 1 ? members[0] : null;
 }
 
+const STANCES = {
+  preferred: "the organization's standard for its category; use it for new work",
+  allowed: "acceptable; use it when the user or the repository already chose it",
+  denied: "never use it, even if asked; use the category's preferred component instead",
+};
+
+/** Lead each result with what the agent must act on: its stance and category. */
+export function describeComponents(components) {
+  return components.map((component) => ({
+    stance: component?.stance ?? "allowed",
+    category: component?.categoryId ?? null,
+    ...component,
+  }));
+}
+
 export default tool({
   name: "approved-components",
   description:
-    "Search the organisation's centrally approved libraries, services, templates, and code snippets before implementing common functionality such as authentication, authorization, logging, secrets, or database access. Results include the reviewed locator, exact version or integrity digest, owner, provenance, and usage instructions. Use action=adopt after you actually choose a component for a repository; this records the consumer so its owner can find applications affected by upgrades or deprecation.",
+    "Search the organisation's centrally approved libraries, services, templates, and code snippets before implementing common functionality such as authentication, authorization, logging, secrets, or database access. Results include each component's stance (preferred, allowed or denied) and category, the reviewed locator, exact version or integrity digest, owner, provenance, and usage instructions. Use action=adopt after you actually choose a component for a repository; this records the consumer so its owner can find applications affected by upgrades or deprecation. Components with detection signals (packages, toolchain files) are recorded automatically from the repository and need no adopt.",
   args: {
     action: z
       .enum(["search", "adopt"])
@@ -65,7 +80,15 @@ export default tool({
         if (!Array.isArray(components) || components.length === 0) {
           return "No centrally approved component matched this session and query.";
         }
-        return JSON.stringify({ count: components.length, components }, null, 2);
+        return JSON.stringify(
+          {
+            count: components.length,
+            stances: STANCES,
+            components: describeComponents(components),
+          },
+          null,
+          2
+        );
       }
 
       if (!args.componentId) return "componentId is required when action=adopt.";
@@ -80,6 +103,9 @@ export default tool({
           body: JSON.stringify({ repoOwner: target.owner, repoName: target.name }),
         }
       );
+      if (response.status === 409) {
+        return `Adoption not recorded: ${await extractError(response)}. Components with detection signals are recorded automatically from the repository's manifests and toolchain files, so nothing else is needed.`;
+      }
       if (!response.ok)
         return `Approved component adoption failed: ${await extractError(response)}`;
       return JSON.stringify({ ok: true, consumer: await response.json() }, null, 2);

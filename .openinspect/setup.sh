@@ -27,26 +27,37 @@ check_cmd node
 check_cmd npm
 
 NODE_MAJOR=$(node -p 'process.versions.node.split(".")[0]')
-if (( NODE_MAJOR < 20 )); then
-  error "Node.js >= 20 required (found $(node -v)). Please upgrade."
-  exit 1
+if (( NODE_MAJOR < 24 )); then
+  warn "Node.js >= 24 required (found $(node -v)). Please upgrade; continuing setup."
+else
+  info "Node $(node -v) ✓"
 fi
-info "Node $(node -v) ✓"
 
 # ---------------------------------------------------------------------------
-# 2. Install npm dependencies (also triggers husky via prepare script)
+# 2. Create local configuration
+# ---------------------------------------------------------------------------
+if [ ! -f .env ]; then
+  cp .env.example .env
+  info "Created .env from .env.example"
+  warn "Fill in CONTROL_PLANE_URL, NEXT_PUBLIC_WS_URL, and SERVICE_AUTH_SECRET before running the web app."
+else
+  info "Keeping existing .env ✓"
+fi
+
+# ---------------------------------------------------------------------------
+# 3. Install npm dependencies (also triggers husky via prepare script)
 # ---------------------------------------------------------------------------
 info "Installing npm dependencies…"
 npm install
 
 # ---------------------------------------------------------------------------
-# 3. Build shared package (other packages depend on it)
+# 4. Build shared package (other packages depend on it)
 # ---------------------------------------------------------------------------
 info "Building @open-inspect/shared…"
 npm run build -w @open-inspect/shared
 
 # ---------------------------------------------------------------------------
-# 4. Verify git hooks
+# 5. Verify git hooks
 # ---------------------------------------------------------------------------
 if [ -f .git/hooks/pre-commit ]; then
   info "Git hooks (husky) installed ✓"
@@ -56,7 +67,7 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 5. Python environment (optional — for modal-infra development)
+# 6. Python environment (optional — for modal-infra development)
 # ---------------------------------------------------------------------------
 MODAL_DIR="$REPO_ROOT/packages/modal-infra"
 
@@ -113,7 +124,7 @@ if [ -d "$MODAL_DIR" ]; then
 fi
 
 # ---------------------------------------------------------------------------
-# 6. Verify the setup
+# 7. Verify the setup
 # ---------------------------------------------------------------------------
 info "Running type check…"
 if npm run typecheck; then
@@ -127,7 +138,7 @@ fi
 # ---------------------------------------------------------------------------
 printf '\n'
 info "Setup complete! You can now:"
-info "  npm run dev -w @open-inspect/web        # Start web dev server"
+info "  npm run dev                                  # Start web dev server using .env"
 info "  npm run test -w @open-inspect/control-plane  # Run control-plane tests"
 info "  npm run lint                             # Lint all packages"
 info "  npm run typecheck                        # Type-check all packages"

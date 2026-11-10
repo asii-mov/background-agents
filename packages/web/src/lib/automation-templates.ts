@@ -10,11 +10,7 @@ import type { AutomationTriggerType } from "@open-inspect/shared/triggers";
 import type { AutomationFormValues } from "@/components/automations/automation-form";
 
 export type TemplateCategory =
-  | "popular"
-  | "code-review"
-  | "security"
-  | "incidents"
-  | "data-research";
+  "popular" | "code-review" | "security" | "incidents" | "data-research";
 
 /**
  * The create-form fields a template pre-fills. The repository selection and
@@ -217,7 +213,7 @@ export const automationTemplates: AutomationTemplate[] = [
       eventType: "check_suite.completed",
       // Only fire on failed suites — avoids spawning a run on every green build.
       triggerConfig: {
-        conditions: [{ type: "check_conclusion", operator: "eq", value: "failure" }],
+        conditions: [{ type: "conclusion", operator: "eq", value: "failure" }],
       },
       instructions:
         "A CI check suite failed on this repository; the failing branch and commit are shown above.\n\n" +

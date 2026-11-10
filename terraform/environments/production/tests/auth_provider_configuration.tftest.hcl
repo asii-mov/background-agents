@@ -32,11 +32,13 @@ variables {
   modal_workspace    = "test-workspace"
   modal_api_secret   = "test-modal-api-secret"
 
-  web_platform      = "cloudflare"
-  project_root      = "../../../"
-  enable_github_bot = false
-  enable_slack_bot  = false
-  enable_linear_bot = false
+  web_platform          = "cloudflare"
+  cf_access_team_domain = "https://test-team.cloudflareaccess.com"
+  cf_access_aud         = "test-openinspect-audience"
+  project_root          = "../../../"
+  enable_github_bot     = false
+  enable_slack_bot      = false
+  enable_linear_bot     = false
 
   github_client_id     = "github-id"
   github_client_secret = "github-secret"
@@ -70,6 +72,82 @@ run "github_only" {
     condition     = nonsensitive(local.effective_provider_accounts_encryption_key) == "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="
     error_message = "An operator-provided provider account key must remain unchanged."
   }
+}
+
+run "cloudflare_access_environment" {
+  command = plan
+
+  assert {
+    condition = (
+      strcontains(local_file.web_app_wrangler_production[0].content, "CF_ACCESS_TEAM_DOMAIN = \"https://test-team.cloudflareaccess.com\"") &&
+      strcontains(local_file.web_app_wrangler_production[0].content, "CF_ACCESS_AUD = \"test-openinspect-audience\"") &&
+      !strcontains(local_file.web_app_wrangler_production[0].content, "AUTH_DEV_BYPASS")
+    )
+    error_message = "The web Worker must receive its Access issuer and audience without a development bypass."
+  }
+}
+
+run "reject_missing_access_team" {
+  command = plan
+  variables {
+    cf_access_team_domain = ""
+  }
+  expect_failures = [var.cf_access_team_domain]
+}
+
+run "reject_http_access_team" {
+  command = plan
+  variables {
+    cf_access_team_domain = "http://test-team.cloudflareaccess.com"
+  }
+  expect_failures = [var.cf_access_team_domain]
+}
+
+run "reject_access_team_path" {
+  command = plan
+  variables {
+    cf_access_team_domain = "https://test-team.cloudflareaccess.com/path"
+  }
+  expect_failures = [var.cf_access_team_domain]
+}
+
+run "reject_non_cloudflare_access_team" {
+  command = plan
+  variables {
+    cf_access_team_domain = "https://untrusted.example.com"
+  }
+  expect_failures = [var.cf_access_team_domain]
+}
+
+run "reject_missing_access_audience" {
+  command = plan
+  variables {
+    cf_access_aud = ""
+  }
+  expect_failures = [var.cf_access_aud]
+}
+
+run "reject_vercel_missing_access_audience" {
+  command = plan
+  variables {
+    web_platform         = "vercel"
+    vercel_api_token     = "test-vercel-token"
+    vercel_team_id       = "test-vercel-team"
+    vercel_custom_domain = "inspect.example.com"
+    cf_access_aud        = ""
+  }
+  expect_failures = [var.cf_access_aud]
+}
+
+run "reject_vercel_without_custom_domain" {
+  command = plan
+  variables {
+    web_platform         = "vercel"
+    vercel_api_token     = "test-vercel-token"
+    vercel_team_id       = "test-vercel-team"
+    vercel_custom_domain = null
+  }
+  expect_failures = [terraform_data.vercel_custom_domain_gate]
 }
 
 run "terraform_generated_provider_account_key" {
@@ -130,20 +208,22 @@ run "vercel_github_only" {
   command = plan
 
   variables {
-    web_platform     = "vercel"
-    vercel_api_token = "test-vercel-token"
-    vercel_team_id   = "test-vercel-team"
+    web_platform         = "vercel"
+    vercel_api_token     = "test-vercel-token"
+    vercel_team_id       = "test-vercel-team"
+    vercel_custom_domain = "inspect.example.com"
   }
 
   assert {
     condition = (
-      output.web_app_url == module.web_app[0].production_url &&
+      output.web_app_url == "https://inspect.example.com" &&
+      module.web_app[0].custom_domain == "inspect.example.com" &&
       strcontains(
         nonsensitive(output.verification_commands),
-        "curl ${module.web_app[0].production_url}"
+        "curl https://inspect.example.com"
       )
     )
-    error_message = "Web verification must use the effective Vercel production URL."
+    error_message = "Vercel browser authentication and verification must use the Access-protected custom domain."
   }
 }
 
@@ -267,5 +347,5 @@ run "anthropic_api_key_blank" {
     anthropic_api_key    = ""
   }
 
-  expect_failures = [var.anthropic_api_key]
+  expect_failures = [var.classification_anthropic_api_key]
 }

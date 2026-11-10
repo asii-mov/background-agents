@@ -40,7 +40,10 @@ describe("resolveSessionScopedSettings", () => {
   it("resolves both settings from the primary (position 0) member", async () => {
     mockState.resolved["code-server"] = { enabledRepos: null, settings: { enabled: true } };
     mockState.resolved["vnc"] = { enabledRepos: null, settings: { enabled: true } };
-    mockState.resolved["sandbox"] = { enabledRepos: null, settings: { tunnelPorts: [8080] } };
+    mockState.resolved["sandbox"] = {
+      enabledRepos: null,
+      settings: { tunnelPorts: [8080], cpuCores: null },
+    };
 
     const result = await resolveSessionScopedSettings(DB, [
       { repoOwner: "acme", repoName: "web" },
@@ -50,7 +53,7 @@ describe("resolveSessionScopedSettings", () => {
     expect(result).toEqual({
       codeServerEnabled: true,
       vncEnabled: true,
-      sandboxSettings: { tunnelPorts: [8080] },
+      sandboxSettings: { tunnelPorts: [8080], cpuCores: null },
     });
     // Every resolution targets the primary member; the secondary is never asked about.
     expect(mockState.resolvedCalls.map((c) => c.repo)).toEqual([
@@ -125,5 +128,67 @@ describe("resolveSessionScopedSettings", () => {
     const result = await resolveSessionScopedSettings(DB, []);
 
     expect(result.sandboxSettings).toEqual({ networkPolicy: { mode: "blocked" } });
+  });
+
+  it("disables all primary-scoped settings when the primary repo is outside the allowlist", async () => {
+    mockState.resolved["code-server"] = {
+      enabledRepos: ["acme/backend"],
+      settings: { enabled: true },
+    };
+    mockState.resolved["vnc"] = { enabledRepos: ["acme/backend"], settings: { enabled: true } };
+    mockState.resolved["sandbox"] = {
+      enabledRepos: ["acme/backend"],
+      settings: { tunnelPorts: [8080], cpuCores: 2 },
+    };
+
+    const result = await resolveSessionScopedSettings(DB, [
+      { repoOwner: "acme", repoName: "web" },
+      { repoOwner: "acme", repoName: "backend" },
+    ]);
+
+    expect(result).toEqual({
+      codeServerEnabled: false,
+      vncEnabled: false,
+      sandboxSettings: {},
+    });
+  });
+
+  it("matches enabled repo allowlists case-insensitively, including nested owners", async () => {
+    mockState.resolved["code-server"] = {
+      enabledRepos: ["group/subgroup/web"],
+      settings: { enabled: true },
+    };
+    mockState.resolved["vnc"] = {
+      enabledRepos: ["group/subgroup/web"],
+      settings: { enabled: true },
+    };
+    mockState.resolved["sandbox"] = {
+      enabledRepos: ["group/subgroup/web"],
+      settings: { buildTimeoutSeconds: 1200 },
+    };
+
+    const result = await resolveSessionScopedSettings(DB, [
+      { repoOwner: "Group/SubGroup", repoName: "Web" },
+    ]);
+
+    expect(result).toEqual({
+      codeServerEnabled: true,
+      vncEnabled: true,
+      sandboxSettings: { buildTimeoutSeconds: 1200 },
+    });
+  });
+
+  it("rejects malformed persisted settings and blocks egress", async () => {
+    mockState.resolved["code-server"] = { enabledRepos: null, settings: { enabled: "true" } };
+    mockState.resolved["vnc"] = { enabledRepos: null, settings: { enabled: "true" } };
+    mockState.resolved["sandbox"] = { enabledRepos: null, settings: { tunnelPorts: ["8080"] } };
+
+    const result = await resolveSessionScopedSettings(DB, [{ repoOwner: "acme", repoName: "web" }]);
+
+    expect(result).toEqual({
+      codeServerEnabled: false,
+      vncEnabled: false,
+      sandboxSettings: { networkPolicy: { mode: "blocked" } },
+    });
   });
 });

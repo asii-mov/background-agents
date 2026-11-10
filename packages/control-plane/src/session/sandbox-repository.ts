@@ -1,18 +1,53 @@
-import type { GitSyncStatus } from "@open-inspect/shared/types/sandbox-events";
+import type { GitSyncStatus, SandboxBootPhase } from "@open-inspect/shared/types/sandbox-events";
 import type { SandboxStatus } from "@open-inspect/shared/types/sessions";
-import type { SqlResult, SqlStorage } from "./sql-storage";
-import type { SandboxRow } from "./types";
+import { z } from "zod";
+import type { SqlStorage } from "./sql-storage";
+import {
+  sandboxRowSchema,
+  SessionStorageIntegrityError,
+  type SandboxAccessKind,
+  type SandboxRow,
+} from "./types";
 import type { Logger } from "../logger";
 import { coerceSandboxStatus } from "../sandbox/sandbox-status";
 import { encryptToken } from "../auth/crypto";
+import { decryptStoredAccessValue } from "./sandbox-access";
 
 /** A sandbox row exactly as SQLite returns it, before the status is validated. */
-type RawSandboxRow = Omit<SandboxRow, "status"> & { status: string };
+const rawSandboxRowSchema = sandboxRowSchema.extend({ status: z.unknown().optional() });
+type RawSandboxRow = z.infer<typeof rawSandboxRowSchema>;
+
+const sandboxCircuitBreakerRowSchema = z.object({
+  status: z.unknown().optional(),
+  created_at: z.number(),
+  last_heartbeat: z.number().nullable(),
+  modal_object_id: z.string().nullable(),
+  snapshot_image_id: z.string().nullable(),
+  snapshot_runtime_version: z.string().nullable(),
+  spawn_failure_count: z.number().nullable(),
+  last_spawn_failure: z.number().nullable(),
+});
+type SandboxCircuitBreakerRow = z.infer<typeof sandboxCircuitBreakerRowSchema>;
+
+const sandboxAccessSecretRowSchema = z.object({ secret: z.string().nullable() });
+const sandboxStatusReturnRowSchema = z.object({ status: z.unknown() });
+
+/** URL and secret columns backing each access artifact kind. */
+const ACCESS_ARTIFACT_COLUMNS: Record<
+  SandboxAccessKind,
+  { urlColumn: string; secretColumn: string }
+> = {
+  codeServer: { urlColumn: "code_server_url", secretColumn: "code_server_password" },
+  vnc: { urlColumn: "vnc_url", secretColumn: "vnc_password" },
+  ttyd: { urlColumn: "ttyd_url", secretColumn: "ttyd_token" },
+};
 
 /** Minimal sandbox state needed for circuit breaker spawn decisions. */
 export interface SandboxCircuitBreakerState {
   status: SandboxStatus;
   created_at: number;
+  /** Null until this generation's bridge first connected (cleared per generation). */
+  last_heartbeat: number | null;
   modal_object_id: string | null;
   snapshot_image_id: string | null;
   snapshot_runtime_version: string | null;
@@ -42,6 +77,15 @@ export interface ResumeSandboxData {
   createdAt: number;
 }
 
+/** Provider access discovered while resuming an existing sandbox. */
+export interface ProviderResumeAccessData {
+  providerObjectId: string;
+  codeServer: { url: string; password: string } | null;
+  vnc: { url: string; password: string } | null;
+  ttyd: { url: string | null; token: string } | null;
+  tunnelUrls: Record<string, string> | null;
+}
+
 /**
  * Persistence for the sandbox scoped to one session.
  *
@@ -58,10 +102,6 @@ export class SandboxRepository {
     private readonly encryptionKey: string
   ) {}
 
-  private rows<T>(result: SqlResult): T[] {
-    return result.toArray() as T[];
-  }
-
   /**
    * The session's sandbox row, with its status validated.
    *
@@ -74,17 +114,15 @@ export class SandboxRepository {
    */
   getSandbox(): SandboxRow | null {
     const result = this.sql.exec(`SELECT * FROM sandbox LIMIT 1`);
-    const rows = this.rows<RawSandboxRow>(result);
-    const row = rows[0];
+    const row = parseSandboxRow(result.toArray()[0]);
     return row ? { ...row, status: coerceSandboxStatus(row.status, this.log) } : null;
   }
 
   getSandboxWithCircuitBreaker(): SandboxCircuitBreakerState | null {
     const result = this.sql.exec(
-      `SELECT status, created_at, modal_object_id, snapshot_image_id, snapshot_runtime_version, spawn_failure_count, last_spawn_failure FROM sandbox LIMIT 1`
+      `SELECT status, created_at, last_heartbeat, modal_object_id, snapshot_image_id, snapshot_runtime_version, spawn_failure_count, last_spawn_failure FROM sandbox LIMIT 1`
     );
-    const rows = this.rows<Omit<SandboxCircuitBreakerState, "status"> & { status: string }>(result);
-    const row = rows[0];
+    const row = parseSandboxCircuitBreakerRow(result.toArray()[0]);
     return row ? { ...row, status: coerceSandboxStatus(row.status, this.log) } : null;
   }
 
@@ -107,15 +145,159 @@ export class SandboxRepository {
   }
 
   /**
+   * Move the sandbox from `from` to `to` only while the row still carries the
+   * sandbox `generation` names (its logical id and the `created_at` its
+   * reservation or resume stamped) and is still in `from`; reports whether it
+   * was. The conditional form of `updateSandboxStatus` for writes that follow
+   * an await: another event may have moved the row, and a newer attempt may
+   * have brought it back to the same status.
+   */
+  transitionSandboxStatus(
+    generation: { sandboxId: string | null; createdAt: number },
+    from: SandboxStatus,
+    to: SandboxStatus
+  ): boolean {
+    const result = this.sql.exec(
+      `UPDATE sandbox SET status = ?
+       WHERE id = (SELECT id FROM sandbox LIMIT 1)
+         AND modal_sandbox_id IS ? AND created_at = ? AND status = ?`,
+      to,
+      generation.sandboxId,
+      generation.createdAt,
+      from
+    );
+    // Consume the result before reading rowsWritten so the count is final.
+    result.toArray();
+    return (result.rowsWritten ?? 0) > 0;
+  }
+
+  /** Persist cleanup responsibility while permanently revoking a rejected generation. */
+  rejectProviderStartup(
+    generation: { sandboxId: string | null; createdAt: number },
+    providerObjectId: string | null
+  ): "failed" | "retained" | "superseded" {
+    const assignments = `modal_object_id = ?, fenced = 1, startup_rejected = 1,
+         auth_token_hash = '', auth_token = NULL, active_socket_id = ''`;
+    const identity = `id = (SELECT id FROM sandbox LIMIT 1)
+         AND modal_sandbox_id IS ? AND created_at = ?`;
+    const args = [providerObjectId, generation.sandboxId, generation.createdAt];
+    const failed = this.sql
+      .exec(
+        `UPDATE sandbox SET ${assignments}, status = 'failed'
+       WHERE ${identity} AND status IN ('spawning', 'connecting', 'ready')
+       RETURNING id`,
+        ...args
+      )
+      .toArray();
+    if (failed.length) return "failed";
+    const retained = this.sql
+      .exec(`UPDATE sandbox SET ${assignments} WHERE ${identity} RETURNING id`, ...args)
+      .toArray();
+    return retained.length ? "retained" : "superseded";
+  }
+
+  commitProviderStartup(
+    generation: { sandboxId: string | null; createdAt: number },
+    providerObjectId: string | null,
+    allowFailedSelfHeal: boolean
+  ): SandboxStatus | null {
+    const result = this.sql.exec(
+      `UPDATE sandbox
+       SET modal_object_id = COALESCE(?, modal_object_id),
+           status = CASE WHEN status = 'spawning' THEN 'connecting' ELSE status END
+       WHERE id = (SELECT id FROM sandbox LIMIT 1)
+         AND modal_sandbox_id IS ? AND created_at = ? AND fenced = 0
+         AND (status IN ('spawning', 'connecting', 'ready')
+              OR (? = 1 AND status = 'failed'))
+       RETURNING status`,
+      providerObjectId,
+      generation.sandboxId,
+      generation.createdAt,
+      allowFailedSelfHeal ? 1 : 0
+    );
+    const row = sandboxStatusReturnRowSchema.safeParse(result.toArray()[0]);
+    return row.success ? coerceSandboxStatus(row.data.status, this.log) : null;
+  }
+
+  /**
+   * Move the row to `ready` if it is booting or self-healing, and report
+   * whether it moved. `ready` is excluded so a reconnecting bridge's repeat
+   * `ready` event changes nothing; `stopped` and `stale` are terminal and
+   * reconnect-blocked, and a cancel writes `stopped` without detaching the
+   * socket, so a late `ready` must not revive them; a fenced `failed` row had
+   * its credentials revoked for good, while an unfenced one is a watchdog
+   * failure whose boot may still arrive. Only the generation that emitted
+   * the event may move the row: a replacement reserved in the meantime is
+   * readied by its own runtime, not by the old one's late report. Clears the
+   * boot phase in the same write: the phase describes a boot that is over.
+   */
+  markSandboxReady(generation: { sandboxId: string | null; createdAt: number }): boolean {
+    const result = this.sql.exec(
+      `UPDATE sandbox SET status = 'ready', boot_phase = NULL, boot_seq = NULL
+       WHERE id = (SELECT id FROM sandbox LIMIT 1)
+         AND modal_sandbox_id IS ? AND created_at = ?
+         AND status NOT IN ('ready', 'stopped', 'stale')
+         AND fenced = 0`,
+      generation.sandboxId,
+      generation.createdAt
+    );
+    // Consume the result before reading rowsWritten so the count is final.
+    result.toArray();
+    return (result.rowsWritten ?? 0) > 0;
+  }
+
+  /**
+   * Record the boot phase the runtime reported under `bootSeq`, unless an
+   * equal or later report already landed or the boot is over; reports
+   * whether it was recorded. The bridge resends its latest phase on every
+   * reconnect, so this is what keeps that resend from being observed twice,
+   * and what keeps a resend after `ready` (which cleared the sequence) from
+   * describing a boot that has finished. A `failed` row still records: an
+   * unfenced one may be a boot that outlived the watchdog and is still going.
+   */
+  recordBootProgress(phase: SandboxBootPhase, bootSeq: number): boolean {
+    const result = this.sql.exec(
+      `UPDATE sandbox SET boot_phase = ?, boot_seq = ?
+       WHERE id = (SELECT id FROM sandbox LIMIT 1)
+         AND status NOT IN ('ready', 'snapshotting', 'stopped', 'stale')
+         AND (boot_seq IS NULL OR boot_seq < ?)`,
+      JSON.stringify(phase),
+      bootSeq,
+      bootSeq
+    );
+    // Consume the result before reading rowsWritten so the count is final.
+    result.toArray();
+    return (result.rowsWritten ?? 0) > 0;
+  }
+
+  /**
+   * Revoke this generation's credentials and socket authority for good. A
+   * fenced runtime's next sandbox-authenticated call or reconnect is refused,
+   * which is what stops a sandbox on a provider with no explicit stop, and
+   * `markSandboxReady` refuses the row so nothing can revive it. Only the
+   * next reservation (`updateSandboxForSpawn`) lifts the fence.
+   */
+  fenceSandboxGeneration(): void {
+    this.sql.exec(
+      `UPDATE sandbox SET auth_token_hash = '', auth_token = NULL, active_socket_id = '', fenced = 1
+       WHERE id = (SELECT id FROM sandbox LIMIT 1)`
+    );
+  }
+
+  /**
    * Phase 1 of the two-phase spawn write (#1589): the reservation itself
    * invalidates credentials — no token can match the emptied hash — until
    * `updateSandboxAuthTokenHash` publishes the new one.
+   * `last_heartbeat` is cleared with the rest of the generation identity: it
+   * is the mark that this generation's bridge has connected, so a replacement
+   * must not inherit the predecessor's.
    */
   updateSandboxForSpawn(data: SpawnSandboxData): void {
     this.sql.exec(
       `UPDATE sandbox SET
          status = ?,
          created_at = ?,
+         last_heartbeat = NULL,
          auth_token_hash = '',
          auth_token = NULL,
          modal_sandbox_id = ?,
@@ -127,7 +309,11 @@ export class SandboxRepository {
          tunnel_urls = NULL,
          ttyd_url = NULL,
          ttyd_token = NULL,
-         runtime_version = NULL
+         runtime_version = NULL,
+         active_socket_id = '',
+         boot_phase = NULL,
+         boot_seq = NULL,
+         fenced = 0, startup_rejected = 0
        WHERE id = (SELECT id FROM sandbox LIMIT 1)`,
       data.status,
       data.createdAt,
@@ -136,13 +322,36 @@ export class SandboxRepository {
   }
 
   /**
+   * Make `socketId` the socket the session dispatches to; every earlier
+   * socket loses authority. `active_socket_id` is three-valued: a tag id,
+   * `''` for revoked (no socket matches, see `revokeActiveSocketId` and the
+   * spawn reservation above), and NULL only on rows that predate persisted
+   * identities.
+   */
+  setActiveSocketId(socketId: string): void {
+    this.sql.exec(
+      `UPDATE sandbox SET active_socket_id = ? WHERE id = (SELECT id FROM sandbox LIMIT 1)`,
+      socketId
+    );
+  }
+
+  /** Leave the session with no authoritative bridge socket until the next accept. */
+  revokeActiveSocketId(): void {
+    this.sql.exec(
+      `UPDATE sandbox SET active_socket_id = '' WHERE id = (SELECT id FROM sandbox LIMIT 1)`
+    );
+  }
+
+  /**
    * Phase 2 of the two-phase spawn write (#1589): publish the reserved
-   * identity's hash. Scoped to that identity so a delayed publisher cannot
-   * attach its hash to a newer reservation; reports whether it applied.
+   * identity's hash. Scoped to that identity and to the reservation's
+   * `spawning` status, so a delayed publisher cannot attach its hash to a
+   * newer reservation and a reservation that a cancel stopped while the hash
+   * was computed cannot go live; reports whether it applied.
    */
   updateSandboxAuthTokenHash(modalSandboxId: string, authTokenHash: string): boolean {
     const result = this.sql.exec(
-      `UPDATE sandbox SET auth_token_hash = ? WHERE modal_sandbox_id = ?`,
+      `UPDATE sandbox SET auth_token_hash = ? WHERE modal_sandbox_id = ? AND status = 'spawning'`,
       authTokenHash,
       modalSandboxId
     );
@@ -156,11 +365,61 @@ export class SandboxRepository {
       `UPDATE sandbox SET
          status = ?,
          created_at = ?,
-         last_heartbeat = NULL
+         last_heartbeat = NULL,
+         boot_phase = NULL,
+         boot_seq = NULL,
+         fenced = 0, startup_rejected = 0
        WHERE id = (SELECT id FROM sandbox LIMIT 1)`,
       data.status,
       data.createdAt
     );
+  }
+
+  /**
+   * Commit all provider access returned by a resume as one generation-scoped
+   * write. `ready` is allowed because the bridge can complete startup before
+   * the provider's resume request returns.
+   */
+  async completeProviderResume(
+    generation: { sandboxId: string | null; createdAt: number },
+    access: ProviderResumeAccessData,
+    expectedProviderObjectId?: string
+  ): Promise<boolean> {
+    const [codeServerPassword, vncPassword, ttydToken] = await Promise.all([
+      access.codeServer ? this.encrypt(access.codeServer.password) : null,
+      access.vnc ? this.encrypt(access.vnc.password) : null,
+      access.ttyd ? this.encrypt(access.ttyd.token) : null,
+    ]);
+    const result = this.sql.exec(
+      `UPDATE sandbox SET
+         modal_object_id = ?,
+         code_server_url = ?,
+         code_server_password = ?,
+         vnc_url = ?,
+         vnc_password = ?,
+         ttyd_url = ?,
+         ttyd_token = ?,
+         tunnel_urls = ?
+       WHERE id = (SELECT id FROM sandbox LIMIT 1)
+         AND modal_sandbox_id IS ? AND created_at = ?
+          AND (status IN ('connecting', 'ready') OR (? IS NOT NULL AND status = 'spawning'))
+          AND fenced = 0 AND (? IS NULL OR modal_object_id = ?)`,
+      access.providerObjectId,
+      access.codeServer?.url ?? null,
+      codeServerPassword,
+      access.vnc?.url ?? null,
+      vncPassword,
+      access.ttyd?.url ?? null,
+      ttydToken,
+      access.tunnelUrls ? JSON.stringify(access.tunnelUrls) : null,
+      generation.sandboxId,
+      generation.createdAt,
+      expectedProviderObjectId ?? null,
+      expectedProviderObjectId ?? null,
+      expectedProviderObjectId ?? null
+    );
+    result.toArray();
+    return (result.rowsWritten ?? 0) > 0;
   }
 
   updateSandboxModalObjectId(modalObjectId: string | null): void {
@@ -170,17 +429,44 @@ export class SandboxRepository {
     );
   }
 
-  updateSandboxSnapshotImageId(
-    sandboxId: string,
+  /**
+   * Record `imageId` as the snapshot of the sandbox identified by
+   * `sandboxId`, with the runtime version that produced it. Applies
+   * only while that is still the row's sandbox; reports whether it was.
+   */
+  recordSandboxSnapshot(
+    sandboxId: string | null,
     imageId: string,
     runtimeVersion: string | null
-  ): void {
-    this.sql.exec(
-      `UPDATE sandbox SET snapshot_image_id = ?, snapshot_runtime_version = ? WHERE id = ?`,
+  ): boolean {
+    const result = this.sql.exec(
+      `UPDATE sandbox SET snapshot_image_id = ?, snapshot_runtime_version = ?
+       WHERE id = (SELECT id FROM sandbox LIMIT 1) AND modal_sandbox_id IS ?`,
       imageId,
       runtimeVersion,
       sandboxId
     );
+    // Consume the result before reading rowsWritten so the count is final.
+    result.toArray();
+    return (result.rowsWritten ?? 0) > 0;
+  }
+
+  /**
+   * Stop the generation and forget its snapshot and provider handle, so the
+   * next start is a fresh spawn: no restore from the snapshot and no resume of
+   * the provider object. Applies only while the row is still that generation.
+   */
+  discardSandboxState(generation: { sandboxId: string | null; createdAt: number }): boolean {
+    const result = this.sql.exec(
+      `UPDATE sandbox SET status = 'stopped', snapshot_image_id = NULL,
+         snapshot_runtime_version = NULL, modal_object_id = NULL
+       WHERE id = (SELECT id FROM sandbox LIMIT 1)
+         AND modal_sandbox_id IS ? AND created_at = ?`,
+      generation.sandboxId,
+      generation.createdAt
+    );
+    result.toArray();
+    return (result.rowsWritten ?? 0) > 0;
   }
 
   /**
@@ -244,42 +530,41 @@ export class SandboxRepository {
     );
   }
 
-  async updateSandboxCodeServer(url: string, password: string): Promise<void> {
+  /** Set one access artifact's URL and encrypted secret. */
+  async updateSandboxAccess(kind: SandboxAccessKind, url: string, secret: string): Promise<void> {
+    const { urlColumn, secretColumn } = ACCESS_ARTIFACT_COLUMNS[kind];
     this.sql.exec(
-      `UPDATE sandbox SET code_server_url = ?, code_server_password = ? WHERE id = (SELECT id FROM sandbox LIMIT 1)`,
+      `UPDATE sandbox SET ${urlColumn} = ?, ${secretColumn} = ? WHERE id = (SELECT id FROM sandbox LIMIT 1)`,
       url,
-      await this.encrypt(password)
+      await this.encrypt(secret)
     );
   }
 
-  clearSandboxCodeServer(): void {
+  /** Read and decrypt one access artifact's stored secret. */
+  async getSandboxAccessSecret(kind: SandboxAccessKind): Promise<string | null> {
+    const { secretColumn } = ACCESS_ARTIFACT_COLUMNS[kind];
+    const row = this.sql.exec(`SELECT ${secretColumn} AS secret FROM sandbox LIMIT 1`).toArray()[0];
+    const parsed = row === undefined ? null : sandboxAccessSecretRowSchema.safeParse(row);
+    if (parsed && !parsed.success) {
+      throw new SessionStorageIntegrityError("Malformed persisted sandbox access secret");
+    }
+    return decryptStoredAccessValue(parsed?.data.secret ?? null, this.encryptionKey, this.log);
+  }
+
+  /** Clear one access artifact's URL and secret. */
+  clearSandboxAccess(kind: SandboxAccessKind): void {
+    const { urlColumn, secretColumn } = ACCESS_ARTIFACT_COLUMNS[kind];
     this.sql.exec(
-      `UPDATE sandbox SET code_server_url = NULL, code_server_password = NULL WHERE id = (SELECT id FROM sandbox LIMIT 1)`
+      `UPDATE sandbox SET ${urlColumn} = NULL, ${secretColumn} = NULL WHERE id = (SELECT id FROM sandbox LIMIT 1)`
     );
   }
 
-  clearSandboxCodeServerUrl(): void {
+  /** Clear one access artifact's URL while preserving its stored secret. */
+  clearSandboxAccessUrl(kind: SandboxAccessKind): void {
+    const { urlColumn } = ACCESS_ARTIFACT_COLUMNS[kind];
     this.sql.exec(
-      `UPDATE sandbox SET code_server_url = NULL WHERE id = (SELECT id FROM sandbox LIMIT 1)`
+      `UPDATE sandbox SET ${urlColumn} = NULL WHERE id = (SELECT id FROM sandbox LIMIT 1)`
     );
-  }
-
-  async updateSandboxVnc(url: string, password: string): Promise<void> {
-    this.sql.exec(
-      `UPDATE sandbox SET vnc_url = ?, vnc_password = ? WHERE id = (SELECT id FROM sandbox LIMIT 1)`,
-      url,
-      await this.encrypt(password)
-    );
-  }
-
-  clearSandboxVnc(): void {
-    this.sql.exec(
-      `UPDATE sandbox SET vnc_url = NULL, vnc_password = NULL WHERE id = (SELECT id FROM sandbox LIMIT 1)`
-    );
-  }
-
-  clearSandboxVncUrl(): void {
-    this.sql.exec(`UPDATE sandbox SET vnc_url = NULL WHERE id = (SELECT id FROM sandbox LIMIT 1)`);
   }
 
   updateSandboxTunnelUrls(urls: Record<string, string>): void {
@@ -292,20 +577,6 @@ export class SandboxRepository {
   clearSandboxTunnelUrls(): void {
     this.sql.exec(
       `UPDATE sandbox SET tunnel_urls = NULL WHERE id = (SELECT id FROM sandbox LIMIT 1)`
-    );
-  }
-
-  async updateSandboxTtyd(url: string, token: string): Promise<void> {
-    this.sql.exec(
-      `UPDATE sandbox SET ttyd_url = ?, ttyd_token = ? WHERE id = (SELECT id FROM sandbox LIMIT 1)`,
-      url,
-      await this.encrypt(token)
-    );
-  }
-
-  clearSandboxTtyd(): void {
-    this.sql.exec(
-      `UPDATE sandbox SET ttyd_url = NULL, ttyd_token = NULL WHERE id = (SELECT id FROM sandbox LIMIT 1)`
     );
   }
 
@@ -328,4 +599,18 @@ export class SandboxRepository {
       timestamp
     );
   }
+}
+
+function parseSandboxRow(row: unknown): RawSandboxRow | null {
+  if (row === undefined) return null;
+  const parsed = rawSandboxRowSchema.safeParse(row);
+  if (parsed.success) return parsed.data;
+  throw new SessionStorageIntegrityError("Malformed persisted sandbox row");
+}
+
+function parseSandboxCircuitBreakerRow(row: unknown): SandboxCircuitBreakerRow | null {
+  if (row === undefined) return null;
+  const parsed = sandboxCircuitBreakerRowSchema.safeParse(row);
+  if (parsed.success) return parsed.data;
+  throw new SessionStorageIntegrityError("Malformed persisted sandbox circuit breaker row");
 }

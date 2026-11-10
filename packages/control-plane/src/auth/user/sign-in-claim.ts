@@ -12,10 +12,8 @@ const logger = createLogger("auth:sign-in-claim");
  * Better Auth persists directly into the canonical registry — a bot-created
  * identity IS an account, so `findOAuthUser`'s account-first lookup signs
  * bot-first users into their canonical row natively. What remains is
- * proof-keeping for the rows that lack it: GitHub ingress creates canonical rows NULL-email, and
- * non-attesting attribution leaves `email_verified = 0` (Slack/Linear
- * ingress is attested — see `EMAIL_ATTESTING_PROVIDERS` in `db/user-store.ts`
- * — so their rows normally arrive already verified). The OAuth callback is
+ * proof-keeping for the rows that lack it: bot ingress creates canonical rows NULL-email,
+ * because a bot-reported email is never mailbox proof. The OAuth callback is
  * the one moment a provider-verified email is in hand, so this decorator
  * runs just before Better Auth's own queries and:
  *
@@ -27,8 +25,8 @@ const logger = createLogger("auth:sign-in-claim");
  * - **Email claim**: no identity row for the subject — normalize the owning
  *   canonical row's legacy email form (Better Auth's lookup is exact-match
  *   lowercase) and mint `email_verified = 1` from the proof so the implicit
- *   linking gate (`requireLocalEmailVerified`) admits the link. Beyond
- *   attested ingress, OAuth proof here is the only verification source.
+ *   linking gate (`requireLocalEmailVerified`) admits the link. OAuth
+ *   proof here is the only verification source.
  *
  * Contract: the inner profile is always returned unchanged, and inner
  * failures (admission denials) propagate untouched. Claim failures are

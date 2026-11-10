@@ -11,8 +11,13 @@ import { PromptSkillTextarea } from "./prompt-skill-autocomplete";
 expect.extend(matchers);
 
 const skills = [
-  { skillId: "review", name: "review-pr", description: "Review a pull request" },
-  { skillId: "release", name: "release-notes", description: "Draft release notes" },
+  { skillId: "review", name: "review-pr", description: "Review a pull request", required: false },
+  {
+    skillId: "release",
+    name: "release-notes",
+    description: "Draft release notes",
+    required: false,
+  },
 ];
 
 beforeAll(() => {
@@ -63,12 +68,36 @@ describe("PromptSkillTextarea", () => {
     expect(screen.getAllByRole("option")[0]).toHaveAttribute("tabindex", "-1");
     expect(screen.getByTestId("prompt-skill-suggestions")).not.toHaveAttribute("role");
     expect(input).toHaveAttribute("aria-autocomplete", "list");
-    expect(input).toHaveAttribute("aria-expanded", "true");
+    expect(input).not.toHaveAttribute("aria-expanded");
+    expect(screen.getByRole("status")).toHaveTextContent("2 managed skill suggestions available.");
 
     await user.keyboard("{ArrowDown}{Enter}");
     expect(input).toHaveValue("$release-notes ");
     expect(screen.queryByRole("listbox")).not.toBeInTheDocument();
     expect(input).toHaveFocus();
+  });
+
+  it("never offers a required governance skill", async () => {
+    const user = userEvent.setup();
+    render(
+      <Harness
+        availableSkills={[
+          ...skills,
+          {
+            skillId: "stack",
+            name: "release-stack-policy",
+            description: "Workspace stack policy",
+            required: true,
+          },
+        ]}
+      />
+    );
+
+    await user.type(screen.getByRole("textbox", { name: "Prompt" }), "$rel");
+
+    expect(screen.getAllByRole("option")).toHaveLength(1);
+    expect(screen.getByRole("option")).toHaveTextContent("release-notes");
+    expect(screen.queryByText("release-stack-policy")).not.toBeInTheDocument();
   });
 
   it("dismisses without changing the draft", async () => {
@@ -110,15 +139,18 @@ describe("PromptSkillTextarea", () => {
       "true"
     );
     expect(screen.getByText("Loading managed skills...")).toBeInTheDocument();
+    expect(screen.getByRole("status")).toHaveTextContent("Loading managed skill suggestions.");
 
     rerender(<Harness availableSkills={[]} />);
     expect(screen.getByText("No managed skills match this session.")).toBeInTheDocument();
+    expect(screen.getByRole("status")).toHaveTextContent("No managed skill suggestions available.");
     expect(screen.getByTestId("prompt-skill-suggestions")).toHaveClass("bottom-full");
 
     rerender(<Harness loadState="error" availableSkills={[]} />);
     expect(
       screen.getByText("Managed skills could not be loaded. Try again shortly.")
     ).toBeInTheDocument();
+    expect(screen.getByRole("status")).toHaveTextContent("Managed skill suggestions unavailable.");
   });
 
   it("does not insert a completion beyond the prompt limit", async () => {

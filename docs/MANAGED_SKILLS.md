@@ -41,9 +41,10 @@ revisions were included.
 Profiles do not change a skill's assignments. If a profile contains a disabled skill or one that
 does not apply to the selected target, Open-Inspect ignores that entry.
 
-Shared skills are installation-wide. Members can inspect and use them; platform editors and
-administrators can create, edit, enable, disable, assign, require, or delete them. See
-[Secure generation governance](SECURE_GENERATION.md) for role configuration.
+Shared skills are installation-wide. Members can inspect and use them; roles holding `skills.manage`
+(Owner, Administrator, and the catalogue editor role) can create, edit, enable, disable, assign,
+require, or delete them. See [Secure generation governance](SECURE_GENERATION.md) for role
+configuration.
 
 ---
 

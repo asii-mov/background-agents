@@ -1,17 +1,13 @@
+import { parseJsonBody } from "./body";
+import { Hono } from "hono";
+import { admit, dispatch } from "../routing/admit";
+import type { ControlPlaneHonoEnv } from "../routing/hono-env";
+import { ACTIVE_SELF } from "./shared";
 import { z } from "zod";
 import { createLogger } from "../logger";
 import { PLATFORM_ROLES, PlatformRoleStore, type PlatformRoleConfig } from "../db/platform-roles";
 import type { Env } from "../types";
-import {
-  SCM_AGNOSTIC_HUMAN_USER_ROUTE,
-  defineRoutes,
-  error,
-  json,
-  parseJsonBody,
-  parsePattern,
-  type Route,
-  type UserRouteContext,
-} from "./shared";
+import { SCM_AGNOSTIC_HUMAN_USER_ROUTE, error, json, type UserRouteContext } from "./shared";
 
 const logger = createLogger("router:platform-users");
 
@@ -27,7 +23,7 @@ function roleConfig(env: Env): PlatformRoleConfig {
 async function handleGetMe(
   _request: Request,
   env: Env,
-  _match: RegExpMatchArray,
+  _params: object,
   ctx: UserRouteContext
 ): Promise<Response> {
   const role = await new PlatformRoleStore(ctx.db, roleConfig(env)).getEffectiveRole(
@@ -40,7 +36,7 @@ async function handleGetMe(
 async function handleListUsers(
   _request: Request,
   env: Env,
-  _match: RegExpMatchArray,
+  _params: object,
   ctx: UserRouteContext
 ): Promise<Response> {
   return json(await new PlatformRoleStore(ctx.db, roleConfig(env)).listUsers());
@@ -49,12 +45,12 @@ async function handleListUsers(
 async function handleUpdateRole(
   request: Request,
   env: Env,
-  match: RegExpMatchArray,
+  match: Record<string, string>,
   ctx: UserRouteContext
 ): Promise<Response> {
-  const userId = match.groups?.id;
+  const userId = match.id;
   if (!userId) return error("Missing user ID", 400);
-  const body = await parseJsonBody<unknown>(request);
+  const body = await parseJsonBody(request);
   if (body instanceof Response) return body;
   const parsed = updateRoleSchema.safeParse(body);
   if (!parsed.success) return error("Invalid platform role", 400);
@@ -73,25 +69,33 @@ async function handleUpdateRole(
   return json({ userId, role: parsed.data.role });
 }
 
-export const platformUserRoutes: Route[] = defineRoutes(SCM_AGNOSTIC_HUMAN_USER_ROUTE, [
-  {
-    method: "GET",
-    pattern: parsePattern("/platform/me"),
+export const platformUserRoutes = new Hono<ControlPlaneHonoEnv>();
+platformUserRoutes.get(
+  "/platform/me",
+  admit({
+    ...SCM_AGNOSTIC_HUMAN_USER_ROUTE,
+    authorization: ACTIVE_SELF,
     cacheControl: "private, no-store",
-    handler: handleGetMe,
-  },
-  {
-    method: "GET",
-    pattern: parsePattern("/platform/users"),
+  }),
+  (c) => dispatch(c, handleGetMe)
+);
+platformUserRoutes.get(
+  "/platform/users",
+  admit({
+    ...SCM_AGNOSTIC_HUMAN_USER_ROUTE,
+    authorization: ACTIVE_SELF,
     requiredPermission: "platform.manage",
     cacheControl: "private, no-store",
-    handler: handleListUsers,
-  },
-  {
-    method: "PATCH",
-    pattern: parsePattern("/platform/users/:id/role"),
+  }),
+  (c) => dispatch(c, handleListUsers)
+);
+platformUserRoutes.patch(
+  "/platform/users/:id/role",
+  admit({
+    ...SCM_AGNOSTIC_HUMAN_USER_ROUTE,
+    authorization: ACTIVE_SELF,
     requiredPermission: "platform.manage",
     cacheControl: "private, no-store",
-    handler: handleUpdateRole,
-  },
-]);
+  }),
+  (c) => dispatch(c, handleUpdateRole)
+);
