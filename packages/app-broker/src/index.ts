@@ -22,7 +22,6 @@ import {
   type BrokerError,
 } from "@open-inspect/shared/app-broker";
 import { APP_BUNDLE_LIMITS, APP_DEPLOY_DEADLINE_MS } from "@open-inspect/shared/apps";
-import { TOKEN_VALIDITY_MS } from "@open-inspect/shared/auth";
 import { readBodyCapped } from "@open-inspect/shared/http-body";
 import { createLogger, type Logger } from "@open-inspect/shared/logger";
 import {
@@ -68,22 +67,27 @@ type BrokerContext = Context<{
   Variables: { body: Uint8Array; config: BrokerConfig };
 }>;
 
+/**
+ * Far tighter than the shared sig1 window, because the control plane signs each attempt just before
+ * sending it. Nonce memory is per isolate, so this window bounds a replay to another isolate.
+ */
+const SIGNATURE_MAX_AGE_MS = 30_000;
 const SEEN_NONCE_LIMIT = 5000;
 
-/** Signed requests seen in this isolate, so a captured request cannot be replayed to it. */
+/** Admits each fresh signature once in this isolate. */
 function createReplayGuard() {
   const seen = new Map<string, number>();
-  return (nonce: string): boolean => {
+  return (nonce: string, timestampMs: number): "expired" | "replayed" | undefined => {
     const now = Date.now();
-    const expiresAt = seen.get(nonce);
-    if (expiresAt !== undefined && expiresAt > now) return false;
+    if (Math.abs(now - timestampMs) >= SIGNATURE_MAX_AGE_MS) return "expired";
+    if (seen.has(nonce)) return "replayed";
     if (seen.size >= SEEN_NONCE_LIMIT) {
       for (const [candidate, expiry] of seen) {
         if (expiry <= now || seen.size >= SEEN_NONCE_LIMIT) seen.delete(candidate);
       }
     }
-    seen.set(nonce, now + TOKEN_VALIDITY_MS);
-    return true;
+    seen.set(nonce, timestampMs + SIGNATURE_MAX_AGE_MS);
+    return undefined;
   };
 }
 
@@ -266,7 +270,7 @@ function toErrorResponse(c: BrokerContext, error: unknown, log: Logger): Respons
 
 export function createBrokerApp(deps: BrokerDeps) {
   const log = createLogger("broker", {}, "info", "app-broker");
-  const firstUse = createReplayGuard();
+  const admitSignature = createReplayGuard();
   const app = new Hono<{
     Bindings: BrokerEnv;
     Variables: { body: Uint8Array; config: BrokerConfig };
@@ -302,7 +306,8 @@ export function createBrokerApp(deps: BrokerDeps) {
       actor: c.req.header(ACTOR_HEADER) ?? "",
     });
     if (!verification.ok) return unauthorized(c, verification.reason);
-    if (!firstUse(verification.nonce)) return unauthorized(c, "replayed");
+    const refusal = admitSignature(verification.nonce, verification.timestampMs);
+    if (refusal) return unauthorized(c, refusal);
 
     const config = parseBrokerConfig(c.env);
     if (!config.ok) {
