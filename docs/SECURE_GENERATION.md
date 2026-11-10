@@ -43,15 +43,25 @@ unverified email addresses do not grant a bootstrap role.
 
 Slack and Linear bots report each sender's email address. The control plane never treats that report
 as proof of the address, so it cannot satisfy an email entry in `platform_admin_users` or
-`platform_editor_users`. A first-contact bot actor links to an existing user only under two
-conditions. `identity_link_email_domains` lists the address's domain, and that user verified the
-address through a GitHub or Google sign-in. The actor then acts with that user's roles, and the
-control plane logs `auth.identity_linked_by_email` with the provider, actor, email domain, target
-user, and request ID. If no user owns an allowed-domain address yet, the actor's user keeps it
-unverified, and a later sign-in that proves the address signs in to that same user. List only
-domains whose Slack and Linear accounts your company administers, because anyone who can set an
-address in those domains on a bot account can act as its owner. The default empty list never links,
-so each bot actor stays a separate user with the workspace default role.
+`platform_editor_users`. A bot actor links to an existing user only under two conditions.
+`identity_link_email_domains` lists the address's domain, and that user's `users.email` is the
+address and is verified. The actor then acts with that user's roles, and the control plane logs
+`auth.identity_linked_by_email` with the provider, actor, email domain, target user, and request ID.
+
+A bot-reported address stays on the actor's identity as `user_identities.provider_email`. It never
+lands on `users.email`, so no sign-in can verify it there or link into the bot actor's user. If no
+user has verified an allowed-domain address yet, the actor gets a separate user with no email. After
+someone proves that address at a web sign-in, the actor's next request links to their account. The
+history from before the link stays with the separate user.
+
+The allowlist leaves one trust boundary open. With a domain listed, a bot actor that reports an
+address in it links to the existing user who verified that address, and acts with that user's roles.
+Anyone who can set that address on a Slack or Linear account can do this, and each link is audited
+as above. The link does not check that the target user has a GitHub or Google identity. A user whose
+email upstream's Slack or Linear attestation verified also counts as a verified owner, and
+`docs/plans/governed-apps/bot-verified-users.sql` lists those users for review. List only domains
+whose Slack and Linear accounts your company administers. The default empty list never links, so
+each bot actor stays a separate user with the workspace default role.
 
 The control plane enforces `governance.read` on every governance read and `governance.manage` on
 every governance write. Owner, Administrator, and the catalogue editor role hold both. Members and

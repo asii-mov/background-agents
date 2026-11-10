@@ -7,22 +7,36 @@ deploy behind Cloudflare Access in a dedicated apps account.
 ## State at handoff
 
 `feat/governed-apps` is built on the verified upstream sync `fb066612` (fork + upstream e364a7ee).
-Units U0 to U9, U10a, U11 and U12 are merged. Each was verified by its own unit and again on the
-merged tree. The last merged-tree run passed typecheck, control-plane unit 4879, control-plane
-integration, sandbox-runtime pytest 1666, app-broker 148, web, Terraform tests, lint and repo map.
-The only failures were web timeouts (`automation-form.test.tsx`) that also occur on pure upstream.
+Units U0 to U12, the `[cleanup]` items, and a review-fix round are merged. Each unit was verified on
+its own and again on the merged tree. The last full merged-tree run, before the review-fix round,
+passed typecheck, control-plane unit 4879, control-plane integration, sandbox-runtime pytest 1666,
+app-broker 148, web, Terraform tests, lint and repo map. The only failures were web timeouts
+(`automation-form.test.tsx`) that also occur on pure upstream.
+
+## Review-fix round
+
+A review found nine issues. Each fix was verified on its own branch before merge
+(`git log --oneline 541753cc..4b0679a5`):
+
+- The stack-policy checker reads manifests under `build`, `dist`, and `.svelte-kit`.
+- It reports git submodules, npm URL, git, and tarball specs, and pnpm `package.yaml` and
+  `package.json5` as scan gaps. It parses Deno import maps.
+- It reads `npm:` range and tag specs as the dependency key.
+- The broker refuses signatures older than 30 seconds.
+- Every `CREATE TRIGGER` migration needs approval on a non-empty production database.
+- Bot-reported emails stay on `user_identities.provider_email` and never reach `users.email`.
+- `GET /apps` hides session and repository linkage from viewers who cannot manage the app.
+
+The residual limits are in `docs/STACK_POLICY.md`, `docs/SECURE_GENERATION.md`, and `docs/APPS.md`.
+Run `harness/verify-all.sh` again before the PR, because no whole-tree run covers this round.
 
 Nothing has been pushed to `main`, deployed, or applied to a Cloudflare account.
 
 ## Remaining work
 
-1. **U10b** (web Apps tab). Spec in `plan.md`. U8 refusals are `{error, code}`, the destructive
-   migration block returns 423, and U5 response shapes are listed in `followups.md`.
-2. **Cleanup items** tagged `[cleanup]` in `followups.md`. Examples: reject component writes with
-   409 while Git owns the catalogue, reject tunnel ports in the admin write path when tunnels are
-   disabled, move MCP and skills gating to named permissions, and the remaining knip findings.
-3. **Final pass**: a full `harness/verify-all.sh` run, a cross-model review of `decisions.tsv`, then
-   a PR to `main` with the bot-attestation SQL from U12 in the description.
+1. Run `harness/verify-all.sh` on the current head.
+2. Open the PR to `main` from `PR_DESCRIPTION.md`, with the bot-attestation SQL from U12
+   (`bot-verified-users.sql`) in the description.
 
 ## Read first
 

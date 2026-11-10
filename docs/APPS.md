@@ -158,6 +158,24 @@ deploy fails with `hosting_unavailable`. Its expiry date is in the apps account 
 Access > Service credentials**. While the signing secret is replaced, the control plane and the
 broker update separately, so deploys can fail until both Workers run the new secret.
 
+## What users see
+
+The **Apps** tab lists every app to holders of `apps.read`, which includes members. A user who may
+manage an app sees the session and repository that last deployed it, and the session behind each
+deployment. For any other app, `GET /apps` and `GET /apps/<name>` leave out `lastSessionId`,
+`lastRepo`, and each deployment's `requestedBy.sessionId`. The same rule decides who may manage an
+app: a holder of `apps.manage.any`, or a holder of `apps.manage.own` who owns the app or belongs to
+its owning team.
+
+## Approve schema changes
+
+The control plane classifies each D1 migration before it runs. A production deploy whose migration
+drops or rewrites data stops with `423 destructive_migration_requires_approval`. Every
+`CREATE TRIGGER` statement counts as destructive, whatever its body, because a trigger runs later on
+every matching write. A user who may manage the app approves the file's exact bytes on the app's
+page, and a later deploy of the same file applies it. A production database with no tables skips the
+approval.
+
 ## Limits
 
 - Terraform does not track the Access applications, scripts, custom domains, databases, KV
@@ -165,5 +183,9 @@ broker update separately, so deploys can fail until both Workers run the new sec
   account with the control plane's records. Keep dashboard access to the apps account to a small
   group, and review its audit log.
 - Bundles are limited to 16 MiB, the largest body the control plane signs.
+- The broker refuses a signature more than 30 seconds from its clock, and admits each nonce once per
+  isolate. Nonce memory is not shared between isolates, so a captured request can reach another
+  isolate once within those 30 seconds. Access in front of the broker still requires the control
+  plane's service token.
 - The broker's token can change any DNS record in the apps zone. Do not host anything else in that
   zone.

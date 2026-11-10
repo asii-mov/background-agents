@@ -28,9 +28,19 @@ Each technology is an approved component with a category, a stance, and signals.
 | `source`    | Source files with an extension                             | `{ kind: source, extension: .ts }`               |
 | `manifest`  | A data store declared in `openinspect.app.json`            | `{ kind: manifest, value: d1 }`                  |
 
-Package signals read `package.json`, `pyproject.toml`, `requirements*.txt`, and `Pipfile`. A package
-name ending in `/*` matches a whole npm scope. When a fact matches several signals, an exact signal
-beats a glob.
+Package signals read `package.json`, `pyproject.toml`, `requirements*.txt`, and `Pipfile`. For npm,
+they also read the `npm:` specifiers in the `imports` and `scopes` of `deno.json` and `deno.jsonc`.
+A package name ending in `/*` matches a whole npm scope. When a fact matches several signals, an
+exact signal beats a glob.
+
+The checker reads every manifest in the tree except under `node_modules` and `.git`. Manifests under
+`build`, `dist`, and `.svelte-kit` count, because a workspace glob or a `file:` spec can install
+them.
+
+An npm dependency counts as the package it installs. `"ui": "npm:react@18"` counts as `react`, and
+`"react": "npm:^18"` counts as `react`. npm and Yarn read a bare `npm:<word>` spec differently, so
+`"ui": "npm:latest"` counts as both `ui` and `latest`. A `registry.npmjs.org` tarball URL counts as
+the package it names.
 
 A disabled component, a component without a category, and a component in the `development` lifecycle
 are not part of the policy. Every other component contributes one rule:
@@ -59,9 +69,19 @@ finding is pre-existing only when both commits had it. React that the base branc
 change forked is therefore new on the change. When the base cannot be read, or the histories are
 unrelated, nothing counts as pre-existing.
 
-A manifest that cannot be parsed makes the scan incomplete. A new unreadable manifest blocks only
-when a blocking rule applies to the repository. An unreadable manifest that was already at the base
-never blocks.
+Some content hides which packages a change adds. The checker reports each of these as a scan gap:
+
+- A manifest that cannot be parsed or is over the size limit.
+- A pnpm `package.yaml` or `package.json5`. The sandbox has no YAML or JSON5 parser, so declare
+  dependencies in `package.json`.
+- A `deno.json` or `deno.jsonc` that names a separate `importMap` file.
+- A git submodule, staged or as an untracked nested repository. Its files belong to another
+  repository and are never read.
+- An npm dependency installed from a URL, a git repository, or a tarball, other than a
+  `registry.npmjs.org` tarball.
+
+A new scan gap blocks only when a blocking rule applies to the repository. A gap that was already at
+the base never blocks.
 
 ### Nudges for new projects
 
@@ -191,6 +211,17 @@ merge. Apply the rule to every branch that deploys.
 - The checker sees declared dependencies, files, source extensions, and data-store manifests. Code
   that vendors a framework without a manifest entry, or loads one from a CDN, does not match a
   package signal.
+
+The checker does not catch these cases:
+
+- A session without a repository scans its working directory and skips `build`, `dist`,
+  `.svelte-kit`, and other build directories. Such a session has no push gate.
+- A force-added `node_modules` directory that a `file:` spec installs from. The checker never reads
+  manifests under `node_modules`.
+- A `file:` spec whose path leaves the repository.
+- `npm:` and URL imports written in source files, such as `import React from "npm:react"` or an
+  `https://esm.sh/react` import. Only Deno config files are read for `npm:` specifiers.
+- A change that moves an existing submodule to a new commit. Only a new submodule is a gap.
 
 ## Run the checker locally
 

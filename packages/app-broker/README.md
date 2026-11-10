@@ -44,6 +44,11 @@ A deploy runs in this order, and every step is safe to repeat:
 Takedown reverses it: detach the hostname, remove the script, then detach again and delete the
 per-app Access app. The floor is never touched.
 
+The broker refuses a sig1 signature more than 30 seconds from its clock, which is tighter than the
+shared sig1 window because the control plane signs each attempt just before it sends it. Each
+isolate admits a nonce once. Nonce memory is per isolate, so a captured request can be replayed once
+to another isolate within those 30 seconds.
+
 ## Fake Cloudflare
 
 `test/fake-cloudflare.ts` is an in-memory Cloudflare REST API served as a `fetch` function. Pass

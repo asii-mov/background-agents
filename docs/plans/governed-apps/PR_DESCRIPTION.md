@@ -99,7 +99,8 @@ Pay particular attention to any user that has a `platform_role` or a match in
   platform role. Members and viewers still cannot. No one lost access, because the named permission
   was already required. `routes/integration-settings.ts` still uses `catalog.write` for network
   policy, so two permission models remain until a later consolidation.
-- **`GET /apps`** lists every app to anyone with `apps.read`, which includes members. The UI shows
+- **`GET /apps`** lists every app to anyone with `apps.read`, which includes members. For an app the
+  viewer cannot manage, it leaves out the session and repository that deployed it. The UI shows
   other people's apps read-only, with no data, takedown or secrets actions. Data routes are
   owner-or-`apps.manage.any`, and service principals are refused.
 

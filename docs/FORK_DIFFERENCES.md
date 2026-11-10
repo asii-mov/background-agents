@@ -40,12 +40,12 @@ Node control-plane host. The repository map records which new UI areas still lac
   `integrations.manage` to change them. This update does not grant broad integration administration
   automatically.
 - Governed Claude launches and restrictive network policy on unsupported backends are rejected.
-- A Slack or Linear first-contact actor links to an existing user by the email that the bot reports
-  only when `identity_link_email_domains` lists the email's domain and that user verified the email
-  at a web sign-in. The linked actor inherits the user's roles, as in upstream. A bot report never
-  verifies an email, so it cannot match an email entry in `PLATFORM_ADMIN_USERS`. The default empty
-  list keeps every bot actor a separate user. Users that upstream's Slack and Linear attestation
-  verified before this change stay verified.
+- A Slack or Linear actor links to an existing user by the email that the bot reports only when
+  `identity_link_email_domains` lists the email's domain and that user's email is verified. The
+  linked actor inherits the user's roles, as in upstream. A bot-reported email stays on the identity
+  and never lands on `users.email`, so it is never verified and cannot match an email entry in
+  `PLATFORM_ADMIN_USERS`. The default empty list keeps every bot actor a separate user. Users that
+  upstream's Slack and Linear attestation verified before this change stay verified.
 - Node 24 is required. Use `.env.web.example` for the web app and `.env.example` for the Node
   backend.
 
