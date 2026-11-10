@@ -26,10 +26,14 @@ test("shows a member their own apps with actions and colleagues' apps read-only"
   ).toBeVisible();
   await expect(own.getByRole("button", { name: "Data" })).toBeVisible();
   await expect(own.getByRole("button", { name: "Take down" })).toBeVisible();
+  await expect(own.getByText("Owner:", { exact: false })).toContainText(
+    "from acme/expense-tracker"
+  );
 
   const others = page.getByRole("region", { name: "Other apps in the workspace" });
   const roster = others.getByRole("listitem", { name: "team-roster" });
   await expect(roster.getByText("Owner: Staff Engineer", { exact: false })).toBeVisible();
+  await expect(roster.getByText("Owner:", { exact: false })).not.toContainText("from acme");
   await expect(roster.getByRole("button")).toHaveCount(0);
   const wiki = others.getByRole("listitem", { name: "legacy-wiki" });
   await expect(wiki.getByText(/Taken down by an administrator/)).toBeVisible();

@@ -1,4 +1,4 @@
-import type { AppName, AppSummary } from "@open-inspect/shared/apps";
+import type { AppName, AppSummary, RedactedAppSummary } from "@open-inspect/shared/apps";
 import type {
   AppDataMigrationView,
   AppDataOperationView,
@@ -283,6 +283,15 @@ function dataRoute(
   return null;
 }
 
+/** The control plane shows the session and repo that deployed an app only to those who manage it. */
+function redact({
+  lastSessionId: _session,
+  lastRepo: _repo,
+  ...entry
+}: AppSummary): RedactedAppSummary {
+  return entry;
+}
+
 /** The `/api/apps/**` surface; null when the request is not an apps route. */
 export function appsRoute(
   state: AppsVerificationState,
@@ -292,7 +301,10 @@ export function appsRoute(
   viewer: Viewer
 ): AppsResponse {
   if (pathname === "/api/apps" && method === "GET") {
-    return { status: 200, body: { apps: state.apps } };
+    const apps = state.apps.map((app) =>
+      viewer.manageAny || app.owner.userId === viewer.userId ? app : redact(app)
+    );
+    return { status: 200, body: { apps } };
   }
   const match = /^\/api\/apps\/([a-z0-9-]+)(\/.*)?$/.exec(pathname);
   if (!match) return null;

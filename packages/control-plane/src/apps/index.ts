@@ -15,6 +15,7 @@ export {
   takeDownApp,
   type AppDataSeam,
   type AppsDeps,
+  type CanManageApp,
   type DataActor,
   type DeployOutcome,
 } from "./deploy";

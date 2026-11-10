@@ -4,7 +4,7 @@ import { useId, useState, type FormEvent } from "react";
 import useSWR, { useSWRConfig } from "swr";
 import useSWRInfinite from "swr/infinite";
 import { toast } from "sonner";
-import type { AppStatus, AppSummary } from "@open-inspect/shared/apps";
+import type { AppDirectoryEntry, AppStatus } from "@open-inspect/shared/apps";
 import { resolveScopedPermission } from "@open-inspect/shared/rbac";
 import {
   APP_STAGES,
@@ -70,7 +70,7 @@ const OPERATION_LABEL: Record<DataOperationKind, string> = {
   policy_block: "Blocked by policy",
 };
 
-type AppsResponse = { apps: AppSummary[] };
+type AppsResponse = { apps: AppDirectoryEntry[] };
 type OperationsPage = { operations: AppDataOperationView[]; nextCursor: string | null };
 
 function appPath(name: string, suffix = ""): BrowserApiPath {
@@ -177,7 +177,7 @@ function AppSection({
 }: {
   title: string;
   empty: string;
-  apps: AppSummary[];
+  apps: AppDirectoryEntry[];
   scope: "own" | "any" | null;
   viewerId: string | null;
 }) {
@@ -205,7 +205,7 @@ function AppRow({
   viewerId,
   scope,
 }: {
-  app: AppSummary;
+  app: AppDirectoryEntry;
   viewerId: string | null;
   scope: "own" | "any" | null;
 }) {
@@ -327,7 +327,7 @@ function TakedownForm({
   placesAdminHold,
   onDone,
 }: {
-  app: AppSummary;
+  app: AppDirectoryEntry;
   placesAdminHold: boolean;
   onDone: () => void;
 }) {

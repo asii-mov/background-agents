@@ -244,7 +244,7 @@ describe("apps", () => {
       await expect(listed.json()).resolves.toMatchObject({
         apps: [{ name: "notes", status: "live", url: "https://notes.apps.example.test" }],
       });
-      const detail = await asUser("/apps/notes", { userId: BOB, role: "member" });
+      const detail = await asUser("/apps/notes", { userId: ALICE, role: "member" });
       await expect(detail.json()).resolves.toMatchObject({
         app: { owner: { userId: ALICE } },
         deployments: [{ version: 1, status: "live", requestedBy: { sessionId: sessionName } }],

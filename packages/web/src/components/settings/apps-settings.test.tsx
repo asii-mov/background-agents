@@ -7,7 +7,7 @@ import userEvent from "@testing-library/user-event";
 import * as matchers from "@testing-library/jest-dom/matchers";
 import { SWRConfig } from "swr";
 import { permissionsForBuiltInRole, type PermissionId } from "@open-inspect/shared/rbac";
-import type { AppName, AppSummary } from "@open-inspect/shared/apps";
+import type { AppName, AppSummary, RedactedAppSummary } from "@open-inspect/shared/apps";
 import type {
   AppDataOperationView,
   AppDataSummary,
@@ -55,6 +55,12 @@ function app(name: string, owner: string, overrides: Partial<AppSummary> = {}): 
     takedown: null,
     ...overrides,
   };
+}
+
+/** Another owner's app as the control plane shows it to someone who cannot manage it. */
+function redacted(name: string, owner: string): RedactedAppSummary {
+  const { lastSessionId: _session, lastRepo: _repo, ...entry } = app(name, owner);
+  return entry;
 }
 
 function summary(overrides: Partial<AppDataSummary> = {}): AppDataSummary {
@@ -185,7 +191,7 @@ describe("AppsSettings as a member", () => {
 
   it("offers actions on the member's own app only", async () => {
     serve({
-      "GET /api/apps": () => response({ apps: [app("expenses", ALICE), app("roster", BOB)] }),
+      "GET /api/apps": () => response({ apps: [app("expenses", ALICE), redacted("roster", BOB)] }),
     });
     renderPanel();
 
@@ -198,13 +204,13 @@ describe("AppsSettings as a member", () => {
     expect(
       within(own).getByRole("link", { name: "https://expenses.apps.example.com" })
     ).toHaveAttribute("target", "_blank");
-    expect(within(own).getByText(/Owner: Alice Example/)).toBeInTheDocument();
+    expect(within(own).getByText(/Owner: Alice Example/)).toHaveTextContent(/from acme\/expenses$/);
     expect(within(own).getByRole("button", { name: "Data" })).toBeInTheDocument();
     expect(within(own).getByRole("button", { name: "Take down" })).toBeInTheDocument();
 
     const others = screen.getByRole("region", { name: "Other apps in the workspace" });
     const theirs = within(others).getByRole("listitem", { name: "roster" });
-    expect(within(theirs).getByText(/Owner: Bob Example/)).toBeInTheDocument();
+    expect(within(theirs).getByText(/Owner: Bob Example/)).toHaveTextContent(/version 2$/);
     expect(within(theirs).queryByRole("button")).not.toBeInTheDocument();
   });
 

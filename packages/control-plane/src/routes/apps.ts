@@ -22,8 +22,11 @@ import {
   readDeployRequest,
   releaseHold,
   takeDownApp,
+  type CanManageApp,
 } from "../apps";
+import { resourceViewer } from "../authorization/resource-viewer";
 import { admit, dispatch } from "../routing/admit";
+import { canManageApp } from "../routing/app-admission";
 import type { ControlPlaneHonoEnv } from "../routing/hono-env";
 import type { Env } from "../types";
 import { parseBody } from "./body";
@@ -50,6 +53,12 @@ function manageScope(ctx: RequestContext): { userId: string; scope: "own" | "any
     : null;
   if (!ctx.authorization || !scope) throw new Error("App management route was not admitted");
   return { userId: ctx.authorization.userId, scope };
+}
+
+/** `apps.read` admits the viewer; only someone who may manage an app sees what deployed it. */
+async function canManageFor(ctx: RequestContext): Promise<CanManageApp> {
+  const viewer = await resourceViewer(ctx);
+  return (owner) => canManageApp(viewer, owner);
 }
 
 function appNameParam(raw: string): AppName | null {
@@ -84,7 +93,7 @@ async function handleList(
 ): Promise<Response> {
   const apps = appsFromEnv(env, ctx.db);
   if (!apps.ok) return failure(apps.failure);
-  return json({ apps: await listApps(apps.deps) });
+  return json({ apps: await listApps(apps.deps, await canManageFor(ctx)) });
 }
 
 async function handleGet(
@@ -96,7 +105,7 @@ async function handleGet(
   const apps = appsFromEnv(env, ctx.db);
   if (!apps.ok) return failure(apps.failure);
   const name = appNameParam(params.name);
-  const found = name ? await getApp(apps.deps, name) : null;
+  const found = name ? await getApp(apps.deps, name, await canManageFor(ctx)) : null;
   return found ? json(found) : error("App not found", 404);
 }
 
