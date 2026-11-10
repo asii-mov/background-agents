@@ -266,7 +266,6 @@ export type StatementClass =
         | "create_table"
         | "create_index"
         | "create_view"
-        | "create_trigger"
         | "add_column"
         | "insert"
         | "select"
@@ -279,6 +278,7 @@ export type StatementClass =
         | "drop_index"
         | "drop_view"
         | "drop_trigger"
+        | "create_trigger"
         | "drop_column"
         | "rename_table"
         | "rename_column"
@@ -300,11 +300,11 @@ export type StatementClass =
 export const MIGRATION_LEDGER_TABLE = "_openinspect_migrations";
 
 const CREATE_FORMS = {
-  TABLE: "create_table",
-  INDEX: "create_index",
-  VIEW: "create_view",
-  TRIGGER: "create_trigger",
-} as const;
+  TABLE: { class: "additive", form: "create_table" },
+  INDEX: { class: "additive", form: "create_index" },
+  VIEW: { class: "additive", form: "create_view" },
+  TRIGGER: { class: "destructive", form: "create_trigger" },
+} as const satisfies Record<string, StatementClass>;
 const DROP_FORMS = {
   TABLE: "drop_table",
   INDEX: "drop_index",
@@ -323,7 +323,9 @@ function lookup<T>(table: Record<string, T>, key: string | null): T | null {
  * Head-keyword classification, conservative by construction: anything that is not a known
  * additive form needs approval in production. `PRAGMA foreign_keys` and `defer_foreign_keys` are
  * additive because D1 migrations legitimately use them; every other PRAGMA, ATTACH, DETACH,
- * VACUUM and transaction control is forbidden, since the broker runs each file as one batch.
+ * VACUUM and transaction control is forbidden, since the broker runs each file as one batch. A
+ * trigger is destructive whatever its body: it runs later, on every matching write, and even an
+ * INSERT in it can replace rows or fire other triggers.
  */
 function classifyTokens(tokens: readonly SqlToken[]): StatementClass {
   const word = (index: number) => {
@@ -349,8 +351,7 @@ function classifyTokens(tokens: readonly SqlToken[]): StatementClass {
     case "CREATE": {
       let index = 1;
       while (CREATE_MODIFIERS.has(word(index) ?? "")) index += 1;
-      const form = lookup(CREATE_FORMS, word(index));
-      return form ? { class: "additive", form } : destructive("unrecognized");
+      return lookup(CREATE_FORMS, word(index)) ?? destructive("unrecognized");
     }
     case "DROP": {
       const form = lookup(DROP_FORMS, word(1));
