@@ -231,10 +231,13 @@ class CloudflareFault extends Error {
 }
 
 interface Handled {
+  /** 204 sends an empty body, as Cloudflare does for the deletes documented without one. */
   status?: number;
   result: unknown;
   resultInfo?: Record<string, number>;
 }
+
+const NO_CONTENT: Handled = { status: 204, result: undefined };
 
 interface RouteContext {
   readonly request: Request;
@@ -1014,7 +1017,7 @@ export function createFakeCloudflare(options: FakeCloudflareOptions): FakeCloudf
     route("DELETE", "/workers/scripts/:script", "scripts.delete", ({ params }) => {
       const worker = findWorker(params.script);
       workers.delete(worker.name);
-      return { result: null };
+      return NO_CONTENT;
     }),
 
     route(
@@ -1091,7 +1094,7 @@ export function createFakeCloudflare(options: FakeCloudflareOptions): FakeCloudf
         if (!namespaceScripts.delete(params.script)) {
           throw new CloudflareFault(404, CODE.scriptNotFound, `script ${params.script} not found`);
         }
-        return { result: null };
+        return NO_CONTENT;
       }
     ),
 
@@ -1156,7 +1159,7 @@ export function createFakeCloudflare(options: FakeCloudflareOptions): FakeCloudf
       const domain = [...domains.values()].find((candidate) => candidate.id === params.id);
       if (!domain) throw new CloudflareFault(404, CODE.invalid, `domain ${params.id} not found`);
       domains.delete(domain.hostname);
-      return { result: null };
+      return NO_CONTENT;
     }),
 
     route("GET", "/d1/database", "d1.list", ({ query }) => {
@@ -1347,13 +1350,16 @@ export function createFakeCloudflare(options: FakeCloudflareOptions): FakeCloudf
     let response: Response;
     try {
       const handled = await hit.handle({ request, params, query: url.searchParams });
-      response = jsonResponse(handled.status ?? 200, {
-        success: true,
-        errors: [],
-        messages: [],
-        result: handled.result,
-        ...(handled.resultInfo ? { result_info: handled.resultInfo } : {}),
-      });
+      response =
+        handled.status === 204
+          ? new Response(null, { status: 204 })
+          : jsonResponse(handled.status ?? 200, {
+              success: true,
+              errors: [],
+              messages: [],
+              result: handled.result,
+              ...(handled.resultInfo ? { result_info: handled.resultInfo } : {}),
+            });
     } catch (error) {
       if (!(error instanceof CloudflareFault)) throw error;
       response = errorResponse(error.status, [error.code], error.message);
