@@ -352,6 +352,8 @@ UNIDENTIFIED_SPECS = [
     "./vendor/react-18.3.1.tgz",
     "react-18.3.1.TGZ",
     "vendor/react-18.3.1.tar.gz",
+    "npm:facebook/react",
+    "npm:https://cdn.example.test/react.tgz",
 ]
 GOLDEN += [
     *(
@@ -427,6 +429,35 @@ GOLDEN += [
             0,
         )
         for spec in ("^1.2.0 || >=2", "latest", "workspace:*", "link:../ui", "file:../ui")
+    ),
+    *(
+        Golden(
+            f"npm-protocol-without-a-name-installs-the-key: {spec}",
+            introduce({"web/package.json": SVELTE}, {"web/package.json": package_json(react=spec)}),
+            {("React", "web/package.json"): "violation"},
+            1,
+            line="error: web/package.json: React is not allowed for Web frontend.",
+        )
+        for spec in ("npm:^18", "npm:18.3.1", "npm:latest", "npm:*", "npm:>=18 <19")
+    ),
+    *(
+        Golden(
+            f"npm-alias-installs-the-named-package: {spec}",
+            introduce({"web/package.json": SVELTE}, {"web/package.json": package_json(ui=spec)}),
+            {("React", "web/package.json"): "violation"},
+            1,
+            line="error: web/package.json: React is not allowed for Web frontend.",
+        )
+        for spec in ("npm:react", "npm:react@^18", "npm:react-dom@18.3.1")
+    ),
+    Golden(
+        "npm-alias-of-the-key-to-another-package-is-not-the-key",
+        introduce(
+            {"web/package.json": SVELTE},
+            {"web/package.json": package_json(react="npm:@preact/compat@^18")},
+        ),
+        {},
+        0,
     ),
 ]
 
