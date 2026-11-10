@@ -433,8 +433,13 @@ def is_toolchain_file(path: PurePosixPath) -> bool:
     return any(fnmatchcase(path.name, pattern) for pattern in WELL_KNOWN_TOOLCHAIN_FILES)
 
 
+# Narrower than the source-count exclusions: a workspace glob or a ``file:`` spec can install a
+# manifest that lives under build/ or dist/, so those must still be scanned.
+MANIFEST_SCAN_EXCLUDED_DIRECTORIES: Final = frozenset({"node_modules", ".git"})
+
+
 def _in_excluded_directory(path: PurePosixPath) -> bool:
-    return any(part in SOURCE_COUNT_EXCLUDED_DIRECTORIES for part in path.parts[:-1])
+    return any(part in MANIFEST_SCAN_EXCLUDED_DIRECTORIES for part in path.parts[:-1])
 
 
 # ---- Tree sources --------------------------------------------------------------------------------

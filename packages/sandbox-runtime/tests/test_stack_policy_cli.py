@@ -154,6 +154,34 @@ GOLDEN = [
         line="warning: web/package.json: React is not allowed for Web frontend.",
     ),
     Golden(
+        "a-workspace-under-a-build-directory-is-scanned",
+        introduce(
+            {"package.json": SVELTE},
+            {
+                "package.json": json.dumps(
+                    {"workspaces": ["build/*"], "dependencies": {"svelte": "^5"}}
+                ),
+                "build/ui/package.json": REACT,
+            },
+        ),
+        {("React", "build/ui/package.json"): "violation", ("Svelte", "package.json"): "standard"},
+        1,
+        line="error: build/ui/package.json: React",
+    ),
+    Golden(
+        "a-file-dependency-under-dist-is-scanned",
+        introduce(
+            {"package.json": SVELTE},
+            {
+                "package.json": package_json(svelte="^5", ui="file:dist"),
+                "dist/package.json": package_json(next="15"),
+            },
+        ),
+        {("Next.js", "dist/package.json"): "violation", ("Svelte", "package.json"): "standard"},
+        1,
+        line="error: dist/package.json: Next.js",
+    ),
+    Golden(
         "pre-existing-denial-passes",
         introduce({"web/package.json": REACT}, {"web/src/fix.ts": "export {}\n"}),
         {("React", "web/package.json"): "legacy", ("TypeScript", "web/src/fix.ts"): "standard"},
