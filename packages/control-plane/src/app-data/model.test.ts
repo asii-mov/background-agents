@@ -176,6 +176,41 @@ describe("classifyStatement", () => {
       "destructive",
       "replace_rows",
     ],
+    [
+      "CREATE TRIGGER purge AFTER INSERT ON audit BEGIN DELETE FROM users; END",
+      "destructive",
+      "create_trigger",
+    ],
+    [
+      "CREATE TEMP TRIGGER t AFTER INSERT ON a BEGIN UPDATE users SET role = 'admin'; END",
+      "destructive",
+      "create_trigger",
+    ],
+    [
+      "create temporary trigger if not exists t before insert on a begin select 1; end",
+      "destructive",
+      "create_trigger",
+    ],
+    [
+      "CREATE TRIGGER IF NOT EXISTS main.t AFTER UPDATE ON a BEGIN INSERT INTO log VALUES (1); END",
+      "destructive",
+      "create_trigger",
+    ],
+    [
+      'CREATE /* c */ TRIGGER -- c\n"t" AFTER INSERT ON a BEGIN DELETE FROM users; END',
+      "destructive",
+      "create_trigger",
+    ],
+    [
+      "CrEaTe TrIgGeR t AFTER DELETE ON a FOR EACH ROW WHEN OLD.x = 1 BEGIN SELECT 1; END",
+      "destructive",
+      "create_trigger",
+    ],
+    [
+      "CREATE TRIGGER t INSTEAD OF INSERT ON v BEGIN INSERT OR REPLACE INTO users VALUES (NEW.id); END",
+      "destructive",
+      "create_trigger",
+    ],
     ["WITH gone AS (SELECT id FROM notes) DELETE FROM notes", "destructive", "unrecognized"],
     ["REINDEX notes", "destructive", "unrecognized"],
     ["PRAGMA journal_mode = DELETE", "forbidden", "pragma"],
@@ -224,7 +259,10 @@ describe("splitSqlStatements", () => {
     const statements = splitSqlStatements(sql);
     expect(statements).toHaveLength(3);
     expect(statements[2]).toMatch(/^CREATE TRIGGER t[\s\S]*END$/);
-    expect(classifyMigration({ sql }).class).toBe("additive");
+    expect(classifyMigration({ sql })).toEqual({
+      class: "destructive",
+      statements: [statements[2]],
+    });
   });
 });
 
@@ -239,6 +277,14 @@ describe("classifyMigration", () => {
       statements: ["VACUUM"],
     });
     expect(classifyMigration({ sql: "CREATE TABLE a (x);" })).toEqual({ class: "additive" });
+  });
+
+  it("holds every trigger for approval, even one whose body only inserts", () => {
+    const trigger = "CREATE TRIGGER t AFTER INSERT ON a BEGIN INSERT INTO log VALUES (NEW.x); END";
+    expect(classifyMigration({ sql: `CREATE TABLE a (x);\n${trigger};` })).toEqual({
+      class: "destructive",
+      statements: [trigger],
+    });
   });
 });
 

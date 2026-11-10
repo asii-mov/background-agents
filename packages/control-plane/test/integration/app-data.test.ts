@@ -35,6 +35,8 @@ const HOSTING = {
 
 const CREATE_NOTES = "CREATE TABLE notes (id TEXT PRIMARY KEY, owner_sub TEXT NOT NULL);";
 const DROP_NOTES = "DROP TABLE notes;";
+const PURGE_TRIGGER =
+  "CREATE TRIGGER purge AFTER INSERT ON notes BEGIN DELETE FROM notes WHERE id <> NEW.id; END;";
 const SECRET_VALUE = "placeholder-secret-value";
 
 function store(): AppDataStore {
@@ -548,5 +550,42 @@ describe("deploying an app that declares a database", () => {
     expect(summary.resources).toEqual([
       expect.objectContaining({ status: "retired", purgeAfter: expect.any(Number) }),
     ]);
+  });
+
+  it("holds a trigger until its exact bytes are approved", async () => {
+    await reseedDefaultPolicy();
+    await seedActiveUser(ALICE);
+    const session = await sandboxSession(ALICE);
+    const broker = fakeBroker();
+    const app = { schemaVersion: 1, name: "notes", data: { DB: { kind: "d1" } } };
+    const initial = await call(deployRequest(session, app, { "0001_init.sql": CREATE_NOTES }));
+    expect(initial.status).toBe(200);
+
+    const withTrigger = { "0001_init.sql": CREATE_NOTES, "0002_purge.sql": PURGE_TRIGGER };
+    const approve = (sha256: string) =>
+      asUser(
+        "/apps/notes/data/migrations/approve",
+        { userId: ALICE, role: "member" },
+        {
+          method: "POST",
+          body: { stage: "production", binding: "DB", name: "0002_purge.sql", sha256 },
+        }
+      );
+    const ranTrigger = () => broker.dataOps.some((entry) => entry.sql?.includes(PURGE_TRIGGER));
+
+    const held = await call(deployRequest(session, app, withTrigger));
+    expect(held.status).toBe(423);
+    await expect(held.json()).resolves.toMatchObject({
+      reason: "destructive_migration_requires_approval",
+      detail: { sha256: await sha256Hex(PURGE_TRIGGER) },
+    });
+    expect((await approve("ab".repeat(32))).ok).toBe(false);
+    expect((await call(deployRequest(session, app, withTrigger))).status).toBe(423);
+    expect(ranTrigger()).toBe(false);
+    expect(broker.deploys).toHaveLength(1);
+
+    expect((await approve(await sha256Hex(PURGE_TRIGGER))).status).toBe(200);
+    expect((await call(deployRequest(session, app, withTrigger))).status).toBe(200);
+    expect(ranTrigger()).toBe(true);
   });
 });
