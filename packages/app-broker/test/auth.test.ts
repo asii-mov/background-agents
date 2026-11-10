@@ -1,6 +1,6 @@
 import { SERVICE_REQUEST_MAX_BODY_BYTES } from "@open-inspect/shared/service-auth";
 import { describe, expect, it } from "vitest";
-import { createHarness, deployForm, signedRequest } from "./broker-harness";
+import { BROKER_ORIGIN, createHarness, deployForm, signedRequest } from "./broker-harness";
 
 describe("request authentication", () => {
   it("answers a request signed by the control plane", async () => {
@@ -64,6 +64,41 @@ describe("request authentication", () => {
     );
 
     expect(response.status).toBe(401);
+    expect(harness.fake.calls).toEqual([]);
+  });
+
+  it("refuses a signature a minute old, well inside the shared sig1 window", async () => {
+    const harness = createHarness();
+
+    const response = await harness.call(
+      await signedRequest("/takedown", { json: { name: "inventory" } }, { signedAgoMs: 60_000 })
+    );
+
+    expect(response.status).toBe(401);
+    expect(harness.fake.calls).toEqual([]);
+  });
+
+  it("answers a signature a few seconds old", async () => {
+    const harness = createHarness();
+
+    const response = await harness.call(
+      await signedRequest("/takedown", { json: { name: "inventory" } }, { signedAgoMs: 5_000 })
+    );
+
+    expect(response.status).toBe(200);
+  });
+
+  it("refuses a signature replayed onto another path", async () => {
+    const harness = createHarness();
+    const signed = await signedRequest("/takedown", { json: { name: "inventory" } });
+
+    const moved = new Request(`${BROKER_ORIGIN}/data`, {
+      method: "POST",
+      headers: signed.headers,
+      body: JSON.stringify({ name: "inventory" }),
+    });
+
+    expect((await harness.call(moved)).status).toBe(401);
     expect(harness.fake.calls).toEqual([]);
   });
 
