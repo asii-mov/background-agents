@@ -196,6 +196,8 @@ _NPM_REGISTRY_TARBALL: Final = re.compile(
 )
 _TARBALL_SUFFIXES: Final = (".tgz", ".tar.gz", ".tar")
 _LOCAL_SPEC_PREFIXES: Final = ("workspace:", "file:", "link:", "portal:", ".", "/", "~")
+_NPM_NAME: Final = r"[a-z0-9!~*'()-][a-z0-9_.!~*'()-]*"
+_NPM_ALIAS: Final = re.compile(rf"((?:@{_NPM_NAME}/)?{_NPM_NAME})(@.*)?", re.IGNORECASE)
 
 
 class NpmEcosystem:
@@ -245,16 +247,17 @@ class NpmEcosystem:
                 continue
             for name, spec in _mapping(entries, field_name).items():
                 declared = spec if isinstance(spec, str) else None
-                installed, identified = self._installed_name(name, declared)
-                dependencies.append(
+                installed, identified = self._installed_names(name, declared)
+                dependencies.extend(
                     DeclaredDependency(
                         self.id,
-                        self.normalize(installed),
+                        self.normalize(package),
                         path,
                         scope,
                         declared,
                         identified,
                     )
+                    for package in installed
                 )
         return ManifestContents(tuple(dependencies))
 
@@ -284,22 +287,28 @@ class NpmEcosystem:
         return ManifestContents(tuple(dependencies))
 
     @staticmethod
-    def _installed_name(name: str, spec: str | None) -> tuple[str, bool]:
-        """The package ``spec`` installs under ``name``, and whether the spec identifies it.
-        ``"ui": "npm:react@18"`` installs react. A URL, git or tarball spec installs an unknown
-        package. A local directory is in the tree, scanned like a workspace."""
+    def _installed_names(name: str, spec: str | None) -> tuple[tuple[str, ...], bool]:
+        """The packages ``spec`` may install under ``name``, and whether the spec identifies them.
+        ``"ui": "npm:react@18"`` installs react and ``"react": "npm:^18"`` installs react. npm
+        reads ``"ui": "npm:latest"`` as the package ``latest`` and Yarn as ``ui`` at that tag, so
+        both count. A URL, git or tarball spec installs an unknown package. A local directory is
+        in the tree, scanned like a workspace."""
         if spec is None:
-            return name, True
+            return (name,), True
         if spec.startswith("npm:"):
             target = spec[len("npm:") :]
-            version_at = target.find("@", 1)
-            return (target[:version_at] if version_at > 0 else target), True
+            alias = _NPM_ALIAS.fullmatch(target)
+            if alias and (alias.group(2) is not None or target.startswith("@")):
+                return (alias.group(1),), True
+            if alias:
+                return (name, target), True
+            return (name,), not any(c in target for c in ":/@")
         registry_tarball = _NPM_REGISTRY_TARBALL.match(spec)
         if registry_tarball:
-            return registry_tarball.group(1), True
+            return (registry_tarball.group(1),), True
         if spec.lower().endswith(_TARBALL_SUFFIXES):
-            return name, False
-        return name, spec.startswith(_LOCAL_SPEC_PREFIXES) or not any(c in spec for c in ":/")
+            return (name,), False
+        return (name,), spec.startswith(_LOCAL_SPEC_PREFIXES) or not any(c in spec for c in ":/")
 
     def parse_lockfile(self, path: PurePosixPath, content: bytes) -> list[tuple[str, str]]:
         if path.name == "bun.lock":
