@@ -36,6 +36,10 @@ A deploy runs in this order, and every step is safe to repeat:
    the deployment. If it reads on, the script is removed and nothing is published.
 5. The Access app is checked again, then the hostname is attached. This is the first moment the app
    resolves.
+6. When this deploy attached the hostname, the broker waits `APP_DOMAIN_DNS_PUBLISH_WAIT_MS` before
+   it returns the URL, so a visitor does not look the name up before its DNS record exists and cache
+   NXDOMAIN for the zone's 30-minute negative TTL. A redeploy to an attached hostname returns at
+   once.
 
 Takedown reverses it: detach the hostname, remove the script, then detach again and delete the
 per-app Access app. The floor is never touched.

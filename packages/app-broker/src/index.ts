@@ -320,12 +320,13 @@ export function createBrokerApp(deps: BrokerDeps) {
   app.onError((error, c) => toErrorResponse(c, error, log));
 
   const services = (config: BrokerConfig) => {
+    const sleep = deps.sleep ?? sleepFor;
     const api = createCloudflareApi({
       baseUrl: deps.apiBaseUrl ?? CLOUDFLARE_API_BASE_URL,
       accountId: config.accountId,
       token: config.apiToken,
       fetch: deps.fetch ?? ((request) => fetch(request)),
-      sleep: deps.sleep ?? sleepFor,
+      sleep,
     });
     return {
       api,
@@ -333,6 +334,7 @@ export function createBrokerApp(deps: BrokerDeps) {
       edge: createEdge(api, config),
       backend: createHostingBackend(api, config),
       guard: deps.guard,
+      sleep,
       log,
     };
   };

@@ -5,6 +5,7 @@
  *   3. ensureAccess  the per-app Access app exists with exactly that policy -> AccessGrant (AUD)
  *   4. put           guard + app modules, assets and bindings (AUD from the grant); no hostname
  *   5. attach        re-checks Access, then the Custom Domain: the first moment the app resolves
+ *   6. wait          a new hostname waits for its DNS record before the URL goes back
  * A failed step leaves nothing reachable that was not reachable before, and every step is an
  * ensure, so calling publish again converges.
  */
@@ -12,6 +13,7 @@
 import type { BrokerDeployRequest, BrokerDeployResponse } from "@open-inspect/shared/app-broker";
 import type { BundleAsset, HostingBackend, ScriptModule } from "./backends";
 import { PublicIngressError, scriptBindings } from "./backends";
+import type { Sleep } from "./cloudflare-api";
 import { assertBindingsOwned, type DataDeps } from "./data";
 import type { Edge } from "./edge";
 import { accessGuardFailed } from "./errors";
@@ -23,6 +25,15 @@ export interface GuardBundle {
   readonly userModuleName: string;
 }
 
+/**
+ * How long a newly attached hostname waits before its URL is returned. On live Cloudflare the
+ * authoritative A/AAAA record appeared about 5.1 s after the Custom Domain PUT, and the zone's SOA
+ * negative TTL is 1800 s, so a lookup before then caches NXDOMAIN for 30 minutes. A Worker cannot
+ * ask the authoritative nameservers, and asking a public resolver would plant that NXDOMAIN, so
+ * the wait is fixed at about twice the measurement. It fits well inside APP_DEPLOY_DEADLINE_MS.
+ */
+export const APP_DOMAIN_DNS_PUBLISH_WAIT_MS = 10_000;
+
 /** A static-only app: the guard serves assets after verifying the visitor. */
 const NO_USER_MODULE = "export default null;\n";
 
@@ -30,6 +41,7 @@ export interface PublishDeps extends DataDeps {
   readonly edge: Edge;
   readonly backend: HostingBackend;
   readonly guard: GuardBundle;
+  readonly sleep: Sleep;
 }
 
 export interface PublishInput {
@@ -77,6 +89,7 @@ export async function publish(
     deps.backend.ingressService(target.script),
     signal
   );
+  if (firstAttach) await deps.sleep(APP_DOMAIN_DNS_PUBLISH_WAIT_MS, signal);
   return {
     url: `https://${target.hostname}`,
     backend: deps.backend.kind,

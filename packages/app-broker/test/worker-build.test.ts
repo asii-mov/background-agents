@@ -6,6 +6,7 @@ import {
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { bundleBroker, bundleGuard } from "../build.mjs";
 import { APP_SCRIPT_COMPATIBILITY_DATE } from "../src/backends";
+import { APP_DOMAIN_DNS_PUBLISH_WAIT_MS } from "../src/publish";
 import {
   FAKE_OPTIONS,
   brokerEnv,
@@ -64,20 +65,26 @@ describe("the built broker Worker", () => {
   });
   afterAll(() => miniflare?.dispose());
 
-  it("publishes an app with the inlined guard as its main module", async () => {
-    const response = await send(
-      await signedRequest("/deploy", {
-        form: deployForm({ name: "inventory", worker: "export default {};" }),
-      })
-    );
+  it(
+    "publishes an app with the inlined guard as its main module",
+    { timeout: APP_DOMAIN_DNS_PUBLISH_WAIT_MS + 10_000 },
+    async () => {
+      const startedAt = Date.now();
+      const response = await send(
+        await signedRequest("/deploy", {
+          form: deployForm({ name: "inventory", worker: "export default {};" }),
+        })
+      );
 
-    expect(response.status, await response.clone().text()).toBe(200);
-    expect(fake.script("app-inventory")?.activeVersion?.moduleNames).toEqual([
-      ...guardModules,
-      "app.mjs",
-    ]);
-    expectServing(harness, "inventory");
-  });
+      expect(response.status, await response.clone().text()).toBe(200);
+      expect(Date.now() - startedAt).toBeGreaterThanOrEqual(APP_DOMAIN_DNS_PUBLISH_WAIT_MS);
+      expect(fake.script("app-inventory")?.activeVersion?.moduleNames).toEqual([
+        ...guardModules,
+        "app.mjs",
+      ]);
+      expectServing(harness, "inventory");
+    }
+  );
 
   it("runs a data op and a takedown", async () => {
     const ensured = await send(

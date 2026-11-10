@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { CLOUDFLARE_API_MAX_ATTEMPTS } from "../src/cloudflare-api";
+import { APP_DOMAIN_DNS_PUBLISH_WAIT_MS } from "../src/publish";
 import {
   BACKENDS,
   FAKE_OPTIONS,
@@ -173,6 +174,24 @@ describe.each(BACKENDS)("publish on the %s backend", (backend) => {
     expectServing(harness, NAME);
   });
 
+  it("waits for DNS only when the deploy attaches the hostname", async () => {
+    const harness = createHarness({ backend });
+
+    await deployOk(harness);
+    expect(harness.sleeps).toEqual([APP_DOMAIN_DNS_PUBLISH_WAIT_MS]);
+
+    await deployOk(harness, { name: NAME, deploymentId: "deployment-2" });
+    expect(harness.sleeps).toEqual([APP_DOMAIN_DNS_PUBLISH_WAIT_MS]);
+
+    expect((await harness.takedown(NAME)).status).toBe(200);
+    const reattached = await deployOk(harness, { name: NAME, deploymentId: "deployment-3" });
+    expect(reattached.firstDeploy).toBe(true);
+    expect(harness.sleeps).toEqual([
+      APP_DOMAIN_DNS_PUBLISH_WAIT_MS,
+      APP_DOMAIN_DNS_PUBLISH_WAIT_MS,
+    ]);
+  });
+
   it("binds exactly the assets, the platform values and the requested bindings", async () => {
     const harness = createHarness({ backend, env: { APP_DATA_JURISDICTION: "eu" } });
     harness.fake.seedD1("app-inventory-db");
@@ -326,6 +345,7 @@ describe("edge", () => {
     expect(body.error).toBe("access_guard_failed");
     expect(steps(harness, "domains.put")).toEqual([]);
     expect(harness.fake.domainFor(HOST)).toBeNull();
+    expect(harness.sleeps).toEqual([]);
     expect(harness.fake.violations).toEqual([]);
   });
 
