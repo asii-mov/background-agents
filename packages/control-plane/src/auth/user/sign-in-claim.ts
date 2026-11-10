@@ -12,9 +12,8 @@ const logger = createLogger("auth:sign-in-claim");
  * Better Auth persists directly into the canonical registry — a bot-created
  * identity IS an account, so `findOAuthUser`'s account-first lookup signs
  * bot-first users into their canonical row natively. What remains is
- * proof-keeping for the rows that lack it: GitHub ingress creates canonical rows NULL-email, and
- * a Slack- or Linear-reported email arrives with `email_verified = 0`
- * because a bot report is never mailbox proof. The OAuth callback is
+ * proof-keeping for the rows that lack it: bot ingress creates canonical rows NULL-email,
+ * because a bot-reported email is never mailbox proof. The OAuth callback is
  * the one moment a provider-verified email is in hand, so this decorator
  * runs just before Better Auth's own queries and:
  *

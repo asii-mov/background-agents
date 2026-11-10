@@ -24,6 +24,8 @@ export interface ProviderIdentity {
  * Which provider-reported emails may link an identity to an existing user.
  * A reported email is never mailbox proof. It links only inside an allowed
  * domain and only to a user whose email a completed OAuth sign-in verified.
+ * It stays on the identity and never lands on `users.email`, where a later
+ * sign-in proving it would verify that row and link into it.
  */
 export interface EmailLinkPolicy {
   /** Exact lowercase domains, such as `corp.example`. Empty never links. */
@@ -104,7 +106,6 @@ export interface NewUserIdentity {
 export interface UserUpdate {
   displayName?: string;
   avatarUrl?: string;
-  email?: string;
 }
 
 // ── Row types (D1 snake_case) ───────────────────────────────────────
@@ -368,13 +369,6 @@ export class UserStore {
       sets.push("avatar_url = ?");
       values.push(updates.avatarUrl);
     }
-    if (updates.email !== undefined) {
-      // A blank email normalizes to null — treated as absent, never stored.
-      // A new address arrives unproven. Only the sign-in claim verifies it.
-      sets.push("email = ?");
-      values.push(normalizeEmail(updates.email));
-      sets.push("email_verified = 0");
-    }
 
     if (sets.length === 0) return;
 
@@ -420,15 +414,10 @@ export class UserStore {
         updates.avatarUrl = identity.avatarUrl;
       }
 
-      // Step 2c: Backfill an allowed-domain email if the user has none.
-      // The check-then-update is racy (a concurrent writer could claim the email
-      // between the SELECT and UPDATE), but the outer retry in resolveOrCreateUser
-      // handles this: on retry, emailOwner is non-null and we re-link instead.
+      // Step 2c: Re-link to the verified owner of an allowed-domain email.
       if (!user.email && linkable) {
         const emailOwner = await this.getUserByEmail(linkable.address);
-        if (!emailOwner) {
-          updates.email = linkable.address;
-        } else if (emailOwner.emailVerified) {
+        if (emailOwner?.emailVerified) {
           // Re-link this identity to the verified owner of its email. This
           // heals the split left when e.g. a Slack identity created without an
           // email later reports the email a GitHub sign-in already proved.
@@ -453,7 +442,7 @@ export class UserStore {
       return {
         id: user.id,
         displayName: updates.displayName ?? user.displayName,
-        email: updates.email ?? user.email,
+        email: user.email,
         isNew: false,
         linkedByEmailDomain: null,
       };
@@ -488,16 +477,13 @@ export class UserStore {
     const displayName = identity.displayName ?? null;
     const avatarUrl = identity.avatarUrl ?? null;
     const issuer = getSignInProviderIssuer(identity.provider);
-    // A later OAuth sign-in proving users.email verifies this row and links
-    // into it, so only an allowed-domain address nobody owns may land there.
-    const email = linkable && !emailOwner ? linkable.address : null;
 
     await this.db.batch([
       this.db
         .prepare(
-          "INSERT INTO users (id, display_name, email, email_verified, avatar_url, created_at, updated_at) VALUES (?, ?, ?, 0, ?, ?, ?)"
+          "INSERT INTO users (id, display_name, email, email_verified, avatar_url, created_at, updated_at) VALUES (?, ?, NULL, 0, ?, ?, ?)"
         )
-        .bind(userId, displayName, email, avatarUrl, now, now),
+        .bind(userId, displayName, avatarUrl, now, now),
       this.db
         .prepare(
           "INSERT INTO user_identities (id, user_id, provider, provider_user_id, provider_login, provider_email, provider_issuer, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
@@ -517,7 +503,7 @@ export class UserStore {
     return {
       id: userId,
       displayName,
-      email,
+      email: null,
       isNew: true,
       linkedByEmailDomain: null,
     };

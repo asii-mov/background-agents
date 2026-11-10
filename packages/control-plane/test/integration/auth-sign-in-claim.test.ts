@@ -3,6 +3,7 @@ import { getSetCookies } from "./helpers";
 import { BROWSER_AUTH_CLIENT_IP_HEADER } from "@open-inspect/shared/browser-auth-routes";
 import { buildServiceAuthHeaders } from "@open-inspect/shared/service-auth";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { PlatformRoleStore } from "../../src/db/platform-roles";
 import { parseEmailLinkPolicy, UserStore } from "../../src/db/user-store";
 import { routeRequest } from "./helpers";
 import { cleanD1Tables } from "./cleanup";
@@ -223,21 +224,42 @@ describe("email claim (bot-first users with an attributed email)", () => {
     expect(await countTableRows("users")).toBe(1);
   });
 
-  it("signs a Slack-first user into their bot-created row once OAuth proves the allowed-domain email", async () => {
-    const slack = await new UserStore(env.DB).resolveOrCreateUser(
-      { provider: "slack", providerUserId: "U0SLACKFIRST", providerEmail: "octocat@example.com" },
+  it("joins a Slack-first user's Slack identity to the account their OAuth sign-in owns", async () => {
+    const users = new UserStore(env.DB);
+    const links = parseEmailLinkPolicy("example.com");
+    const slackActor = {
+      provider: "slack",
+      providerUserId: "U0SLACKFIRST",
+      providerEmail: "octocat@example.com",
+    } as const;
+    await users.resolveOrCreateUser(slackActor, links);
+
+    const { sessionUser } = await signIn("github");
+    const slack = await users.resolveOrCreateUser(slackActor, links);
+
+    expect(sessionUser).not.toBeNull();
+    expect(slack).toMatchObject({ id: sessionUser?.id, linkedByEmailDomain: "example.com" });
+    expect(await getIdentityRow("github", GITHUB_SUBJECT)).toMatchObject({
+      user_id: sessionUser?.id,
+    });
+  });
+
+  it("never signs a colleague into the row of a Slack actor that reported their email first", async () => {
+    const attacker = await new UserStore(env.DB).resolveOrCreateUser(
+      { provider: "slack", providerUserId: "U0ATTACKER", providerEmail: "octocat@example.com" },
       parseEmailLinkPolicy("example.com")
     );
-    expect(await getUserRow(slack.id)).toMatchObject({
-      email: "octocat@example.com",
-      email_verified: 0,
-    });
 
     const { sessionUser } = await signIn("github");
 
-    expect(sessionUser?.id).toBe(slack.id);
-    expect(await getUserRow(slack.id)).toMatchObject({ email_verified: 1 });
-    expect(await countTableRows("users")).toBe(1);
+    expect(sessionUser).not.toBeNull();
+    expect(sessionUser?.id).not.toBe(attacker.id);
+    expect(await getIdentityRow("github", GITHUB_SUBJECT)).toMatchObject({
+      user_id: sessionUser?.id,
+    });
+    const roles = new PlatformRoleStore(env.DB, { adminUsers: "octocat@example.com" });
+    expect(await roles.getEffectiveRole(sessionUser?.id ?? "")).toBe("admin");
+    expect(await roles.getEffectiveRole(attacker.id)).toBe("member");
   });
 
   it("registers its own user when the Slack-reported email was outside the allowed domains", async () => {

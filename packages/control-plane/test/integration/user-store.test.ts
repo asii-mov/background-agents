@@ -2,7 +2,6 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { env } from "cloudflare:test";
 import { IdentityClaimStore } from "../../src/db/identity-claim-store";
 import { PlatformRoleStore } from "../../src/db/platform-roles";
-import type { SqlDatabase, SqlStatement } from "../../src/db/sql-database";
 import { TeamMembershipStore } from "../../src/db/team-memberships";
 import { TeamStore } from "../../src/db/teams";
 import { parseEmailLinkPolicy, UserStore } from "../../src/db/user-store";
@@ -18,38 +17,6 @@ const providerIssuers = [
 
 const BOT_PROVIDERS = ["slack", "linear"] as const;
 const CORP_LINKS = parseEmailLinkPolicy("corp.example");
-
-class ClaimBeforeRunStatement implements SqlStatement {
-  constructor(
-    private readonly inner: SqlStatement,
-    private readonly claim: () => Promise<unknown>
-  ) {}
-  bind(...values: unknown[]): SqlStatement {
-    return new ClaimBeforeRunStatement(this.inner.bind(...values), this.claim);
-  }
-  first<T>() {
-    return this.inner.first<T>();
-  }
-  all<T>() {
-    return this.inner.all<T>();
-  }
-  async run<T>() {
-    await this.claim();
-    return this.inner.run<T>();
-  }
-}
-
-/** Lands `claim` between the email-owner check and the email write, as a concurrent sign-in would. */
-function claimingBeforeEmailWrite(claim: () => Promise<unknown>): SqlDatabase {
-  const db = sqlDatabase(env.DB);
-  return {
-    prepare: (query) =>
-      query.startsWith("UPDATE users SET") && query.includes("email = ?")
-        ? new ClaimBeforeRunStatement(db.prepare(query), claim)
-        : db.prepare(query),
-    batch: (statements) => db.batch(statements),
-  };
-}
 
 describe("UserStore", () => {
   let store: UserStore;
@@ -167,24 +134,15 @@ describe("UserStore", () => {
       ).toBeNull();
     });
 
-    it("creates a new user with email normalized to lowercase", async () => {
-      const result = await store.resolveOrCreateUser(
-        {
-          provider: "github",
-          providerUserId: "12345",
-          displayName: "Alice",
-          providerEmail: "Alice@Example.COM",
-        },
-        parseEmailLinkPolicy("example.com")
-      );
+    it("normalizes a reported email to lowercase on the identity", async () => {
+      const result = await store.resolveOrCreateUser({
+        provider: "github",
+        providerUserId: "12345",
+        displayName: "Alice",
+        providerEmail: "Alice@Example.COM",
+      });
 
       expect(result.isNew).toBe(true);
-      expect(result.email).toBe("alice@example.com");
-
-      const user = await store.getUserById(result.id);
-      expect(user!.email).toBe("alice@example.com");
-
-      // Identity email is also normalized
       const identity = await store.getIdentity("github", "12345");
       expect(identity!.providerEmail).toBe("alice@example.com");
     });
@@ -213,7 +171,7 @@ describe("UserStore", () => {
     });
 
     it.each(["slack", "linear", "github"] as const)(
-      "never verifies an email that %s reports",
+      "keeps an allowed-domain email that %s reports off its new user",
       async (provider) => {
         const result = await store.resolveOrCreateUser(
           { provider, providerUserId: `${provider}-reporter`, providerEmail: "alice@corp.example" },
@@ -221,8 +179,11 @@ describe("UserStore", () => {
         );
 
         expect(await store.getUserById(result.id)).toMatchObject({
-          email: "alice@corp.example",
+          email: null,
           emailVerified: false,
+        });
+        expect(await store.getIdentity(provider, `${provider}-reporter`)).toMatchObject({
+          providerEmail: "alice@corp.example",
         });
       }
     );
@@ -395,7 +356,7 @@ describe("UserStore", () => {
       ]);
     });
 
-    it("backfills an email-less user's allowed-domain email unverified", async () => {
+    it("keeps a later-reported allowed-domain email off an email-less user", async () => {
       const first = await store.resolveOrCreateUser({
         provider: "slack",
         providerUserId: "UABC",
@@ -413,18 +374,14 @@ describe("UserStore", () => {
         CORP_LINKS
       );
 
-      expect(second).toMatchObject({
-        id: first.id,
-        email: "alice@corp.example",
-        linkedByEmailDomain: null,
-      });
-      expect(await store.getUserById(first.id)).toMatchObject({
-        email: "alice@corp.example",
-        emailVerified: false,
+      expect(second).toMatchObject({ id: first.id, email: null, linkedByEmailDomain: null });
+      expect(await store.getUserById(first.id)).toMatchObject({ email: null });
+      expect(await store.getIdentity("slack", "UABC")).toMatchObject({
+        providerEmail: "alice@corp.example",
       });
     });
 
-    it("grants no bootstrap admin role from a bot-reported email until OAuth proves it", async () => {
+    it("grants no bootstrap admin role from a bot-reported email, even once OAuth proves it", async () => {
       const roles = new PlatformRoleStore(env.DB, { adminUsers: "admin@corp.example" });
       const actor = await store.resolveOrCreateUser(
         { provider: "slack", providerUserId: "U-ADMIN-CLAIM", providerEmail: "admin@corp.example" },
@@ -435,7 +392,7 @@ describe("UserStore", () => {
 
       await new IdentityClaimStore(env.DB).verifyEmailOwner("admin@corp.example");
 
-      expect(await roles.getEffectiveRole(actor.id)).toBe("admin");
+      expect(await roles.getEffectiveRole(actor.id)).toBe("member");
     });
 
     it("refreshes identity metadata on repeat sign-in", async () => {
@@ -504,32 +461,6 @@ describe("UserStore", () => {
       expect(await store.getUserById(owner.id)).toMatchObject({ emailVerified: false });
     });
 
-    it("converges on the verified owner when a sign-in claims the email mid-backfill", async () => {
-      const slackUser = await store.resolveOrCreateUser({
-        provider: "slack",
-        providerUserId: "U-RACE",
-      });
-      const signedIn = await store.createUser({ displayName: "Signed in elsewhere" });
-      const racing = new UserStore(
-        claimingBeforeEmailWrite(() =>
-          new IdentityClaimStore(env.DB).claimEmail(signedIn.id, "racer@corp.example")
-        )
-      );
-
-      const result = await racing.resolveOrCreateUser(
-        { provider: "slack", providerUserId: "U-RACE", providerEmail: "racer@corp.example" },
-        CORP_LINKS
-      );
-
-      expect(result).toMatchObject({ id: signedIn.id, linkedByEmailDomain: "corp.example" });
-      expect(await store.getIdentity("slack", "U-RACE")).toMatchObject({ userId: signedIn.id });
-      expect(await store.getUserById(slackUser.id)).toMatchObject({ email: null });
-      expect(await store.getUserById(signedIn.id)).toMatchObject({
-        email: "racer@corp.example",
-        emailVerified: true,
-      });
-    });
-
     it("stores avatar_url on new user", async () => {
       const result = await store.resolveOrCreateUser({
         provider: "github",
@@ -589,15 +520,7 @@ describe("UserStore", () => {
 
   describe("getUserById", () => {
     it("returns user when found", async () => {
-      const created = await store.resolveOrCreateUser(
-        {
-          provider: "github",
-          providerUserId: "12345",
-          displayName: "Alice",
-          providerEmail: "alice@example.com",
-        },
-        parseEmailLinkPolicy("example.com")
-      );
+      const created = await store.createUser({ displayName: "Alice", email: "alice@example.com" });
 
       const user = await store.getUserById(created.id);
       expect(user).not.toBeNull();
